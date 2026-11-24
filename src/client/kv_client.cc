@@ -257,6 +257,41 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
     absent_grace_ms_ = static_cast<uint64_t>(grace);
     absent_remove_cap_ = EnvSize("DFKV_RING_ABSENT_REMOVE_QUEUE", 4096);
   }
+  {
+    // Cooldown reroute (C). Fan-out and the registry marker come with it.
+    const int reroute = EnvNonnegativeInt("DFKV_RING_COOLDOWN_REROUTE", 0);
+    if (reroute > 1)
+      DFKV_LOG_WARN("DFKV_RING_COOLDOWN_REROUTE=" + std::to_string(reroute) +
+                    " is not 0 or 1; taken as 1");
+    reroute_on_ = reroute != 0;
+    fanout_on_ = reroute_on_;
+    const auto clamp = [](const char* name, int v, int lo, int hi) {
+      if (v >= lo && v <= hi) return v;
+      const int c = v < lo ? lo : hi;
+      DFKV_LOG_WARN(std::string(name) + "=" + std::to_string(v) +
+                    " is outside " + std::to_string(lo) + "-" +
+                    std::to_string(hi) + "; using " + std::to_string(c));
+      return c;
+    };
+    fanout_ = static_cast<size_t>(clamp(
+        "DFKV_RING_REMOVE_FANOUT",
+        EnvNonnegativeInt("DFKV_RING_REMOVE_FANOUT", 3), 1, 8));
+    reroute_cap_ = static_cast<size_t>(clamp(
+        "DFKV_RING_REROUTE_KEYS",
+        EnvNonnegativeInt("DFKV_RING_REROUTE_KEYS", 65536), 1024, 16777216));
+    reroute_close_ms_ = static_cast<uint64_t>(clamp(
+        "DFKV_RING_REROUTE_CLOSE_MS",
+        EnvNonnegativeInt("DFKV_RING_REROUTE_CLOSE_MS", 2000), 0, 60000));
+    if (fanout_on_) {
+      recent_keep_ms_.store(33000, std::memory_order_relaxed);  // 11 polls of 3 s
+      // The ring adopted above, before the switch was read, is the first
+      // recent ring.
+      std::lock_guard<std::mutex> lk(ring_mu_);
+      std::map<std::string, int> weight;
+      for (const auto& [id, w] : ring_.Nodes()) weight[id] = w;
+      NoteRecentLocked(weight, addr_, true, NowMs());
+    }
+  }
   retain_reprobe_ms_ =
       static_cast<uint64_t>(EnvNonnegativeInt("DFKV_RETAIN_REPROBE_MS", 30000));
   // An ABI descriptor value (including 0=auto) supersedes the environment.
@@ -424,6 +459,11 @@ void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr,
     absent_ = std::move(absent);
     absent_ring_ = std::move(absent_ring);
     placement_ = std::move(placement);
+    if (fanout_on_) {
+      std::map<std::string, int> weight;
+      for (const auto& [id, w] : ring_.Nodes()) weight[id] = w;
+      NoteRecentLocked(weight, addr_, true, NowMs());
+    }
     any_draining_.store(!draining_.empty(), std::memory_order_relaxed);
     any_absent_.store(!absent_.empty(), std::memory_order_relaxed);
   }
@@ -853,6 +893,521 @@ void KVClient::RetryAbsentRemoves() {
   }
 }
 
+// ---- Cooldown reroute and REMOVE fan-out (CLI-02 stage C) ----
+
+void KVClient::NoteRecentLocked(const std::map<std::string, int>& weight,
+                                const std::map<std::string, std::string>& addr,
+                                bool adopted, uint64_t now) {
+  if (weight.empty()) return;
+  bool found = false;
+  for (RecentRing& r : recent_) {
+    bool& flag = adopted ? r.adopted : r.seen;
+    const bool match = r.weight == weight;
+    if (match) {
+      found = true;
+      flag = true;
+      for (const auto& [id, a] : addr)
+        if (weight.count(id) != 0) r.addr[id] = a;
+      continue;
+    }
+    if (flag) {
+      flag = false;
+      if (!r.adopted && !r.seen) r.last_ms = now;
+    }
+  }
+  if (!found) {
+    RecentRing r;
+    r.weight = weight;
+    for (const auto& [id, a] : addr)
+      if (weight.count(id) != 0) r.addr[id] = a;
+    for (const auto& [id, w] : weight) r.ring.AddNode(id, w);
+    r.ring.Build();
+    (adopted ? r.adopted : r.seen) = true;
+    r.last_ms = now;
+    recent_.push_back(std::move(r));
+  }
+  RebuildRecentLocked();
+}
+
+void KVClient::RebuildRecentLocked() {
+  std::map<std::string, int> all;
+  std::map<std::string, size_t> count;
+  recent_addr_.clear();
+  for (const RecentRing& r : recent_) {
+    for (const auto& [id, w] : r.weight) {
+      all[id] = w;
+      ++count[id];
+    }
+    for (const auto& [id, a] : r.addr) recent_addr_[id] = a;
+  }
+  // The current adopted ring's addresses win (a member that moved).
+  for (const RecentRing& r : recent_)
+    if (r.adopted)
+      for (const auto& [id, a] : r.addr) recent_addr_[id] = a;
+  recent_stable_.clear();
+  for (const auto& [id, n] : count)
+    if (n == recent_.size()) recent_stable_.insert(id);
+  ConHash u;
+  for (const auto& [id, w] : all) u.AddNode(id, w);
+  u.Build();
+  recent_union_ = std::move(u);
+}
+
+bool KVClient::ExpireRecentLocked(uint64_t now) {
+  const uint64_t keep = recent_keep_ms_.load(std::memory_order_relaxed);
+  const size_t before = recent_.size();
+  recent_.erase(std::remove_if(recent_.begin(), recent_.end(),
+                               [&](const RecentRing& r) {
+                                 return !r.adopted && !r.seen &&
+                                        now - r.last_ms > keep;
+                               }),
+                recent_.end());
+  if (recent_.size() == before) return false;
+  RebuildRecentLocked();
+  return true;
+}
+
+std::string KVClient::SubstituteLocked(uint32_t hash, const std::string& owner,
+                                       uint64_t now) const {
+  std::string sub;
+  size_t rank = 0;
+  recent_union_.Walk(hash, [&](const std::string& id) {
+    if (rank++ >= fanout_) return false;
+    const auto a = recent_addr_.find(id);
+    // Unusable members count toward the rank: the owner, members not in
+    // every recent ring, cooling ones.
+    if (a == recent_addr_.end() || a->second == owner) return true;
+    if (recent_stable_.count(id) == 0) return true;
+    if (health_.Cooling(a->second, now)) return true;
+    sub = a->second;
+    return false;
+  });
+  return sub;
+}
+
+void KVClient::FanoutTargetsLocked(uint32_t hash,
+                                   std::set<std::string>* out) const {
+  for (const RecentRing& r : recent_) {
+    size_t stable = 0;
+    r.ring.Walk(hash, [&](const std::string& id) {
+      const auto a = r.addr.find(id);
+      if (a != r.addr.end()) out->insert(a->second);
+      if (recent_stable_.count(id) != 0 && ++stable >= fanout_) return false;
+      return true;
+    });
+  }
+}
+
+void KVClient::NoteSeenView(const std::vector<MemberInfo>& placement) {
+  if (!fanout_on_) return;
+  // Its write ring: the eligible members that do not drain (all of them if
+  // every one drains), as AdoptPlacement builds it.
+  size_t serving = 0;
+  for (const auto& m : placement)
+    if (m.RingEligible() && !m.draining) ++serving;
+  std::map<std::string, int> weight;
+  std::map<std::string, std::string> addr;
+  for (const auto& m : placement) {
+    if (!m.RingEligible() || (serving != 0 && m.draining)) continue;
+    weight[m.id] = m.weight < 1 ? 1 : static_cast<int>(m.weight);
+    addr[m.id] = m.ip + ":" + std::to_string(m.port);
+  }
+  std::lock_guard<std::mutex> lk(ring_mu_);
+  NoteRecentLocked(weight, addr, false, NowMs());
+}
+
+std::string KVClient::RouteFor(const std::string& key, RouteOp op) {
+  if (!reroute_on_ || t_drain_pass || t_route_to != nullptr) return Route(key);
+  const uint32_t hash = ConHash::KeyHash(key);
+  std::string owner;
+  {
+    std::lock_guard<std::mutex> lk(ring_mu_);
+    std::string name;
+    if (!ring_.LookupHash(hash, &name)) return "";
+    const auto it = addr_.find(name);
+    if (it == addr_.end()) return "";
+    owner = it->second;
+  }
+  if (!health_.AnyCooldown() || !gate_open_.load(std::memory_order_acquire))
+    return owner;
+  const uint64_t now = NowMs();
+  const uint64_t episode = health_.CooldownUntil(owner, now);
+  if (episode == 0) return owner;
+  std::string sub;
+  {
+    std::lock_guard<std::mutex> lk(ring_mu_);
+    sub = SubstituteLocked(hash, owner, now);
+  }
+  if (sub.empty()) {
+    reroutes_[kRrNone].fetch_add(1, std::memory_order_relaxed);
+    return owner;  // as today: the cooling owner is skipped
+  }
+  if (op == RouteOp::kPut || op == RouteOp::kRetainSet) {
+    if (!TrackReroute(owner, episode, key, sub)) {
+      reroute_refused_.fetch_add(1, std::memory_order_relaxed);
+      return "";  // never written to a substitute untracked
+    }
+  } else {
+    // A copy whose cleanup is still queued is not read: it may be one a
+    // REMOVE did not reach.
+    std::lock_guard<std::mutex> lk(reroute_mu_);
+    const auto pending = episode_cleanup_.find(sub);
+    if (pending != episode_cleanup_.end() && pending->second.count(key) != 0)
+      return "";
+  }
+  const RerouteOpIndex index =
+      op == RouteOp::kGet     ? kRrGet
+      : op == RouteOp::kExist ? kRrExist
+      : op == RouteOp::kPut   ? kRrPut
+                              : kRrRetain;
+  reroutes_[index].fetch_add(1, std::memory_order_relaxed);
+  return sub;
+}
+
+bool KVClient::TrackReroute(const std::string& owner, uint64_t episode,
+                            const std::string& key, const std::string& sub) {
+  std::lock_guard<std::mutex> lk(reroute_mu_);
+  auto& keys = reroute_keys_[owner][episode];
+  if (keys.count({key, sub}) != 0) return true;
+  // Tracked keys and episode cleanups still to land share the bound: no
+  // write goes to a substitute that could not be cleaned up.
+  if (reroute_tracked_ + episode_pending_ >= reroute_cap_) {
+    if (keys.empty()) {
+      reroute_keys_[owner].erase(episode);
+      if (reroute_keys_[owner].empty()) reroute_keys_.erase(owner);
+    }
+    return false;
+  }
+  keys.insert({key, sub});
+  ++reroute_tracked_;
+  return true;
+}
+
+void KVClient::QueueFanoutCleanupLocked(const std::string& addr,
+                                        const std::string& key) {
+  auto& keys = fanout_cleanup_[addr];
+  if (keys.count(key) != 0) return;
+  if (fanout_pending_ >= reroute_cap_) {
+    cleanup_abandoned_.fetch_add(1, std::memory_order_relaxed);
+    if (keys.empty()) fanout_cleanup_.erase(addr);
+    return;
+  }
+  keys.insert(key);
+  ++fanout_pending_;
+  cleanup_queued_total_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::vector<std::vector<char>> KVClient::RemoveAtNodes(
+    const std::vector<std::pair<std::string, std::vector<std::string>>>&
+        groups) {
+  std::vector<std::vector<char>> result(groups.size());
+  RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
+    const std::string& node = groups[g].first;
+    const std::vector<std::string>& keys = groups[g].second;
+    std::vector<char>& ok = result[g];
+    ok.assign(keys.size(), 0);
+    const uint64_t now = NowMs();
+    if (health_.Cooling(node, now)) {
+      ok.assign(keys.size(), 2);
+      return;
+    }
+    if (!health_.Healthy(node, now)) return;
+    std::vector<BlockKey> bkeys;
+    bkeys.reserve(keys.size());
+    for (const auto& key : keys) bkeys.push_back(block_key_(key));
+    const std::vector<Status> sts = t_->RemoveMany(node, bkeys);
+    ReportPeer(node, sts);
+    for (size_t m = 0; m < keys.size(); ++m) {
+      const bool removed = m < sts.size() && (sts[m] == Status::kOk ||
+                                              sts[m] == Status::kNotFound);
+      ok[m] = removed ? 1 : 0;
+      if (removed) InvalidateRendezvous(bkeys[m]);
+    }
+  });
+  return result;
+}
+
+// Fan-out REMOVE (§3.2): every target of a key must confirm in this call (the
+// owner, a drainer, the fan-out set of every recent ring); a target cooling
+// in this client, or failing, makes the REMOVE not ok, and a cooling one is
+// queued for cleanup. The absent owner keeps stage A's treatment.
+std::vector<char> KVClient::RemoveFanout(const std::vector<std::string>& keys) {
+  const size_t n = keys.size();
+  std::vector<char> ok(n, 1);
+  std::vector<char> cooling(n, 0), failed(n, 0);
+  std::map<std::string, std::vector<size_t>> by_node;
+  for (size_t i = 0; i < n; ++i) {
+    std::set<std::string> targets;
+    {
+      std::lock_guard<std::mutex> lk(ring_mu_);
+      FanoutTargetsLocked(ConHash::KeyHash(keys[i]), &targets);
+      if (targets.empty()) {
+        // No recent ring (C configured without a ring yet): the owner.
+        std::string name;
+        if (ring_.LookupHash(ConHash::KeyHash(keys[i]), &name)) {
+          const auto it = addr_.find(name);
+          if (it != addr_.end()) targets.insert(it->second);
+        }
+      }
+    }
+    const std::string drainer = DrainRoute(keys[i]);
+    if (!drainer.empty()) targets.insert(drainer);
+    if (targets.empty()) {
+      ok[i] = 0;
+      failed[i] = 1;
+      continue;
+    }
+    for (const auto& t : targets) by_node[t].push_back(i);
+  }
+  std::vector<std::pair<std::string, std::vector<std::string>>> groups;
+  std::vector<std::vector<size_t>> index;
+  for (auto& [node, idx] : by_node) {
+    std::vector<std::string> sub;
+    sub.reserve(idx.size());
+    for (size_t i : idx) sub.push_back(keys[i]);
+    groups.emplace_back(node, std::move(sub));
+    index.push_back(std::move(idx));
+  }
+  const auto results = RemoveAtNodes(groups);
+  {
+    std::lock_guard<std::mutex> lk(reroute_mu_);
+    for (size_t g = 0; g < groups.size(); ++g) {
+      for (size_t m = 0; m < index[g].size(); ++m) {
+        const size_t i = index[g][m];
+        switch (results[g][m]) {
+          case 1:
+            fanout_ok_.fetch_add(1, std::memory_order_relaxed);
+            break;
+          case 2:
+            ok[i] = 0;
+            cooling[i] = 1;
+            fanout_queued_cooling_.fetch_add(1, std::memory_order_relaxed);
+            QueueFanoutCleanupLocked(groups[g].first, keys[i]);
+            break;
+          default:
+            ok[i] = 0;
+            failed[i] = 1;
+            fanout_error_.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (cooling[i])
+      unconfirmed_cooling_.fetch_add(1, std::memory_order_relaxed);
+    else if (failed[i])
+      unconfirmed_failed_.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (any_absent_.load(std::memory_order_relaxed)) RemoveAtAbsent(keys);
+  return ok;
+}
+
+size_t KVClient::RunCleanup(bool all, uint64_t deadline_ms) {
+  const uint64_t now = NowMs();
+  const bool open = gate_open_.load(std::memory_order_acquire);
+  // node -> keys, and whether the keys are episode cleanups (they stay in
+  // episode_cleanup_ until confirmed, so that no read finds them meanwhile).
+  std::map<std::string, std::set<std::string>> episode_work, fanout_work;
+  {
+    std::lock_guard<std::mutex> lk(reroute_mu_);
+    // Episodes that ended: any but the owner's running cooldown, all of
+    // them once it does not cool or the gate closed.
+    for (auto owner = reroute_keys_.begin(); owner != reroute_keys_.end();) {
+      const uint64_t current =
+          all || !open ? 0 : health_.CooldownUntil(owner->first, now);
+      for (auto ep = owner->second.begin(); ep != owner->second.end();) {
+        if (ep->first == current) {
+          ++ep;
+          continue;
+        }
+        for (const auto& [key, sub] : ep->second) {
+          if (episode_cleanup_[sub].insert(key).second) ++episode_pending_;
+        }
+        reroute_tracked_ -= ep->second.size();
+        ep = owner->second.erase(ep);
+      }
+      owner = owner->second.empty() ? reroute_keys_.erase(owner) : ++owner;
+    }
+    for (const auto& [node, keys] : episode_cleanup_)
+      if (all || !health_.Cooling(node, now)) episode_work[node] = keys;
+    for (auto it = fanout_cleanup_.begin(); it != fanout_cleanup_.end();) {
+      if (!all && health_.Cooling(it->first, now)) {
+        ++it;
+        continue;
+      }
+      fanout_work[it->first] = std::move(it->second);
+      fanout_pending_ -= fanout_work[it->first].size();
+      it = fanout_cleanup_.erase(it);
+    }
+  }
+  if (episode_work.empty() && fanout_work.empty()) return 0;
+  std::vector<std::pair<std::string, std::vector<std::string>>> groups;
+  std::vector<bool> is_episode;
+  for (const auto* work : {&episode_work, &fanout_work}) {
+    for (const auto& [node, keys] : *work) {
+      groups.emplace_back(node,
+                          std::vector<std::string>(keys.begin(), keys.end()));
+      is_episode.push_back(work == &episode_work);
+    }
+  }
+  std::vector<std::vector<char>> results;
+  if (deadline_ms == 0 || NowMs() < deadline_ms) results = RemoveAtNodes(groups);
+  size_t left = 0;
+  std::lock_guard<std::mutex> lk(reroute_mu_);
+  for (size_t g = 0; g < groups.size(); ++g) {
+    const std::string& node = groups[g].first;
+    for (size_t m = 0; m < groups[g].second.size(); ++m) {
+      const std::string& key = groups[g].second[m];
+      const bool sent = !results.empty() && results[g][m] == 1;
+      if (sent) cleanup_ok_.fetch_add(1, std::memory_order_relaxed);
+      if (!sent) ++left;
+      if (is_episode[g]) {
+        if (sent || all) {
+          auto it = episode_cleanup_.find(node);
+          if (it != episode_cleanup_.end() && it->second.erase(key) != 0) {
+            --episode_pending_;
+            if (it->second.empty()) episode_cleanup_.erase(it);
+          }
+          if (!sent) cleanup_abandoned_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          cleanup_queued_total_.fetch_add(1, std::memory_order_relaxed);
+        }
+      } else if (!sent) {
+        if (all)
+          cleanup_abandoned_.fetch_add(1, std::memory_order_relaxed);
+        else
+          QueueFanoutCleanupLocked(node, key);
+      }
+    }
+  }
+  return left;
+}
+
+void KVClient::OnRegistry(bool ok, const std::vector<MemberInfo>& clients) {
+  if (!fanout_on_) return;
+  const uint64_t now = NowMs();
+  std::lock_guard<std::mutex> lk(gate_mu_);
+  if (ok) {
+    registry_seen_ = true;
+    registry_ok_ms_ = now;
+    size_t unmarked = 0;
+    uint64_t poll_max = static_cast<uint64_t>(own_poll_ms_);
+    static const std::string kMarker = "dfkv-remove-fanout=1;poll_ms=";
+    for (const auto& c : clients) {
+      const size_t at = c.info.find(kMarker);
+      uint64_t poll = 0;
+      if (at != std::string::npos) {
+        size_t p = at + kMarker.size();
+        while (p < c.info.size() && c.info[p] >= '0' && c.info[p] <= '9' &&
+               poll < (1ull << 40))
+          poll = poll * 10 + static_cast<uint64_t>(c.info[p++] - '0');
+      }
+      if (poll == 0)
+        ++unmarked;
+      else
+        poll_max = std::max(poll_max, poll);
+    }
+    unmarked_clients_ = unmarked;
+    unmarked_gauge_.store(unmarked, std::memory_order_relaxed);
+    poll_max_ms_ = poll_max;
+  }
+  EvaluateGateLocked(now);
+}
+
+void KVClient::EvaluateGateLocked(uint64_t now) {
+  const uint64_t own = static_cast<uint64_t>(own_poll_ms_);
+  // S follows the slowest marked poller: a larger one is used for keeping
+  // rings at once but opens the gate only once that much history exists; a
+  // smaller one replaces the old after one old S.
+  if (poll_max_ms_ != 0) {
+    const uint64_t s = 11 * poll_max_ms_;
+    if (s_ms_ == 0) {
+      s_ms_ = s;
+    } else if (s != s_ms_) {
+      if (s_next_ms_ != s) {
+        s_next_ms_ = s;
+        s_change_ms_ = now;
+      }
+      const uint64_t wait = s > s_ms_ ? s : s_ms_;
+      if (now - s_change_ms_ >= wait) {
+        s_ms_ = s;
+        s_next_ms_ = 0;
+      }
+    } else {
+      s_next_ms_ = 0;
+    }
+  }
+  recent_keep_ms_.store(std::max(s_ms_, s_next_ms_),
+                        std::memory_order_relaxed);
+  int reason = -1;
+  if (!reroute_on_ || own == 0 || !registered_ ||
+      !registry_seen_ || own < 1000)
+    reason = kGateNoRegistry;
+  else if (now - registry_ok_ms_ > 2 * own)
+    reason = kGateStale;
+  else if (unmarked_clients_ != 0)
+    reason = kGateUnmarked;
+  else if (s_next_ms_ > s_ms_)
+    reason = kGateSGrowing;
+  const bool open = reason < 0;
+  const bool was = gate_open_.exchange(open, std::memory_order_acq_rel);
+  if (was && !open) {
+    gate_failures_[reason].fetch_add(1, std::memory_order_relaxed);
+    DFKV_LOG_WARN(std::string("ring: cooldown reroute off: ") +
+                  (reason == kGateUnmarked
+                       ? "a registered client does not fan out its REMOVEs"
+                   : reason == kGateStale ? "the client registry answer is stale"
+                   : reason == kGateSGrowing
+                       ? "a slower client registered; waiting for the ring history"
+                       : "the client registry cannot be read"));
+  } else if (!was && open) {
+    DFKV_LOG_INFO("ring: cooldown reroute on (every registered client fans "
+                  "out its REMOVEs)");
+  }
+}
+
+uint64_t KVClient::RecentKeepMsForTest() const {
+  return recent_keep_ms_.load(std::memory_order_relaxed);
+}
+
+void KVClient::UseRegistryGateForTest(int poll_ms) {
+  std::lock_guard<std::mutex> lk(gate_mu_);
+  own_poll_ms_ = poll_ms;
+  registered_ = true;
+  s_ms_ = 11 * static_cast<uint64_t>(poll_ms);
+  recent_keep_ms_.store(s_ms_, std::memory_order_relaxed);
+}
+
+void KVClient::TickReroute() {
+  if (!fanout_on_) return;
+  const uint64_t now = NowMs();
+  {
+    std::lock_guard<std::mutex> lk(gate_mu_);
+    EvaluateGateLocked(now);
+  }
+  {
+    std::lock_guard<std::mutex> lk(ring_mu_);
+    ExpireRecentLocked(now);
+  }
+  RunCleanup(false, 0);
+}
+
+void KVClient::CloseReroute() {
+  if (!fanout_on_) return;
+  {
+    std::lock_guard<std::mutex> lk(reroute_mu_);
+    if (reroute_keys_.empty() && episode_cleanup_.empty() &&
+        fanout_cleanup_.empty())
+      return;
+  }
+  const size_t left =
+      RunCleanup(true, reroute_close_ms_ == 0 ? 1 : NowMs() + reroute_close_ms_);
+  if (left != 0)
+    DFKV_LOG_WARN("ring: close left " + std::to_string(left) +
+                  " key(s) on substitutes it could not REMOVE");
+}
+
 void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
                                  const std::string& group, int poll_ms) {
   StopMdsDiscovery();
@@ -866,6 +1421,8 @@ void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
       [this, placement_state](const std::vector<MemberInfo>& topology,
                               uint64_t topology_epoch,
                               bool placement_admitted) {
+        // Every view seen, admitted or not, is a recent ring (stage C).
+        NoteSeenView(topology);
         // Topology is a replace-all stream independent of placement. Degraded
         // members remain here even though SetMembers excludes them. Ring
         // members a guard-refused view omits keep their topology until a view
@@ -914,7 +1471,28 @@ void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
         if (!returned.empty()) RetryAbsentRemoves();
       },
       poll_ms);
-  if (absent_grace_ms_ > 0) poller_->SetTick([this] { TickAbsent(); }, 1000);
+  if (fanout_on_) {
+    own_poll_ms_ = poll_ms;
+    {
+      std::lock_guard<std::mutex> lk(gate_mu_);
+      s_ms_ = 11 * static_cast<uint64_t>(poll_ms > 0 ? poll_ms : 0);
+      recent_keep_ms_.store(s_ms_, std::memory_order_relaxed);
+    }
+    if (reroute_on_ && poll_ms < 1000)
+      DFKV_LOG_WARN("DFKV_RING_COOLDOWN_REROUTE: the member poll interval (" +
+                    std::to_string(poll_ms) +
+                    " ms) is below 1000 ms; cooldown reroute stays off");
+    poller_->SetRegistry([this](bool ok, const std::vector<MemberInfo>& clients) {
+      OnRegistry(ok, clients);
+    });
+  }
+  if (absent_grace_ms_ > 0 || fanout_on_)
+    poller_->SetTick(
+        [this] {
+          TickAbsent();
+          TickReroute();
+        },
+        1000);
   poller_->Start();
 }
 
@@ -934,6 +1512,18 @@ void KVClient::StartClientRegistration(std::vector<std::string> mds_eps,
                                        const std::string& group, MemberInfo self,
                                        int heartbeat_ms) {
   StopClientRegistration();
+  // With fan-out on, the registry marker the gate of every client reads
+  // (§3.2): this client fans out its REMOVEs, and polls every poll_ms.
+  if (fanout_on_) {
+    std::lock_guard<std::mutex> lk(gate_mu_);
+    registered_ = true;
+  }
+  // Only with the poll interval MDS discovery set: a guess would size the
+  // other clients' S wrongly.
+  if (fanout_on_ && own_poll_ms_ > 0)
+    self.info += (self.info.empty() ? "" : ",") +
+                 std::string("dfkv-remove-fanout=1;poll_ms=") +
+                 std::to_string(own_poll_ms_);
   // is_client=true routes the registrar to kClientRegister/kClientHeartbeat,
   // which the MDS writes under /clients/<id> (never the placement ring). No
   // stats provider: a consumer has no ring-level stats to report.
@@ -948,7 +1538,13 @@ void KVClient::StopClientRegistration() {
   if (client_registrar_) { client_registrar_->Stop(); client_registrar_.reset(); }
 }
 
-KVClient::~KVClient() { StopProbe(); StopClientRegistration(); StopMdsDiscovery(); }
+KVClient::~KVClient() {
+  // Stage C: the episode-end cleanup of a clean close (nothing with C off).
+  CloseReroute();
+  StopProbe();
+  StopClientRegistration();
+  StopMdsDiscovery();
+}
 
 // Every operation reports here what its statuses say about the node it was
 // sent to: PeerHealth::Report is the one place that turns statuses into a
@@ -1127,6 +1723,50 @@ std::string KVClient::MetricsSnapshot() const {
     s += "# HELP dfkv_client_ring_absent_removes_dropped_total Unconfirmed REMOVEs never confirmed: over the queue bound, the member dropped, or not confirmed within the grace after its return\n";
     s += "# TYPE dfkv_client_ring_absent_removes_dropped_total counter\n";
     s += "dfkv_client_ring_absent_removes_dropped_total " + load(absent_removes_dropped_) + "\n";
+    s += "# HELP dfkv_client_cooldown_reroutes_total Keys routed past an owner cooling in this client (cooldown reroute); op=\"none\": the owner cooled and no candidate was usable\n";
+    s += "# TYPE dfkv_client_cooldown_reroutes_total counter\n";
+    s += "dfkv_client_cooldown_reroutes_total{op=\"get\"} " + load(reroutes_[kRrGet]) + "\n";
+    s += "dfkv_client_cooldown_reroutes_total{op=\"exist\"} " + load(reroutes_[kRrExist]) + "\n";
+    s += "dfkv_client_cooldown_reroutes_total{op=\"put\"} " + load(reroutes_[kRrPut]) + "\n";
+    s += "dfkv_client_cooldown_reroutes_total{op=\"retain\"} " + load(reroutes_[kRrRetain]) + "\n";
+    s += "dfkv_client_cooldown_reroutes_total{op=\"none\"} " + load(reroutes_[kRrNone]) + "\n";
+    size_t episode_pending = 0;
+    {
+      std::lock_guard<std::mutex> lk(reroute_mu_);
+      episode_pending = episode_pending_;
+    }
+    s += "# HELP dfkv_client_ring_reroute_episode_pending Keys of ended reroute episodes whose REMOVE at the substitute is not confirmed yet; they count toward DFKV_RING_REROUTE_KEYS with the tracked keys\n";
+    s += "# TYPE dfkv_client_ring_reroute_episode_pending gauge\n";
+    s += "dfkv_client_ring_reroute_episode_pending " + std::to_string(episode_pending) + "\n";
+    s += "# HELP dfkv_client_reroute_refused_total Rerouted writes refused because DFKV_RING_REROUTE_KEYS keys are tracked for cleanup\n";
+    s += "# TYPE dfkv_client_reroute_refused_total counter\n";
+    s += "dfkv_client_reroute_refused_total " + load(reroute_refused_) + "\n";
+    s += "# HELP dfkv_client_reroute_cleanup_total REMOVEs of keys written to substitutes (episode end, or a fan-out target that cooled): ok, queued (sent again from the tick), abandoned (over the bound, or not sent before a close)\n";
+    s += "# TYPE dfkv_client_reroute_cleanup_total counter\n";
+    s += "dfkv_client_reroute_cleanup_total{result=\"ok\"} " + load(cleanup_ok_) + "\n";
+    s += "dfkv_client_reroute_cleanup_total{result=\"queued\"} " + load(cleanup_queued_total_) + "\n";
+    s += "dfkv_client_reroute_cleanup_total{result=\"abandoned\"} " + load(cleanup_abandoned_) + "\n";
+    s += "# HELP dfkv_client_remove_fanout_total REMOVE fan-out messages: ok, error, queued_cooling (the target cools in this client: queued for cleanup)\n";
+    s += "# TYPE dfkv_client_remove_fanout_total counter\n";
+    s += "dfkv_client_remove_fanout_total{result=\"ok\"} " + load(fanout_ok_) + "\n";
+    s += "dfkv_client_remove_fanout_total{result=\"error\"} " + load(fanout_error_) + "\n";
+    s += "dfkv_client_remove_fanout_total{result=\"queued_cooling\"} " + load(fanout_queued_cooling_) + "\n";
+    s += "# HELP dfkv_client_remove_unconfirmed_total REMOVEs answered not ok because a target did not confirm in the call: cooling (in this client), failed\n";
+    s += "# TYPE dfkv_client_remove_unconfirmed_total counter\n";
+    s += "dfkv_client_remove_unconfirmed_total{reason=\"cooling\"} " + load(unconfirmed_cooling_) + "\n";
+    s += "dfkv_client_remove_unconfirmed_total{reason=\"failed\"} " + load(unconfirmed_failed_) + "\n";
+    s += "# HELP dfkv_client_registry_gate_open 1 while the registry gate passes (cooldown reroute may act)\n";
+    s += "# TYPE dfkv_client_registry_gate_open gauge\n";
+    s += std::string("dfkv_client_registry_gate_open ") + (gate_open_.load(std::memory_order_relaxed) ? "1" : "0") + "\n";
+    s += "# HELP dfkv_client_registry_gate_failures_total Registry gate transitions from open to closed, by reason\n";
+    s += "# TYPE dfkv_client_registry_gate_failures_total counter\n";
+    s += "dfkv_client_registry_gate_failures_total{reason=\"unmarked_client\"} " + load(gate_failures_[kGateUnmarked]) + "\n";
+    s += "dfkv_client_registry_gate_failures_total{reason=\"stale_registry\"} " + load(gate_failures_[kGateStale]) + "\n";
+    s += "dfkv_client_registry_gate_failures_total{reason=\"no_registry\"} " + load(gate_failures_[kGateNoRegistry]) + "\n";
+    s += "dfkv_client_registry_gate_failures_total{reason=\"s_growing\"} " + load(gate_failures_[kGateSGrowing]) + "\n";
+    s += "# HELP dfkv_client_registry_unmarked_clients Registered clients without the fan-out marker (or its poll_ms) in the last registry answer\n";
+    s += "# TYPE dfkv_client_registry_unmarked_clients gauge\n";
+    s += "dfkv_client_registry_unmarked_clients " + std::to_string(unmarked_gauge_.load(std::memory_order_relaxed)) + "\n";
     s += "# HELP dfkv_client_ring_point_collisions Ring points two members hashed to; the member added later owns each\n";
     s += "# TYPE dfkv_client_ring_point_collisions gauge\n";
     s += "dfkv_client_ring_point_collisions " + std::to_string(collisions) + "\n";
@@ -1359,6 +1999,8 @@ bool KVClient::ExistDirect(const std::string& key, Status* status) {
 // the absent members (absent grace) is absent is removed there too; that
 // member (usually down) need not confirm, its part is queued for its return.
 bool KVClient::RemoveDirect(const std::string& key) {
+  if (fanout_on_ && !t_drain_pass && t_route_to == nullptr)
+    return RemoveFanout({key})[0] != 0;
   const bool ok = RemoveDirectRouted(key);
   if (t_drain_pass || t_route_to != nullptr) return ok;
   if (any_absent_.load(std::memory_order_relaxed)) RemoveAtAbsent({key});
@@ -1512,7 +2154,7 @@ bool KVClient::PutDirect(const std::string& key, const void* value, size_t n,
   outcome = ItemStatus::kBadArgument;
   if (key.empty() || n == 0 || value == nullptr) return false;
   outcome = ItemStatus::kNoRoute;
-  std::string node = Route(key);
+  std::string node = RouteFor(key, RouteOp::kPut);
   if (node.empty()) return false;
   outcome = ItemStatus::kPeerCooling;
   uint64_t now = NowMs();
@@ -1550,7 +2192,7 @@ bool KVClient::GetDirectRouted(const std::string& key, void* out, size_t n,
   outcome = ItemStatus::kBadArgument;
   if (key.empty()) return false;  // as PUT
   outcome = ItemStatus::kNoRoute;
-  std::string node = Route(key);
+  std::string node = RouteFor(key, RouteOp::kGet);
   if (node.empty()) return false;
   outcome = ItemStatus::kPeerCooling;
   uint64_t now = NowMs();
@@ -1583,7 +2225,7 @@ bool KVClient::GetAuto(const std::string& key, std::string* out,
 
 bool KVClient::GetAutoDirectRouted(const std::string& key, std::string* out,
                                    size_t max_bytes) {
-  std::string node = Route(key);
+  std::string node = RouteFor(key, RouteOp::kGet);
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
@@ -1625,7 +2267,7 @@ bool KVClient::GetAutoDirectRouted(const std::string& key, void* out,
   outcome = ItemStatus::kBadArgument;
   if (key.empty()) return false;  // as PUT
   outcome = ItemStatus::kNoRoute;
-  std::string node = Route(key);
+  std::string node = RouteFor(key, RouteOp::kGet);
   if (node.empty()) return false;
   outcome = ItemStatus::kPeerCooling;
   uint64_t now = NowMs();
@@ -1658,7 +2300,7 @@ bool KVClient::Exist(const std::string& key) {
 
 bool KVClient::ExistDirectRouted(const std::string& key, Status* status) {
   if (status) *status = Status::kInvalid;
-  std::string node = Route(key);
+  std::string node = RouteFor(key, RouteOp::kExist);
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
@@ -1728,7 +2370,7 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items,
       if (st) st[i] = ItemStatus::kBadArgument;
       continue;
     }
-    std::string node = Route(items[i].key);
+    std::string node = RouteFor(items[i].key, RouteOp::kPut);
     if (node.empty()) continue;
     by_node[node].push_back(i);
   }
@@ -1923,7 +2565,7 @@ std::vector<bool> KVClient::BatchGetDirectRouted(
         if (st) st[i] = ItemStatus::kBadArgument;
         continue;
       }
-      std::string node = Route(items[i].key);
+      std::string node = RouteFor(items[i].key, RouteOp::kGet);
       if (node.empty()) continue;
       by[{node, items[i].n}].push_back(i);
     }
@@ -2138,7 +2780,7 @@ std::vector<bool> KVClient::BatchGetAutoDirectRouted(
       if (st) st[i] = ItemStatus::kBadArgument;
       continue;
     }
-    std::string node = Route(items[i].key);
+    std::string node = RouteFor(items[i].key, RouteOp::kGet);
     if (node.empty()) continue;
     by[{node, items[i].n}].push_back(i);
   }
@@ -2508,11 +3150,14 @@ void KVClient::BatchRetainRouted(const std::vector<std::string>& keys,
   const uint64_t interval = std::max<uint64_t>(
       req.min_refresh_ms, static_cast<uint64_t>(req.ttl_s) * 100);
   const uint64_t now = NowMs();
+  const RouteOp retain_op = req.mode == kRetainModeSet
+                                ? RouteOp::kRetainSet
+                                : RouteOp::kRetainRefresh;
   std::vector<BlockKey> bks(n);
   std::map<std::pair<std::string, uint64_t>, std::vector<size_t>> by_node;
   for (size_t i = 0; i < n; ++i) {
     bks[i] = block_key_(keys[i]);
-    std::string node = Route(keys[i]);
+    std::string node = RouteFor(keys[i], retain_op);
     if (node.empty()) continue;  // stays kRetError
     if (debounce) {
       RetainDebounceShard& shard =
@@ -2609,7 +3254,7 @@ bool KVClient::RetainPrecheck(const std::vector<std::string>& keys,
                               uint8_t min_headroom_pct) {
   std::set<std::string> owners;
   for (const std::string& key : keys) {
-    std::string node = Route(key);
+    std::string node = RouteFor(key, RouteOp::kExist);
     if (node.empty()) return false;
     owners.insert(std::move(node));
   }
@@ -3297,7 +3942,7 @@ std::vector<bool> KVClient::BatchExistDirectRouted(
   if (pernode_on) unrouted = std::make_unique<PernodeStat>();
   std::map<std::string, std::vector<size_t>> by_node;
   for (size_t i = 0; i < N; ++i) {
-    std::string node = Route(keys[i]);
+    std::string node = RouteFor(keys[i], RouteOp::kExist);
     if (node.empty()) {
       if (pernode_on)
         RecordPernodeNonIssued(unrouted.get(),
@@ -3428,7 +4073,9 @@ std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
   const auto t0 = std::chrono::steady_clock::now();
   const size_t N = keys.size();
   std::vector<char> ok(N, 0);
-  if (!t_->pipelined()) {
+  if (fanout_on_) {
+    ok = RemoveFanout(keys);  // owner, drainer and fan-out set, both forms
+  } else if (!t_->pipelined()) {
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
       ok[i] = RemoveDirect(keys[i]) ? 1 : 0;  // asks a draining owner too
     });
@@ -3539,7 +4186,7 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items,
             items[i].key);
       continue;
     }
-    std::string node = Route(items[i].key);
+    std::string node = RouteFor(items[i].key, RouteOp::kPut);
     if (node.empty()) {
       if (pernode_on)
         RecordPernodeNonIssued(unrouted.get(),
@@ -3972,7 +4619,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirectRouted(const std::vector<KvGetIt
               items[i].key);
         continue;
       }
-      std::string node = Route(items[i].key);
+      std::string node = RouteFor(items[i].key, RouteOp::kGet);
       if (node.empty()) {
         if (pernode_on && !(*nonissued_recorded)[i]) {
           RecordPernodeNonIssued(

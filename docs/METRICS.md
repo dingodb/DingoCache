@@ -391,6 +391,7 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | `dfkv_mds_lease_grants_total` | counter | etcd lease 授予：只在 member 记录不存在或其租约已过期时发生，稳态下不增长 |
 | `dfkv_mds_record_puts_total` / `dfkv_mds_record_puts_skipped_total` | counter | 写进 etcd 的 member/client 记录 / 只续租约、没有写的心跳（记录未变，或只有统计变了且未到 `DFKV_MDS_STATS_PUT_MS`）。稳态下前者每节点约每分钟 1 次 |
 | `dfkv_mds_list_cache_hits_total` | counter | 由 `DFKV_MDS_LIST_CACHE_MS` 缓存回答、没有读 etcd 的 member list 请求 |
+| `dfkv_mds_client_list_cache_hits_total` | counter | 同上，client list（`kListClients`）请求 |
 | `dfkv_mds_fenced_refusals_total` | counter | 被拒绝的已 fence 节点的注册/心跳（`DFKV_MDS_FENCING=1`） |
 | `dfkv_mds_etcd_errors_total` | counter | etcd I/O 失败 |
 | `dfkv_mds_max_conns` | gauge | 生效的并发连接上限：`DFKV_MDS_MAX_CONNS` 按进程 fd 上限折算后的值；小于配置值说明 `LimitNOFILE` 不够 |
@@ -434,6 +435,14 @@ Prometheus 调用。vLLM 使用同一 allowlist，区别只是在 family 前加 
 | `dfkv_client_ring_absent_members` | gauge | 缺席成员数（DEPLOY §4c-2，`DFKV_RING_ABSENT_GRACE_MS`）：从视图消失、仍在宽限期内的成员，不再写入也不读，REMOVE 和 RETAIN 也发给它 |
 | `dfkv_client_ring_absent_dropped_total{reason}` | counter | 移出的缺席成员：`grace` 宽限期满，`bound` 超过 `max(1, N/8)` 的上限立即移出，`planned` 排空后下线、不保留 |
 | `dfkv_client_ring_absent_removes_unconfirmed_total` / `_retried_total` / `_dropped_total` | counter | 缺席成员没确认的 REMOVE / 它回来后重发的次数（每次发送都计）/ 最终没确认的（超出队列上限、成员被移出、回来后一个宽限期仍未确认） |
+| `dfkv_client_cooldown_reroutes_total{op}` | counter | 冷却改道（DEPLOY §4c-3）：owner 在本客户端回避期内、改走替补的 key（`get`、`exist`、`put`、`retain`）；`none`：owner 在回避期内但前几个候选都不能用，照旧跳过 |
+| `dfkv_client_ring_reroute_episode_pending` | gauge | 回避期已结束、在替补上的 REMOVE 还没确认的 key 数；它和正在记账的 key 合计受 `DFKV_RING_REROUTE_KEYS` 限制，持续增长说明某个替补一直清不掉（例如它已经死了），改道写入快被拒绝了 |
+| `dfkv_client_reroute_refused_total` | counter | 已记账的替补 key 达到 `DFKV_RING_REROUTE_KEYS` 后被拒绝的改道写入 |
+| `dfkv_client_reroute_cleanup_total{result}` | counter | 回避期结束（或扇出目标回避期满）时对替补发的清理 REMOVE：`ok`，`queued`（失败，之后补发），`abandoned`（超过上限，或关闭前没发出去） |
+| `dfkv_client_remove_fanout_total{result}` | counter | REMOVE 扇出的消息：`ok`，`error`，`queued_cooling`（目标在本客户端回避期内，记入清理队列） |
+| `dfkv_client_remove_unconfirmed_total{reason}` | counter | 因为有目标没在这次调用里确认而返回失败的 REMOVE：`cooling`（目标在本客户端回避期内）、`failed` |
+| `dfkv_client_registry_gate_open` / `dfkv_client_registry_unmarked_clients` | gauge | 登记门是否打开（冷却改道生效）/ 上次登记表里没带扇出标记（或标记里没有 `poll_ms`）的客户端数 |
+| `dfkv_client_registry_gate_failures_total{reason}` | counter | 登记门由开到关的次数，按原因：`unmarked_client`、`stale_registry`、`no_registry`、`s_growing` |
 | `dfkv_client_drain_requests_total{op,result}` | counter | 发给 key 的排空或缺席 owner 的第二次请求：`op=read`（新 owner 未命中后的读，只问排空 owner）、`remove`、`retain`（两边都发，含缺席 owner）；`result=served` 它有这个 key（或确认删除），`not_served` 没有或失败 |
 | `dfkv_client_dedup_hits_total` / `dfkv_client_dedup_fetches_total` / `dfkv_client_dedup_wait_hits_total` / `dfkv_client_dedup_wait_timeouts_total` | counter | host rendezvous 命中、真实 fetch、等待后命中、等待后回退直连（等满 `DFKV_NODE_DEDUP_WAIT_MS`，或 leader 放弃 / 已发布条目不可用而提前回退，两者不区分） |
 | `dfkv_client_gpu_dedup_hits_total` / `dfkv_client_gpu_dedup_fetches_total` / `dfkv_client_gpu_dedup_wait_hits_total` / `dfkv_client_gpu_dedup_wait_timeouts_total` | counter | 同上 CUDA IPC rendezvous。另：发布中的 slot 被收回（发布者超过 `DFKV_NODE_DEDUP_TAKEOVER_MS` 或该 key 被写入/删除）之后，到下一次 fetch 认领之前 slot 读作空，正在等的 follower 复查一次后放弃并自行读取，计入 wait_timeouts，也多一次远端读取 |

@@ -195,11 +195,9 @@ MdsServer::MdsServer(const std::string& etcd_addr, int etcd_timeout_ms,
           600000)),
       // DFKV_MDS_LIST_CACHE_MS: how long a member-list answer is reused (see
       // ListCache); 0 = every poll reads etcd, the behavior up to 2.42.
-      list_cache_(std::min<uint64_t>(
-                      config_dump::EnvU64("DFKV_MDS_LIST_CACHE_MS",
-                                          kListCacheMs),
-                      10000),
-                  SteadyNowMs),
+      // Client lists use it too, at most kMaxClientListCacheMs.
+      list_cache_(ListCacheMs(), SteadyNowMs),
+      client_list_cache_(ClientListCacheMs(), SteadyNowMs),
       // DFKV_MDS_FENCING: member fencing (dfkvctl member fence). Off by
       // default: it adds records under /fenced/ to the etcd layout and a
       // read per heartbeat, and every MDS of a group has to have it on, or
@@ -430,7 +428,12 @@ Status MdsServer::UpsertClient(const std::string& group, const MemberInfo& m) {
   // Same path-traversal guard as Upsert; clients live under a parallel prefix
   // (/clients/<id>) so a malformed id can't escape into /members/ either.
   if (!IsValidGroupOrId(group) || !IsValidGroupOrId(m.id)) return Status::kInvalid;
-  return UpsertLeased(ClientKey(group, m.id), m, client_leases_, true);
+  bool wrote = false;
+  const Status st =
+      UpsertLeased(ClientKey(group, m.id), m, client_leases_, true, &wrote);
+  // A record written here changes the client list: the next poll reads it.
+  if (wrote) client_list_cache_.Invalidate(group);
+  return st;
 }
 
 namespace {
@@ -813,6 +816,27 @@ Status MdsServer::ListClients(const std::string& group, std::string* out) {
   // Same path-traversal guard as ListMembers: a malformed group would build a
   // RangePrefix straddling other groups' client subtrees.
   if (!IsValidGroupOrId(group)) return Status::kInvalid;
+  bool hit = false;
+  const Status st = client_list_cache_.Get(
+      group, false, out,
+      [&](std::string* fresh) { return ListClientsFromEtcd(group, fresh); },
+      &hit);
+  if (hit)
+    metrics_.client_list_cache_hits.fetch_add(1, std::memory_order_relaxed);
+  return st;
+}
+
+uint64_t MdsServer::ListCacheMs() {
+  return std::min<uint64_t>(
+      config_dump::EnvU64("DFKV_MDS_LIST_CACHE_MS", kListCacheMs), 10000);
+}
+
+uint64_t MdsServer::ClientListCacheMs() {
+  return std::min<uint64_t>(ListCacheMs(), kMaxClientListCacheMs);
+}
+
+Status MdsServer::ListClientsFromEtcd(const std::string& group,
+                                      std::string* out) {
   std::string prefix = "/dfkv/v1/groups/" + group + "/clients/";
   auto r = etcd_.RangePrefix(prefix);
   if (!r) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }

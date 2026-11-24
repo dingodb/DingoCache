@@ -199,6 +199,18 @@ class KVClient {
   // Drop the absent members whose grace has passed. MDS discovery calls it
   // once a second; public for tests.
   void TickAbsent();
+  // Cooldown reroute (DFKV_RING_COOLDOWN_REROUTE): end the episodes whose
+  // owner's cooldown has expired, send queued cleanup REMOVEs, re-evaluate
+  // the registry gate. MDS discovery calls it once a second; public for
+  // tests, as is the registry answer below.
+  void TickReroute();
+  void OnRegistry(bool ok, const std::vector<MemberInfo>& clients);
+  // Tests: act as a client that registered and polls every `poll_ms`,
+  // without an MDS (the registry answers then come from OnRegistry).
+  void UseRegistryGateForTest(int poll_ms);
+  uint64_t RecentKeepMsForTest() const;
+  // A view the member poller saw (admitted or not): kept as a recent ring.
+  void NoteSeenView(const std::vector<MemberInfo>& placement);
 
   // Start background MDS discovery: poll the MDS endpoints for `group` and rebuild
   // the ring on each epoch change. Replaces static membership.
@@ -247,6 +259,12 @@ class KVClient {
 
  private:
   std::string Route(const std::string& key) const;
+  // Route for an operation: Route, except that with cooldown reroute on and
+  // the gate open a key whose owner cools in this client goes to its
+  // substitute (§3.2 of docs/design/ring-unavailable-owner.md). "" for a
+  // write refused because DFKV_RING_REROUTE_KEYS keys are tracked.
+  enum class RouteOp { kGet, kExist, kPut, kRetainSet, kRetainRefresh };
+  std::string RouteFor(const std::string& key, RouteOp op);
   uint64_t NowMs() const;
   void ProbeLoop();
   // Swap in a freshly-built ring under ring_mu_ and log the membership delta
@@ -509,6 +527,97 @@ class KVClient {
     return AutoBatchWorkers(batch_concurrency_.load(std::memory_order_relaxed), groups);
   }
   std::unique_ptr<MdsMemberPoller> poller_;
+
+  // ---- Cooldown reroute and REMOVE fan-out (CLI-02 stage C) ----
+  bool reroute_on_ = false;  // DFKV_RING_COOLDOWN_REROUTE
+  // REMOVE fan-out and the registry marker: on whenever C (or B) is
+  // configured, even while the gate keeps C off.
+  bool fanout_on_ = false;
+  size_t fanout_ = 3;  // DFKV_RING_REMOVE_FANOUT
+  int own_poll_ms_ = 0;  // StartMdsDiscovery's poll interval; 0 = none
+  // Recent rings: the write rings of the views adopted or seen within the
+  // last S (ring_mu_). `adopted` / `seen` mark the current ones; the others
+  // stopped being current at last_ms.
+  struct RecentRing {
+    std::map<std::string, int> weight;
+    std::map<std::string, std::string> addr;
+    ConHash ring;
+    uint64_t last_ms = 0;
+    bool adopted = false;
+    bool seen = false;
+  };
+  std::vector<RecentRing> recent_;
+  ConHash recent_union_;                    // every member of recent_
+  std::set<std::string> recent_stable_;     // members in every one of them
+  std::map<std::string, std::string> recent_addr_;
+  void NoteRecentLocked(const std::map<std::string, int>& weight,
+                        const std::map<std::string, std::string>& addr,
+                        bool adopted, uint64_t now);
+  void RebuildRecentLocked();
+  bool ExpireRecentLocked(uint64_t now);
+  std::string SubstituteLocked(uint32_t hash, const std::string& owner,
+                               uint64_t now) const;
+  void FanoutTargetsLocked(uint32_t hash, std::set<std::string>* out) const;
+  // The registry gate (gate_mu_ for the fields, gate_open_ read lock-free).
+  std::atomic<bool> gate_open_{false};
+  std::mutex gate_mu_;
+  bool registry_seen_ = false;
+  bool registered_ = false;  // StartClientRegistration ran
+  uint64_t registry_ok_ms_ = 0;
+  uint64_t s_ms_ = 0;          // S in use
+  uint64_t s_next_ms_ = 0;     // a different S waiting (0: none)
+  uint64_t s_change_ms_ = 0;   // when s_next_ms_ was first seen
+  uint64_t poll_max_ms_ = 0;   // from the last answer
+  size_t unmarked_clients_ = 0;
+  std::atomic<uint64_t> recent_keep_ms_{0};  // max(S, a growing S)
+  std::atomic<size_t> unmarked_gauge_{0};
+  enum GateReason { kGateUnmarked, kGateStale, kGateNoRegistry, kGateSGrowing,
+                    kGateReasons };
+  std::atomic<uint64_t> gate_failures_[kGateReasons] = {};
+  void EvaluateGateLocked(uint64_t now);
+  // Episodes: keys written to substitutes, by owner address and episode
+  // (the owner's cooldown end, PeerHealth::CooldownUntil), as (key,
+  // substitute address). The keys of an ended episode move to
+  // episode_cleanup_ (by substitute) until their REMOVE is confirmed: no read
+  // finds them, and they are never given up but at close. They and the
+  // tracked keys share DFKV_RING_REROUTE_KEYS. fanout_cleanup_ holds the
+  // parts of fan-out REMOVEs whose target cooled (cleanup only), under its
+  // own bound of the same size, past which they are given up and counted.
+  mutable std::mutex reroute_mu_;
+  std::map<std::string,
+           std::map<uint64_t, std::set<std::pair<std::string, std::string>>>>
+      reroute_keys_;
+  size_t reroute_tracked_ = 0;
+  size_t reroute_cap_ = 65536;  // DFKV_RING_REROUTE_KEYS
+  std::map<std::string, std::set<std::string>> episode_cleanup_;
+  size_t episode_pending_ = 0;
+  std::map<std::string, std::set<std::string>> fanout_cleanup_;
+  size_t fanout_pending_ = 0;
+  uint64_t reroute_close_ms_ = 2000;  // DFKV_RING_REROUTE_CLOSE_MS
+  bool TrackReroute(const std::string& owner, uint64_t episode,
+                    const std::string& key, const std::string& sub);
+  void QueueFanoutCleanupLocked(const std::string& addr,
+                                const std::string& key);
+  // REMOVE keys at explicit nodes: per (node, keys) group, one result per key
+  // (1 confirmed, 0 failed, 2 not sent: the node cools in this client).
+  std::vector<std::vector<char>> RemoveAtNodes(
+      const std::vector<std::pair<std::string, std::vector<std::string>>>&
+          groups);
+  // Send the cleanup queues' REMOVEs to nodes that do not cool, and the episodes of
+  // owners that no longer cool (all of them with `all`), until `deadline_ms`
+  // (0: no bound). Returns the number of keys left unsent.
+  size_t RunCleanup(bool all, uint64_t deadline_ms);
+  std::vector<char> RemoveFanout(const std::vector<std::string>& keys);
+  void CloseReroute();
+  enum RerouteOpIndex { kRrGet, kRrExist, kRrPut, kRrRetain, kRrNone,
+                        kRrOps };
+  std::atomic<uint64_t> reroutes_[kRrOps] = {};
+  std::atomic<uint64_t> reroute_refused_{0};
+  std::atomic<uint64_t> fanout_ok_{0}, fanout_error_{0},
+      fanout_queued_cooling_{0};
+  std::atomic<uint64_t> unconfirmed_cooling_{0}, unconfirmed_failed_{0};
+  std::atomic<uint64_t> cleanup_ok_{0}, cleanup_queued_total_{0},
+      cleanup_abandoned_{0};
   // Same-host GET rendezvous (phase 5, DFKV_CLIENT_NODE_DEDUP=1; host-memory
   // destinations only). nullptr = feature off.
   std::unique_ptr<NodeDedup> dedup_;

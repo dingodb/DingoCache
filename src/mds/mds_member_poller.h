@@ -13,6 +13,8 @@
 
 #include "mds/mds_endpoints.h"
 #include "common/membership.h"
+#include "common/status.h"
+#include "transport/wire.h"
 
 namespace dfkv {
 
@@ -202,6 +204,12 @@ class MdsMemberPoller {
   // Run `tick` on the poll thread every `every_ms` between polls (absent
   // grace uses it to drop members whose grace passed). Set before Start().
   void SetTick(std::function<void()> tick, int every_ms);
+  // Read the group's client registry (kListClients) after every poll and
+  // hand it over (ok false: no answer). Set before Start().
+  using OnRegistry =
+      std::function<void(bool, const std::vector<MemberInfo>&)>;
+  void SetRegistry(OnRegistry cb);
+  int poll_ms() const { return poll_ms_; }
   void Start();
   void Stop();
   bool PollOnce();
@@ -223,6 +231,10 @@ class MdsMemberPoller {
 
  private:
   bool Query(std::vector<MemberInfo>* out, uint64_t* epoch);
+  bool Request(const std::string& ep, WireOp op, Status* status,
+               std::string* data);
+  bool QueryClients(std::vector<MemberInfo>* out);
+  void PollRegistry();
   void Loop();
   bool WaitMs(int ms);
   uint64_t NowMs() const;
@@ -234,6 +246,7 @@ class MdsMemberPoller {
   int poll_ms_;
   int io_ms_;
   std::function<void()> tick_;
+  OnRegistry registry_cb_;
   int tick_ms_ = 0;
   uint64_t last_topology_epoch_ = 0;
   uint64_t last_placement_epoch_ = 0;

@@ -113,6 +113,29 @@ class PeerHealth {
     unhealthy_skips_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
+  // True while `peer`'s cooldown has not expired: a check that takes no
+  // trial and counts nothing (cooldown reroute, REMOVE fan-out). With no
+  // peer cooling it takes no lock.
+  bool Cooling(const std::string& peer, uint64_t now_ms) const {
+    if (until_count_.load(std::memory_order_relaxed) == 0) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = until_.find(peer);
+    return it != until_.end() && it->second > now_ms;
+  }
+  // The running cooldown's end (ms), or 0 when `peer` does not cool. A new
+  // cooldown always ends later than the one before, so the value names the
+  // cooldown (an episode of cooldown reroute).
+  uint64_t CooldownUntil(const std::string& peer, uint64_t now_ms) const {
+    if (until_count_.load(std::memory_order_relaxed) == 0) return 0;
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = until_.find(peer);
+    return it != until_.end() && it->second > now_ms ? it->second : 0;
+  }
+  // Some peer has a cooldown recorded (it may have expired): a cheap
+  // pre-check before Cooling.
+  bool AnyCooldown() const {
+    return until_count_.load(std::memory_order_relaxed) != 0;
+  }
   void MarkBad(const std::string& peer, uint64_t now_ms) {
     std::lock_guard<std::mutex> lk(mu_);
     errors_.fetch_add(1, std::memory_order_relaxed);
@@ -146,6 +169,7 @@ class PeerHealth {
     uint64_t cd = base_cooldown_ms_ << shift;
     if (cd > max_cooldown_ms_ || cd < base_cooldown_ms_ /*overflow*/) cd = max_cooldown_ms_;
     until_[peer] = now_ms + cd;
+    until_count_.store(until_.size(), std::memory_order_relaxed);
     trial_until_.erase(peer);
     marked_bad_.fetch_add(1, std::memory_order_relaxed);  // healthy->bad edge
   }
@@ -275,6 +299,7 @@ class PeerHealth {
     if (tracked_.size() == kMaxPeers) {
       const std::string victim = peer_lru_.front();
       until_.erase(victim);
+      until_count_.store(until_.size(), std::memory_order_relaxed);
       trial_until_.erase(victim);
       probe_used_.erase(victim);
       fail_streak_.erase(victim);
@@ -295,6 +320,7 @@ class PeerHealth {
     trial_until_.erase(peer);
     probe_used_.erase(peer);
     if (until_.erase(peer)) recovered_.fetch_add(1, std::memory_order_relaxed);  // bad->good edge
+    until_count_.store(until_.size(), std::memory_order_relaxed);
   }
 
   static constexpr size_t kMaxPeers = 4096;  // global address-state cardinality cap
@@ -303,6 +329,7 @@ class PeerHealth {
   uint64_t max_cooldown_ms_;
   uint64_t busy_grace_ms_;
   std::unordered_map<std::string, uint64_t> until_;        // peer -> unhealthy-until (ms)
+  std::atomic<size_t> until_count_{0};                     // until_.size(), lock-free
   // peer -> end of the lease of the trial admitted after its cooldown
   mutable std::unordered_map<std::string, uint64_t> trial_until_;
   // peers whose current incident has had its probe-granted early trial

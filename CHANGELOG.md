@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+
+- Client: cooldown reroute (CLI-02 stage C), behind
+  `DFKV_RING_COOLDOWN_REROUTE` (default 0 = off; MDS discovery only). A key
+  whose owner this client's PeerHealth has in cooldown goes to a substitute
+  for PUT, GET, EXIST and RETAIN: the first stable, non-cooling member among
+  the key's first `DFKV_RING_REMOVE_FANOUT` (default 3) successors on the
+  union of the write rings this client adopted or saw in the last S (11 of
+  the group's longest poll intervals). The keys written to a substitute are
+  removed from it when its episode (that cooldown) ends (at most
+  `DFKV_RING_REROUTE_KEYS`, default 65536, tracked or waiting for their
+  cleanup; past that a rerouted write is refused), and by a
+  clean close within `DFKV_RING_REROUTE_CLOSE_MS` (default 2000). A REMOVE
+  fans out to the key's successors on every recent ring, the drainer and the
+  absent owner, and is ok only if every target confirms in the call: while
+  one of N members cools, about (`DFKV_RING_REMOVE_FANOUT` + 1)/N of the
+  REMOVEs fail, against 1/N without the switch. The reroute acts only while
+  every client of the group's MDS client registry carries the fan-out marker
+  this release adds to its registration (`dfkv-remove-fanout=1;poll_ms=`);
+  enable the switch on every registered client, readers included. Measured
+  on a test ring of eight server processes (64-block prefixes, a miss
+  recomputed and PUT again): a member killed for 90 s and back with its
+  data, full-prefix hit rate in the first 10 s 36 % (0 % off), 88 % in the
+  next 20 s (3 % off), 90 MiB recomputed instead of 149; killed for 3 s,
+  49 % in the first 10 s (32 % off). With clients removing keys throughout,
+  no key was served after its REMOVE returned ok while the reroute acted.
+  New `dfkv_client_cooldown_reroutes_total{op}`,
+  `dfkv_client_reroute_refused_total`, `dfkv_client_reroute_cleanup_total{result}`,
+  `dfkv_client_remove_fanout_total{result}`,
+  `dfkv_client_remove_unconfirmed_total{reason}`,
+  `dfkv_client_registry_gate_open`, `dfkv_client_registry_gate_failures_total{reason}`,
+  `dfkv_client_registry_unmarked_clients`. Off, routing, REMOVE and close are
+  unchanged.
+- MDS: `kListClients` is answered from a client-list cache, as member lists
+  are, for `DFKV_MDS_LIST_CACHE_MS` but at most 1000 ms (member lists keep
+  the value as before, up to 10000 ms). This holds for every caller,
+  `dfkvctl clients` included: a client registered at another MDS can be
+  missing from its answer for up to that TTL. New
+  `dfkv_mds_client_list_cache_hits_total`.
 - Client, GPU dedup: publishing fetched keys and copying hits synchronize
   the CUDA stream once per batch (per chunk of at most half the arena for
   publishes) instead of once per key. Measured on one GPU: 512 keys of 64
