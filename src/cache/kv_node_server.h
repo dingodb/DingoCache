@@ -217,6 +217,7 @@ class KvNodeServer {
   const std::string& engine_name() const { return group_.EngineName(); }
   const std::string& write_mode() const { return group_.WriteMode(); }
   uint64_t ram_arena_bytes() const { return ram_ ? ram_->arena_bytes() : 0; }
+  RamTier* ram_tier() const { return ram_.get(); }
   bool ram_ack_enabled() const { return ram_ack_enabled_; }
 
   // SIGHUP: read the tenant quotas file again (DiskCacheGroup::ReloadTenantQuotas).

@@ -5,6 +5,7 @@
 #ifndef DFKV_CACHE_RDMA_SERVER_ENV_H_
 #define DFKV_CACHE_RDMA_SERVER_ENV_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -65,6 +66,47 @@ inline int RdmaStopDrainMsFromEnv() {
   spec.zero_means = "Stop() closes connections at once";
   const uint64_t v = envparse::EnvU64("DFKV_RDMA_STOP_DRAIN_MS", spec);
   return v == 0 ? -1 : static_cast<int>(v);
+}
+
+// Server memory windows (DFKV_RDMA_SERVER_MW, off by default; see
+// docs/design/server-memory-windows.md). The quarantine floor can only be
+// raised: below 5 ms (or not a number) is the default 5 ms. The longest
+// quarantine a grant may need before it takes a per-grant MR instead:
+// default 50 ms, at least the floor.
+struct RdmaServerMwSettings {
+  bool enabled = false;
+  uint64_t floor_ms = 5;
+  uint64_t max_ms = 50;
+  uint64_t quarantine_bytes = 0;  // 0: an eighth of the receive pool
+  uint64_t arena_bytes = 0;       // per rail; 0: the whole arena
+  uint64_t link_gbps = 0;         // lower bound on the link rate; 0: ports
+};
+inline RdmaServerMwSettings RdmaServerMwFromEnv() {
+  RdmaServerMwSettings out;
+  out.enabled = envparse::EnvSwitch("DFKV_RDMA_SERVER_MW", false,
+                                    envparse::OffWhen::kOffWord);
+  envparse::U64Spec floor_spec;
+  floor_spec.fallback = 5;
+  floor_spec.min = 5;
+  floor_spec.max = 1000;
+  floor_spec.above = envparse::Above::kClamp;
+  out.floor_ms =
+      envparse::EnvU64("DFKV_RDMA_SERVER_MW_QUARANTINE_MS", floor_spec);
+  envparse::U64Spec max_spec;
+  max_spec.fallback = 50;
+  max_spec.min = 1;
+  max_spec.max = 10000;
+  max_spec.above = envparse::Above::kClamp;
+  out.max_ms = std::max(
+      out.floor_ms,
+      envparse::EnvU64("DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS", max_spec));
+  envparse::U64Spec bytes_spec;  // 0 = default, said by the caller
+  out.quarantine_bytes =
+      envparse::EnvU64("DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES", bytes_spec);
+  out.arena_bytes =
+      envparse::EnvU64("DFKV_RDMA_SERVER_MW_ARENA_BYTES", bytes_spec);
+  out.link_gbps = envparse::EnvU64("DFKV_RDMA_SERVER_MW_LINK_GBPS", bytes_spec);
+  return out;
 }
 
 // A receive-pool byte count. rdma::ResolveRecvSegmentBytes does the parsing,

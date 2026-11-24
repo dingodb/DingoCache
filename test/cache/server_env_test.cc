@@ -308,3 +308,33 @@ TEST(ServerEnv, RecvBytesWarningNamesTheValueInUse) {
 }
 
 }  // namespace
+
+// Server memory windows: off unless asked for; the quarantine floor can only
+// be raised above 5 ms and the maximum is never below the floor.
+TEST(ServerEnv, ServerMemoryWindowSettings) {
+  for (const char* name :
+       {"DFKV_RDMA_SERVER_MW", "DFKV_RDMA_SERVER_MW_QUARANTINE_MS",
+        "DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS",
+        "DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES",
+        "DFKV_RDMA_SERVER_MW_ARENA_BYTES", "DFKV_RDMA_SERVER_MW_LINK_GBPS"})
+    ::unsetenv(name);
+  RdmaServerMwSettings out = RdmaServerMwFromEnv();
+  EXPECT_FALSE(out.enabled);
+  EXPECT_EQ(out.floor_ms, 5u);
+  EXPECT_EQ(out.max_ms, 50u);
+  EXPECT_EQ(out.quarantine_bytes, 0u);
+  EXPECT_EQ(out.arena_bytes, 0u);
+  std::string log = LogOf("DFKV_RDMA_SERVER_MW", "1", [&] {
+    out = RdmaServerMwFromEnv();
+  });
+  EXPECT_TRUE(out.enabled);
+  log = LogOf("DFKV_RDMA_SERVER_MW_QUARANTINE_MS", "1",
+              [&] { out = RdmaServerMwFromEnv(); });
+  EXPECT_EQ(out.floor_ms, 5u);
+  EXPECT_TRUE(Names(log, "DFKV_RDMA_SERVER_MW_QUARANTINE_MS", "1"));
+  ::setenv("DFKV_RDMA_SERVER_MW_QUARANTINE_MS", "80", 1);
+  out = RdmaServerMwFromEnv();
+  ::unsetenv("DFKV_RDMA_SERVER_MW_QUARANTINE_MS");
+  EXPECT_EQ(out.floor_ms, 80u);
+  EXPECT_EQ(out.max_ms, 80u) << "the maximum is at least the floor";
+}

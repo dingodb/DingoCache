@@ -269,6 +269,38 @@
   once was slower: 620-683 ms against 411-417 ms for 1 GiB on two rails),
   and the lock is taken only to publish the new declaration, whole. A
   destroyed transport waits for a registration in flight.
+- Server, RDMA: GET grants can be bound by memory windows (RDS-09,
+  `DFKV_RDMA_SERVER_MW=1`, off by default; design in
+  `docs/design/server-memory-windows.md`). Each GET registered a memory
+  region over the value it served and deregistered it at the RELEASE, about
+  55 us per GET (220 us at 4 MiB). With the switch on, each receive chunk
+  and RAM-arena extent is registered once per rail, with no remote access,
+  and a GET binds a type-2B window on its own connection (3.5 us) that the
+  RELEASE invalidates (3.4 us); the range is reused only after the
+  invalidation's completion and a quarantine of at least 5 ms (longer with
+  many GET bytes outstanding on the rail). Measured, one GET at a time:
+  the server's authorization of a grant 15-30 -> 1-1.5 us; GET p50 from the
+  RAM tier 221 -> 146 us at 64 KiB, 220 -> 198 us at 1 MiB, 424 -> 508 us
+  at 4 MiB (its RELEASE reply waits behind the invalidation), from disk
+  170 -> 118 us at 64 KiB and 448 -> 383 us at 4 MiB.
+  Nothing changes on the wire; clients of every version are served. A rail
+  whose device has no type-2B windows, a connection that cannot allocate
+  them, memory not registered yet, a full quarantine: each uses the
+  per-grant MR, counted. Leased PUTs keep their per-grant MR. The residual
+  risk is confidentiality only, toward a client violating the protocol
+  (reading after its own RELEASE); never data corruption. On mlx5 a READ
+  accepted before the invalidation, or its retransmission, may read the
+  reused range for up to the client's transport retry horizon (about 3.7 s
+  at the defaults); the quarantine does not cover that. The default stays
+  off until it is established on real hardware whether mlx5 re-checks the
+  R_Key on a retransmitted READ, and until GETs staged from disk are no
+  longer slower with it under concurrency (4 client threads, 256 KiB: e.g.
+  6100 -> 4700 GET/s; cause open). From the RAM tier windows are as fast
+  or faster (64 KiB in batches of 8: 26600 -> 42700 GET/s). New
+  `dfkv_rdma_server_mw_*` metrics and
+  `dfkv_rdma_server_grant_register_seconds` (both modes). A receive chunk
+  is now freed after the pool lock is released when it is trimmed.
+
 
 - RDMA client: the device context stays open while the transport lives
   (TRN-16). Each rail's device context and protection domain are now held

@@ -86,6 +86,17 @@ inline double NowSteadySec() {
 }
 
 
+// Added to twice a revoked GET range's wire time in its quarantine
+// (MwQuarantineUs); measured, see docs/design/server-memory-windows.md.
+constexpr uint64_t kMwMarginUs = 1000;
+
+uint64_t SteadyNs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
 size_t RecvSegmentBytes() {
   constexpr size_t kDefault = 128ull << 30;
   const size_t bytes =
@@ -231,6 +242,19 @@ RdmaServer::RdmaServer(Handler handler, size_t max_msg,
   dev_name_ = anchor_devs_.front();
   session_fd_enabled_ =
       config_dump::EnvBool("DFKV_RDMA_SESSION_FD", false);
+  const RdmaServerMwSettings mw = RdmaServerMwFromEnv();
+  mw_enabled_ = mw.enabled;
+  mw_floor_us_ = mw.floor_ms * 1000;
+  mw_max_us_ = mw.max_ms * 1000;
+  mw_margin_us_ = kMwMarginUs;
+  mw_quarantine_cap_ = mw.quarantine_bytes;  // 0: set by Start
+  mw_arena_cap_ = mw.arena_bytes;
+  mw_link_gbps_ = mw.link_gbps;
+  config_dump::RecordResolved("DFKV_RDMA_SERVER_MW", mw_enabled_ ? "1" : "0");
+  config_dump::RecordResolved("DFKV_RDMA_SERVER_MW_QUARANTINE_MS",
+                              std::to_string(mw.floor_ms));
+  config_dump::RecordResolved("DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS",
+                              std::to_string(mw.max_ms));
 }
 
 RdmaServer::~RdmaServer() { Stop(); }
@@ -353,6 +377,12 @@ Status RdmaServer::Start(int port) {
   const bool recv_huge_pages =
       config_dump::EnvBool("DFKV_RDMA_RECV_HUGEPAGES", true);
   recv_segments_.set_huge_pages(recv_huge_pages);
+  // A chunk windows are bound in is deregistered before its memory goes
+  // (the trim unlinks it first, under the pool lock).
+  if (mw_enabled_)
+    recv_segments_.set_release_hook([this](const rdma::RecvSegment* segment) {
+      return mw_regions_.Forget(segment->data());
+    });
   const size_t min_slot_bytes = rdma::V2SlotSize(max_msg_);
   // Reserve one staging chunk only if it can hold the largest legal staged
   // object and the hard budget still fits one resident chunk per configured
@@ -448,6 +478,62 @@ Status RdmaServer::Start(int port) {
   recv_segment_registered_rails_ = anchors_.size();
   LogTopologySummary(requested_devices.size(), anchors_.size(),
                      discovery.devices);
+  rail_mw_.assign(anchors_.size(), 0);
+  rail_grant_bytes_ =
+      std::make_unique<std::atomic<uint64_t>[]>(anchors_.size());
+  if (mw_enabled_) {
+    uint64_t slowest = 0;
+    bool any = false;
+    // Windows per connection: one per pull slot. The receive pool bounds the
+    // connections: at most that many control connections of full depth.
+    const uint64_t connections =
+        recv_segment_max_bytes_ /
+        std::max<uint64_t>(1, PipelineDepth() *
+                                  rdma::V2SlotSize(rdma::kV2ControlCap));
+    for (size_t rail = 0; rail < anchors_.size(); ++rail) {
+      rdma::RcEndpoint& anchor = *anchors_[rail];
+      rail_mw_[rail] = anchor.ProbeType2Windows() ? 1 : 0;
+      any = any || rail_mw_[rail];
+      const uint64_t rate = anchor.PortRateMbps();
+      if (rate != 0 && (slowest == 0 || rate < slowest)) slowest = rate;
+      DFKV_LOG_INFO("rdma: rail " + anchor_devs_[rail] + ": GET grants use " +
+                    (rail_mw_[rail] ? "memory windows (type 2B)"
+                                    : "per-grant MRs (no type-2B windows)") +
+                    ", link " + std::to_string(rate) + " Mbit/s");
+      const int max_mw = anchor.MaxWindows();
+      if (rail_mw_[rail] && max_mw > 0 &&
+          static_cast<uint64_t>(max_mw) < connections * PipelineDepth())
+        DFKV_LOG_WARN("rdma: rail " + anchor_devs_[rail] + " offers " +
+                      std::to_string(max_mw) + " memory windows, fewer than "
+                      "depth x the connections the receive pool can hold (" +
+                      std::to_string(connections * PipelineDepth()) +
+                      "); connections past it serve GETs with per-grant MRs");
+    }
+    if (mw_link_gbps_ != 0 &&
+        (slowest == 0 || mw_link_gbps_ * 1000 < slowest))
+      slowest = mw_link_gbps_ * 1000;
+    mw_rate_mbps_ = slowest;
+    if (mw_quarantine_cap_ == 0) mw_quarantine_cap_ = recv_segment_max_bytes_ / 8;
+    if (mw_arena_tier_ && mw_arena_tier_->arena_base() &&
+        mw_arena_tier_->extent_bytes() != 0) {
+      mw_arena_ = mw_arena_tier_->arena_base();
+      mw_arena_bytes_ = mw_arena_tier_->arena_bytes();
+      mw_extent_bytes_ = mw_arena_tier_->extent_bytes();
+      mw_arena_tier_->HoldArenaRegistrations(1);
+    }
+    if (any)
+      mw_regions_.Start(
+          anchors_.size(),
+          [this](size_t rail, char* base, size_t size) -> ibv_mr* {
+            if (mw_register_for_test_ && !mw_register_for_test_(rail, base))
+              return nullptr;
+            return anchors_[rail]->RegisterBindRegion(base, size);
+          },
+          [](ibv_mr* mr) { return rdma::RcEndpoint::DeregisterBindRegion(mr); },
+          mw_arena_cap_);
+    config_dump::RecordResolved("DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES",
+                                std::to_string(mw_quarantine_cap_));
+  }
   if (anchor_devs_.size() > 1)
     DFKV_LOG_INFO("rdma multi-rail anchors: " +
                   std::to_string(anchors_.size()) + "/" +
@@ -509,17 +595,31 @@ Status RdmaServer::Start(int port) {
       NameThisThread("rdma-ports");
       PortWatchLoop();
     });
-  if (recv_chunk_idle_ms_ != 0) {
+  if (recv_chunk_idle_ms_ != 0 || mw_enabled_) {
+    // Also releases quarantined GET ranges (DFKV_RDMA_SERVER_MW), waking
+    // for the earliest end.
     recv_trim_thread_ = std::thread([this] {
       NameThisThread("rdma-recv-trim");
       std::unique_lock<std::mutex> lock(recv_trim_mu_);
+      uint64_t trimmed_us = SteadyUs();
       while (running_.load(std::memory_order_relaxed)) {
-        if (recv_trim_cv_.wait_for(lock, std::chrono::seconds(1), [this] {
-              return !running_.load(std::memory_order_relaxed);
-            }))
-          break;
+        auto wait = std::chrono::microseconds(1000000);
+        if (const uint64_t next = MwQuarantineEndUs(false); next != 0) {
+          const uint64_t now = SteadyUs();
+          wait = std::min(wait, std::chrono::microseconds(
+                                    next > now ? next - now : 0));
+        }
+        // No predicate: a notify for an earlier quarantine end must end
+        // the wait too, not only Stop().
+        recv_trim_cv_.wait_for(lock, wait);
+        if (!running_.load(std::memory_order_relaxed)) break;
         lock.unlock();
-        recv_segments_.TrimIdle(recv_chunk_idle_ms_);
+        if (mw_enabled_) MwReleaseQuarantine(false);
+        // Once a second, as before, however often a quarantine ends.
+        if (recv_chunk_idle_ms_ != 0 && SteadyUs() - trimmed_us >= 1000000) {
+          recv_segments_.TrimIdle(recv_chunk_idle_ms_);
+          trimmed_us = SteadyUs();
+        }
         lock.lock();
       }
     });
@@ -618,6 +718,13 @@ void RdmaServer::Stop() {
   // Under the same lock: a second caller must not release the rails while the
   // first is still joining connection threads.
   std::lock_guard<std::mutex> lk(stop_mu_);
+  // Every window is gone with its connection: the bind-only regions go
+  // before the rails' protection domains, and before the arena.
+  mw_regions_.Stop();
+  if (mw_arena_) {
+    mw_arena_tier_->HoldArenaRegistrations(-1);
+    mw_arena_ = nullptr;
+  }
   anchors_.clear();  // drop the lifetime device refs (frees pool MRs last)
 }
 
@@ -677,6 +784,15 @@ void RdmaServer::Quiesce() {
     conns.swap(conns_);
   }
   for (auto& c : conns) if (c.th.joinable()) c.th.join();
+  // Every connection has put its windowed ranges into quarantine: wait it
+  // out (each at most DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS) and release
+  // them, so their pins and leases are back before the store stops.
+  if (const uint64_t last = MwQuarantineEndUs(true); last != 0) {
+    const uint64_t now = SteadyUs();
+    if (last > now)
+      std::this_thread::sleep_for(std::chrono::microseconds(last - now));
+  }
+  MwReleaseQuarantine(true);
   // Every Serve thread has ended and unwatched its session.
   if (session_thread_.joinable()) {
     const uint64_t one = 1;
@@ -919,6 +1035,89 @@ std::vector<rdma::RcEndpoint*> RdmaServer::PlanPressureVictimsLocked(
                                                   candidates, bytes, rail))
     victims.push_back(owners[i]);
   return victims;
+}
+
+ibv_mr* RdmaServer::MwRegionFor(size_t rail, const char* at, size_t len,
+                                const rdma::RecvSegmentPool::Lease& lease) {
+  const auto inside = [&](const char* base, size_t size) {
+    return at >= base && len <= size &&
+           static_cast<size_t>(at - base) <= size - len;
+  };
+  if (mw_arena_ && inside(mw_arena_, mw_arena_bytes_)) {
+    // Values up to an extent never cross one.
+    const size_t extent = static_cast<size_t>(at - mw_arena_) / mw_extent_bytes_;
+    char* base = mw_arena_ + extent * mw_extent_bytes_;
+    const size_t size = std::min(mw_extent_bytes_,
+                                 mw_arena_bytes_ - extent * mw_extent_bytes_);
+    if (!inside(base, size)) return nullptr;
+    return mw_regions_.Find(rail, base, size,
+                            rdma::BindRegionRegistry::Kind::kArena);
+  }
+  const rdma::RecvSegment* segment = lease ? lease.segment() : nullptr;
+  if (segment && inside(segment->data(), segment->size()))
+    return mw_regions_.Find(rail, segment->data(), segment->size(),
+                            rdma::BindRegionRegistry::Kind::kChunk);
+  return nullptr;
+}
+
+uint64_t RdmaServer::MwQuarantineUsFor(uint64_t rail_bytes) const {
+  return rdma::MwQuarantineUs(rail_bytes, mw_rate_mbps_, mw_floor_us_,
+                              mw_margin_us_);
+}
+
+bool RdmaServer::MwQuarantineAllows(uint64_t rail_bytes,
+                                    uint64_t held_bytes) const {
+  return MwQuarantineUsFor(rail_bytes) <= mw_max_us_ &&
+         mw_quarantine_bytes_.load(std::memory_order_relaxed) + held_bytes <=
+             mw_quarantine_cap_;
+}
+
+void RdmaServer::MwQuarantine(MwQuarantined entry) {
+  // The admission (MwQuarantineAllows) took the decision; more grants on
+  // the rail since then do not stretch it past the maximum.
+  const uint64_t until =
+      SteadyUs() + std::min(MwQuarantineUsFor(entry.rail_bytes), mw_max_us_);
+  const char* at = entry.at;
+  bool earliest = false;
+  {
+    std::lock_guard<std::mutex> lock(mw_quarantine_mu_);
+    mw_quarantine_bytes_.fetch_add(entry.bytes, std::memory_order_relaxed);
+    const auto it = mw_quarantine_.emplace(until, std::move(entry));
+    earliest = it == mw_quarantine_.begin();
+  }
+  mw_quarantined_total_.fetch_add(1, std::memory_order_relaxed);
+  if (mw_event_for_test_) mw_event_for_test_("quarantined", at);
+  if (earliest) {
+    // The trim thread may be asleep until a later end.
+    std::lock_guard<std::mutex> lock(recv_trim_mu_);
+    recv_trim_cv_.notify_all();
+  }
+}
+
+void RdmaServer::MwReleaseQuarantine(bool all) {
+  std::vector<MwQuarantined> ended;
+  {
+    std::lock_guard<std::mutex> lock(mw_quarantine_mu_);
+    const uint64_t now = SteadyUs();
+    auto it = mw_quarantine_.begin();
+    while (it != mw_quarantine_.end() && (all || it->first <= now)) {
+      mw_quarantine_bytes_.fetch_sub(it->second.bytes,
+                                     std::memory_order_relaxed);
+      ended.push_back(std::move(it->second));
+      it = mw_quarantine_.erase(it);
+    }
+  }
+  for (auto& entry : ended) {
+    if (mw_event_for_test_) mw_event_for_test_("released", entry.at);
+    entry.read.Commit(Status::kOk, entry.data_len, entry.read_elapsed_sec);
+  }
+}
+
+uint64_t RdmaServer::MwQuarantineEndUs(bool latest) {
+  std::lock_guard<std::mutex> lock(mw_quarantine_mu_);
+  if (mw_quarantine_.empty()) return 0;
+  return latest ? mw_quarantine_.rbegin()->first
+                : mw_quarantine_.begin()->first;
 }
 
 rdma::RecvSegmentPool::Lease RdmaServer::AllocateReceiveWithPressure(
@@ -1240,6 +1439,17 @@ void RdmaServer::Serve(
     size_t value_len = 0;
     rdma::RecvSegmentPool::Lease lease;
     ibv_mr* mr = nullptr;  // endpoint-owned, revoked before Reset()
+    // A memory window, not an MR, authorizes the client's READ (the
+    // slot's own window, under rkey). Revoking: its invalidation is posted
+    // and not yet complete; the slot stays busy until it is.
+    bool windowed = false;
+    bool revoking = false;
+    uint32_t rkey = 0;
+    const char* read_at = nullptr;  // the range the window covers
+    RdmaServer* server = nullptr;
+    // This grant's bytes in the rail's outstanding GET-grant bytes.
+    std::atomic<uint64_t>* rail_grant_bytes = nullptr;
+    uint64_t granted_bytes = 0;
     // B5-3 zero-copy pull: pinned arena source handed to the peer instead of
     // a staged copy. Empty for staged pulls; the send pin releases exactly
     // when the slot resets (PullRelease or connection teardown).
@@ -1247,7 +1457,33 @@ void RdmaServer::Serve(
     double read_elapsed_sec = 0.0;
     std::atomic<uint64_t>* active_count = nullptr;
     std::atomic<uint64_t>* active_bytes = nullptr;
-    ~PullSlotState() { Reset(); }
+    ~PullSlotState() {
+      // The endpoint, its QP and its windows are gone by now (it is
+      // declared after the slots): what a window covered still waits out
+      // its quarantine.
+      Quarantine();
+      Reset();
+    }
+    // A windowed range leaves the slot for the quarantine, with what holds
+    // it (the staging lease, the arena pin); its window is known dead.
+    void Quarantine() {
+      if (!windowed) return;
+      MwQuarantined entry;
+      entry.bytes = lease ? lease.size() : std::max<size_t>(data_len, 1);
+      if (lease) {
+        active_bytes->fetch_sub(lease.size(), std::memory_order_relaxed);
+        active_count->fetch_sub(1, std::memory_order_relaxed);
+      }
+      entry.lease = std::move(lease);
+      entry.read = std::move(arena_read);
+      entry.data_len = data_len;
+      entry.read_elapsed_sec = read_elapsed_sec;
+      entry.at = read_at;
+      entry.rail_bytes = rail_grant_bytes->load(std::memory_order_relaxed);
+      windowed = false;
+      revoking = false;
+      server->MwQuarantine(std::move(entry));
+    }
     // The staging range alone, when the client reads the value from
     // elsewhere (the RAM arena).
     void ReleaseStaging() {
@@ -1264,6 +1500,13 @@ void RdmaServer::Serve(
         lease.Reset();
       }
       mr = nullptr;
+      windowed = false;
+      revoking = false;
+      rkey = 0;
+      read_at = nullptr;
+      if (granted_bytes != 0)
+        rail_grant_bytes->fetch_sub(granted_bytes, std::memory_order_relaxed);
+      granted_bytes = 0;
       busy = false;
       data_len = 0;
       value_len = 0;
@@ -1275,7 +1518,15 @@ void RdmaServer::Serve(
   for (auto& state : pull_slots) {
     state.active_count = &dynamic_get_active_;
     state.active_bytes = &dynamic_get_bytes_active_;
+    state.server = this;
+    state.rail_grant_bytes = &rail_grant_bytes_[rail_index];
   }
+  // Slots whose window's invalidation is posted and not yet complete.
+  size_t revoking_slots = 0;
+  // Per send slot: the pull slot whose invalidation precedes the reply
+  // posted from it (K: none). The invalidation is unsignalled; the reply's
+  // successful completion, after it on the send queue, means it completed.
+  std::vector<size_t> revoke_on_send(K, K);
   std::vector<MultiPutState> multi_put(K);
   std::vector<LeasePutState> lease_put(K);
   for (auto& state : lease_put) {
@@ -1312,11 +1563,18 @@ void RdmaServer::Serve(
     if (state.generation == 0) ++state.generation;
   };
   constexpr size_t conn_control = rdma::kV2ControlCap;
+  // Memory windows, one per pull slot, when the rail offers them.
+  const bool want_windows = mw_enabled_ && rail_index < rail_mw_.size() &&
+                            rail_mw_[rail_index] != 0;
+  if (want_windows) ep.set_window_slots(K);
   if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), conn_control, K,
                /*ib_port=*/1, /*direct_io_buffers=*/false, conn_max)) {
     close_boot();
     return;
   }
+  const bool conn_windows = want_windows && ep.AllocWindows(K);
+  if (want_windows && !conn_windows)
+    mw_fallback_connections_.fetch_add(1, std::memory_order_relaxed);
   // The connection's own receive slots, and nothing else, are writable by
   // its client: an rkey over the whole chunk let one connection write into
   // another's slots. Zeroed first, so no bytes of a previous connection can
@@ -1660,6 +1918,77 @@ void RdmaServer::Serve(
     size_t first_len = 0;
   };
 
+  // Authorizes the client's READ of [at, at+len) for a GET grant on `slot`:
+  // the slot's window bound to it, when this connection has windows, the
+  // range lies in a registered region and its quarantine fits; an exact MR
+  // otherwise, as before. False if neither could be had.
+  constexpr uint64_t kMwWrTag = uint64_t{1} << 63;  // a bind or invalidation
+  constexpr uint64_t kMwInvalidate = uint64_t{1} << 62;
+  auto authorize_read = [&](size_t slot, const char* at, size_t len,
+                            uint32_t* rkey) -> bool {
+    PullSlotState& state = pull_slots[slot];
+    const uint64_t started_ns = SteadyNs();
+    const size_t bytes = std::max<size_t>(len, 1);
+    bool ok = false;
+    if (conn_windows) {
+      const uint64_t held = state.lease ? state.lease.size() : bytes;
+      const uint64_t rail_bytes =
+          state.rail_grant_bytes->load(std::memory_order_relaxed) + bytes;
+      ibv_mr* region = MwRegionFor(rail_index, at, bytes, state.lease);
+      if (region == nullptr) {
+        mw_fallback_grants_.fetch_add(1, std::memory_order_relaxed);
+      } else if (!MwQuarantineAllows(rail_bytes, held)) {
+        mw_quarantine_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+      } else if (ep.PostBindWindow(slot, region, at, bytes, kMwWrTag | slot,
+                                   rkey)) {
+        state.windowed = true;
+        state.rkey = *rkey;
+        state.read_at = at;
+        mw_binds_.fetch_add(1, std::memory_order_relaxed);
+        ok = true;
+      } else {
+        mw_fallback_grants_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    if (!ok) {
+      state.mr = ep.RegisterLeaseReadRegion(const_cast<char*>(at), bytes);
+      if (state.mr) {
+        *rkey = state.mr->rkey;
+        ok = true;
+      }
+    }
+    if (ok) {
+      state.granted_bytes = bytes;
+      state.rail_grant_bytes->fetch_add(bytes, std::memory_order_relaxed);
+    }
+    grant_register_ns_.fetch_add(SteadyNs() - started_ns,
+                                 std::memory_order_relaxed);
+    grant_registers_.fetch_add(1, std::memory_order_relaxed);
+    return ok;
+  };
+  // A windowed slot's invalidation completed: its range goes into
+  // quarantine and the slot is free for the next request.
+  auto retire_windowed = [&](size_t slot) {
+    PullSlotState& state = pull_slots[slot];
+    if (mw_event_for_test_) mw_event_for_test_("invalidated", state.read_at);
+    state.Quarantine();
+    state.Reset();
+    --revoking_slots;
+    ++state.generation;
+    if (state.generation == 0) ++state.generation;
+  };
+  // A reply's SEND completed: an invalidation posted ahead of it has too.
+  auto on_send_completion = [&](size_t send_slot) {
+    const size_t slot = revoke_on_send[send_slot];
+    if (slot == K) return;
+    revoke_on_send[send_slot] = K;
+    retire_windowed(slot);
+  };
+  auto note_window_failure = [&](const ibv_wc& wc) {
+    if ((wc.wr_id & kMwWrTag) != 0 && (wc.wr_id & kMwInvalidate) != 0)
+      mw_invalidation_failures_.fetch_add(1, std::memory_order_relaxed);
+  };
+
   auto publish_pull = [&](size_t send_slot, size_t slot,
                           const Request& request, const char* output,
                           size_t output_len, size_t value_len,
@@ -1691,14 +2020,13 @@ void RdmaServer::Serve(
     // Empty results retain a revocable release identity, but authorize no
     // payload READ. The one registered sentinel byte is not a wire request.
     if (output_len == 0) output = state.lease.data();
-    state.mr = ep.RegisterLeaseReadRegion(
-        const_cast<char*>(output), std::max<size_t>(output_len, 1));
-    if (!state.mr && prepared.source_registered() && prepared.Stage()) {
+    uint32_t rkey = 0;
+    bool authorized = authorize_read(slot, output, output_len, &rkey);
+    if (!authorized && prepared.source_registered() && prepared.Stage()) {
       output = prepared.data();
-      state.mr = ep.RegisterLeaseReadRegion(
-          const_cast<char*>(output), std::max<size_t>(output_len, 1));
+      authorized = authorize_read(slot, output, output_len, &rkey);
     }
-    if (!state.mr) return error_reply(Status::kIOError);
+    if (!authorized) return error_reply(Status::kIOError);
     // Served from outside the staging range (a coalesced follower reading
     // the arena, a RAM hit through the prepared read): the staging lease is
     // not needed until the RELEASE, so it goes back to the pool now.
@@ -1720,7 +2048,7 @@ void RdmaServer::Serve(
     state.value_len = value_len;
     const rdma::DynamicPullReady ready{
         static_cast<uint32_t>(slot), state.generation, output_len, value_len,
-        reinterpret_cast<uint64_t>(output), state.mr->rkey};
+        reinterpret_cast<uint64_t>(output), rkey};
     EncodeRespVersion(ep.sbuf(send_slot), wire_epoch, Status::kOk,
                       rdma::kDynamicPullReadyBytes, value_len);
     rdma::EncodeDynamicPullReady(ready, ep.sbuf(send_slot) + response_prefix);
@@ -1742,10 +2070,9 @@ void RdmaServer::Serve(
       return false;
     const double read_elapsed_sec = NowSteadySec() - started_sec;
     PullSlotState& state = pull_slots[slot];
-    state.mr = fail_pinned_registration_for_test_ ? nullptr :
-        ep.RegisterLeaseReadRegion(const_cast<char*>(pinned.data()),
-                                   pinned.payload_len());
-    if (!state.mr) {
+    uint32_t rkey = 0;
+    if (fail_pinned_registration_for_test_ ||
+        !authorize_read(slot, pinned.data(), pinned.payload_len(), &rkey)) {
       // Falls back to a staged copy. Worth counting: with the arena no longer
       // registered up front, a memlock limit or a device MR limit shows up
       // here, per read, instead of failing startup.
@@ -1761,7 +2088,7 @@ void RdmaServer::Serve(
     const rdma::DynamicPullReady ready{
         static_cast<uint32_t>(slot), state.generation, state.data_len,
         state.value_len, reinterpret_cast<uint64_t>(state.arena_read.data()),
-        state.mr->rkey};
+        rkey};
     EncodeRespVersion(ep.sbuf(send_slot), wire_epoch, Status::kOk,
                       rdma::kDynamicPullReadyBytes, state.value_len);
     rdma::EncodeDynamicPullReady(ready, ep.sbuf(send_slot) + response_prefix);
@@ -1792,10 +2119,25 @@ void RdmaServer::Serve(
         return invalid_reply();
       const size_t slot = static_cast<size_t>(fields.payload_len - 1);
       PullSlotState& state = pull_slots[slot];
-      if (!state.busy || state.mr == nullptr ||
-          state.generation != fields.length)
+      if (!state.busy || (state.mr == nullptr && !state.windowed) ||
+          state.revoking || state.generation != fields.length)
         return invalid_reply();
-      release_pull(slot);
+      if (state.windowed) {
+        // Revoked on this QP ahead of the reply, which the send queue
+        // orders after it; the range is reused only after the
+        // invalidation's completion and a quarantine.
+        if (!ep.PostLocalInvalidate(state.rkey,
+                                    kMwWrTag | kMwInvalidate | slot)) {
+          mw_invalidation_failures_.fetch_add(1, std::memory_order_relaxed);
+          return false;  // the connection ends; teardown quarantines it
+        }
+        mw_invalidations_.fetch_add(1, std::memory_order_relaxed);
+        state.revoking = true;
+        ++revoking_slots;
+        revoke_on_send[send_slot] = slot;
+      } else {
+        release_pull(slot);
+      }
       encode_status(Status::kOk, 0);
       reply->first_len = response_prefix;
       return true;
@@ -2085,6 +2427,21 @@ void RdmaServer::Serve(
       batch_arrival = std::chrono::steady_clock::now();
     request->batch_arrival = batch_arrival;
   };
+  // A GET for a slot whose window is still being revoked (its RELEASE
+  // reply's completion not yet polled: the client's next request and the
+  // ACK of that reply are separate packets, and either may come first)
+  // waits in the FIFO below until that completion retires the slot.
+  auto waits_for_revocation = [&](const ibv_wc& wc) -> bool {
+    if (revoking_slots == 0 || wc.opcode != IBV_WC_RECV ||
+        wc.wr_id >= K || wc.byte_len != kReqPrefix + rdma::kPullPrepareBytes)
+      return false;
+    const char* frame = ep.rbuf(static_cast<size_t>(wc.wr_id));
+    rdma::PullPrepareControl control;
+    return static_cast<uint8_t>(frame[1]) ==
+               static_cast<uint8_t>(WireOp::kPullRange) &&
+           rdma::DecodePullPrepareControl(frame + kReqPrefix, &control) &&
+           control.slot_index < K && pull_slots[control.slot_index].revoking;
+  };
   auto dispatch_completions = [&](const ibv_wc* batch, int count,
                                   auto&& process_wc,
                                   auto&& has_async_work) -> bool {
@@ -2097,7 +2454,8 @@ void RdmaServer::Serve(
       const bool received = wc.opcode == IBV_WC_RECV ||
                             wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM;
       if (wc.status == IBV_WC_SUCCESS && received &&
-          (pending_recv_count != 0 || free_send.empty())) {
+          (pending_recv_count != 0 || free_send.empty() ||
+           waits_for_revocation(wc))) {
         if (pending_recv_count == K) return false;
         pending_recv[(pending_recv_head + pending_recv_count) % K] = wc;
         ++pending_recv_count;
@@ -2105,7 +2463,8 @@ void RdmaServer::Serve(
         return false;
       }
     }
-    while (pending_recv_count != 0 && !free_send.empty()) {
+    while (pending_recv_count != 0 && !free_send.empty() &&
+           !waits_for_revocation(pending_recv[pending_recv_head])) {
       if (!process_wc(pending_recv[pending_recv_head])) return false;
       pending_recv_head = (pending_recv_head + 1) % K;
       --pending_recv_count;
@@ -2330,15 +2689,18 @@ void RdmaServer::Serve(
 
     auto process_wc = [&](const ibv_wc& wc) -> bool {
       if (wc.status != IBV_WC_SUCCESS) {
+        note_window_failure(wc);
         note_completion_error(wc, "uring", posted_sends);
         return false;
       }
+      if ((wc.wr_id & kMwWrTag) != 0) return false;  // never signalled
       if (wc.opcode == IBV_WC_SEND) {
         const size_t sid = static_cast<size_t>(wc.wr_id);
         if (sid >= K) return false;
         if (posted_sends == 0) return false;
         --posted_sends;
         uring_send_fences_.fetch_add(1, std::memory_order_relaxed);
+        on_send_completion(sid);
         free_send.push_back(sid);
         return true;
       }
@@ -2558,7 +2920,8 @@ void RdmaServer::Serve(
       // Serve on while running, and during Stop()'s drain for as long as a
       // grant waits for the client.
       const GrantView grants = grant_view(
-          !queue.empty() || ring.inflight() != 0 || posted_sends != 0);
+          !queue.empty() || ring.inflight() != 0 || posted_sends != 0 ||
+          revoking_slots != 0);
       if (fail || (!running_ && !grants.holding)) break;
       bool progressed = false;
 
@@ -2580,7 +2943,7 @@ void RdmaServer::Serve(
                   // A queued descriptor or unretired SEND still owns data
                   // even if all receive slots appear free.
                   return !queue.empty() || ring.inflight() != 0 ||
-                         posted_sends != 0;
+                         posted_sends != 0 || revoking_slots != 0;
                 }))
           fail = true;
       }
@@ -2662,7 +3025,7 @@ void RdmaServer::Serve(
               wcs.data(), g, process_wc,
               [&] {
                 return !queue.empty() || ring.inflight() != 0 ||
-                       posted_sends != 0;
+                       posted_sends != 0 || revoking_slots != 0;
               }))
         fail = true;
     }
@@ -2682,12 +3045,15 @@ sync_serve_loop:;
 
   auto process_sync_wc = [&](const ibv_wc& wc) -> bool {
     if (wc.status != IBV_WC_SUCCESS) {
+      note_window_failure(wc);
       note_completion_error(wc, "sync", K - free_send.size());
       return false;
     }
+    if ((wc.wr_id & kMwWrTag) != 0) return false;  // never signalled
     if (wc.opcode == IBV_WC_SEND) {
       const size_t sid = static_cast<size_t>(wc.wr_id);
       if (sid >= K) return false;
+      on_send_completion(sid);
       free_send.push_back(sid);
       return true;
     }
@@ -2731,7 +3097,7 @@ sync_serve_loop:;
     }
     if (g < 0) break;  // error / Stop()'s Wake()
     if (!dispatch_completions(wcs.data(), g, process_sync_wc,
-                              [] { return false; }))
+                              [&] { return revoking_slots != 0; }))
       fail = true;
   }
   // Any prepared sends without completions destructor-abort below.
@@ -3018,6 +3384,69 @@ std::string RdmaServer::MetricsText() const {
               [](const RailStats& r) {
                 return r.put_bytes.load(std::memory_order_relaxed);
               });
+  // Server memory windows (DFKV_RDMA_SERVER_MW).
+  s += "# HELP dfkv_rdma_server_mw_mode 1 if GET grants on this device are "
+       "bound by memory windows, 0 if they use per-grant MRs\n";
+  s += "# TYPE dfkv_rdma_server_mw_mode gauge\n";
+  for (size_t i = 0; i < anchor_devs_.size(); ++i)
+    s += "dfkv_rdma_server_mw_mode{dev=\"" + PromLabelEscape(anchor_devs_[i]) +
+         "\"} " +
+         std::to_string(mw_enabled_ && i < rail_mw_.size() ? rail_mw_[i] : 0) +
+         "\n";
+  s += "# HELP dfkv_rdma_server_mw_arena_registered_bytes RAM-arena bytes "
+       "registered for memory windows on this device\n";
+  s += "# TYPE dfkv_rdma_server_mw_arena_registered_bytes gauge\n";
+  for (size_t i = 0; i < anchor_devs_.size(); ++i)
+    s += "dfkv_rdma_server_mw_arena_registered_bytes{dev=\"" +
+         PromLabelEscape(anchor_devs_[i]) + "\"} " +
+         std::to_string(mw_regions_.RegisteredBytes(
+             i, rdma::BindRegionRegistry::Kind::kArena)) +
+         "\n";
+  const auto load = [](const std::atomic<uint64_t>& v) {
+    return v.load(std::memory_order_relaxed);
+  };
+  m(s, "dfkv_rdma_server_mw_binds_total", "counter",
+    "GET grants bound by a memory window", load(mw_binds_));
+  m(s, "dfkv_rdma_server_mw_invalidations_total", "counter",
+    "Memory-window invalidations posted at a GET's RELEASE",
+    load(mw_invalidations_));
+  m(s, "dfkv_rdma_server_mw_invalidation_failures_total", "counter",
+    "Memory-window invalidations that could not be posted or completed in "
+    "error (the connection ends)",
+    load(mw_invalidation_failures_));
+  m(s, "dfkv_rdma_server_mw_quarantine_bytes", "gauge",
+    "Revoked GET ranges waiting out their quarantine before reuse",
+    load(mw_quarantine_bytes_));
+  m(s, "dfkv_rdma_server_mw_quarantined_total", "counter",
+    "Revoked GET ranges put into quarantine", load(mw_quarantined_total_));
+  m(s, "dfkv_rdma_server_mw_quarantine_fallbacks_total", "counter",
+    "GET grants given a per-grant MR because the quarantine was full or "
+    "would have been longer than DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS",
+    load(mw_quarantine_fallbacks_));
+  m(s, "dfkv_rdma_server_mw_fallback_grants_total", "counter",
+    "GET grants given a per-grant MR on a connection with windows: their "
+    "memory not (yet) registered for windows",
+    load(mw_fallback_grants_));
+  m(s, "dfkv_rdma_server_mw_fallback_connections_total", "counter",
+    "Connections that could not allocate their memory windows and serve "
+    "GETs with per-grant MRs",
+    load(mw_fallback_connections_));
+  m(s, "dfkv_rdma_server_mw_region_registrations_total", "counter",
+    "Receive chunks and RAM-arena extents registered for memory windows, "
+    "per device",
+    mw_regions_.Registrations());
+  m(s, "dfkv_rdma_server_mw_region_register_failures_total", "counter",
+    "Registrations of a receive chunk or RAM-arena extent for memory "
+    "windows that failed (tried again after 10 s)",
+    mw_regions_.RegisterFailures());
+  s += "# HELP dfkv_rdma_server_grant_register_seconds Time GET grants spent "
+       "authorizing the client's READ: an exact MR, or a window bind\n";
+  s += "# TYPE dfkv_rdma_server_grant_register_seconds summary\n";
+  s += "dfkv_rdma_server_grant_register_seconds_sum " +
+       std::to_string(static_cast<double>(load(grant_register_ns_)) / 1e9) +
+       "\n";
+  s += "dfkv_rdma_server_grant_register_seconds_count " +
+       std::to_string(load(grant_registers_)) + "\n";
   return s;
 }
 

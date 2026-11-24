@@ -233,6 +233,34 @@ TEST(RecvSegmentPool, TrimsEmptyNonInitialChunksAfterIdleHold) {
   EXPECT_EQ(stats.released_bytes, 32u << 10);
 }
 
+// A chunk a trim takes is offered to the release hook first, outside the
+// pool lock (the hook allocates: it would deadlock under it); a chunk the
+// hook refuses is kept, never freed, and its budget is not given back.
+TEST(RecvSegmentPool, TheReleaseHookRunsOutsideThePoolLockAndCanKeepAChunk) {
+  RecvSegmentPool pool;
+  std::vector<const char*> offered;
+  bool keep = true;
+  pool.set_release_hook([&](const RecvSegment* segment) {
+    offered.push_back(segment->data());
+    auto lease = pool.Allocate(4u << 10);  // the lock is not held
+    EXPECT_TRUE(lease);
+    return !keep;
+  });
+  ASSERT_TRUE(pool.Init(16u << 10, 48u << 10));
+  auto first = pool.Allocate(12u << 10);
+  auto second = pool.Allocate(12u << 10);
+  ASSERT_EQ(pool.stats().chunks, 2u);
+  const char* second_base = second.segment()->data();
+  first.Reset();
+  second.Reset();
+  std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  EXPECT_EQ(pool.TrimIdle(1), 16u << 10);
+  ASSERT_EQ(offered.size(), 1u);
+  EXPECT_EQ(offered[0], second_base);
+  EXPECT_EQ(pool.kept_chunks(), 1u);
+  EXPECT_EQ(pool.stats().chunks, 1u);
+}
+
 TEST(RecvSegmentPool, ReservedStagingRemainsContiguousWhenConnectionsFillBudget) {
   RecvSegmentPool pool;
   constexpr size_t chunk = 64u << 10;

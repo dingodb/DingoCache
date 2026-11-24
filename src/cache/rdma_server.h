@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -32,6 +33,7 @@
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
+#include "transport/rdma_mw.h"
 #include "transport/rdma_recv_segment.h"
 #include "transport/rdma_verbs.h"  // rdma::RcEndpoint
 #include "transport/rdma_topology.h"
@@ -102,6 +104,9 @@ class RdmaServer {
   // memory. Unset: every GET is staged and the read answers the miss.
   using LookupHandler = std::function<Status(const BlockKey& key)>;
   void set_lookup_handler(LookupHandler h) { lookup_handler_ = std::move(h); }
+  // The RAM tier whose arena GET grants may bind memory windows on
+  // (DFKV_RDMA_SERVER_MW); it must outlive Stop(). Set before Start().
+  void set_mw_arena(RamTier* tier) { mw_arena_tier_ = tier; }
   ~RdmaServer();
 
   Status Start(int port);  // TCP bootstrap port
@@ -218,6 +223,40 @@ class RdmaServer {
   // would make room. conn_mu_ held.
   std::vector<rdma::RcEndpoint*> PlanPressureVictimsLocked(size_t bytes,
                                                            int rail);
+  // Server memory windows (DFKV_RDMA_SERVER_MW; design in
+  // docs/design/server-memory-windows.md). A revoked GET range: what held
+  // it (a staging lease, an arena pin) until its quarantine ends.
+  struct MwQuarantined {
+    rdma::RecvSegmentPool::Lease lease;
+    PreparedRead read;
+    size_t data_len = 0;
+    double read_elapsed_sec = 0.0;
+    uint64_t bytes = 0;  // counted against the quarantine cap
+    // GET-grant bytes outstanding on the rail as the window went: what the
+    // port could still have to send ahead of a READ in flight.
+    uint64_t rail_bytes = 0;
+    const char* at = nullptr;  // the range (test hook)
+  };
+  // The bind-only region [at, at+len) lies in on `rail` (an arena extent,
+  // or the chunk of `lease`), if registered; nullptr otherwise, which
+  // starts its registration.
+  ibv_mr* MwRegionFor(size_t rail, const char* at, size_t len,
+                      const rdma::RecvSegmentPool::Lease& lease);
+  // A grant holding held_bytes, with rail_bytes of GET grants outstanding
+  // on its rail (its own included), may use a window: its quarantine fits
+  // the maximum and the quarantined bytes the cap.
+  bool MwQuarantineAllows(uint64_t rail_bytes, uint64_t held_bytes) const;
+  // The quarantine of a range revoked with rail_bytes of GET grants
+  // outstanding on its rail: twice the time the port needs to send them,
+  // plus the margin, never below the floor.
+  uint64_t MwQuarantineUsFor(uint64_t rail_bytes) const;
+  // Holds the range until now + its quarantine; the recv_trim thread
+  // releases it.
+  void MwQuarantine(MwQuarantined entry);
+  // Releases the entries whose quarantine has ended, or all of them.
+  void MwReleaseQuarantine(bool all);
+  // The earliest and the latest quarantine end; 0 if none.
+  uint64_t MwQuarantineEndUs(bool latest);
   rdma::RecvSegmentPool::Lease AllocateReceiveWithPressure(
       size_t bytes, int rail, int numa_node, uint64_t wait_us,
       rdma::RecvSegmentPool::LeaseClass lease_class =
@@ -397,6 +436,39 @@ class RdmaServer {
   std::atomic<uint64_t> dynamic_get_bytes_active_{0};
   std::atomic<uint64_t> pull_zerocopy_served_{0};
   std::atomic<uint64_t> pull_zerocopy_register_failures_{0};
+  // Server memory windows (DFKV_RDMA_SERVER_MW). Settings resolved by the
+  // constructor; rail_mw_ by Start (the rail's device offers type-2B
+  // windows). The registry and the quarantine outlive every connection.
+  bool mw_enabled_ = false;
+  uint64_t mw_floor_us_ = 0;
+  uint64_t mw_max_us_ = 0;
+  uint64_t mw_margin_us_ = 0;
+  uint64_t mw_quarantine_cap_ = 0;
+  uint64_t mw_arena_cap_ = 0;
+  uint64_t mw_link_gbps_ = 0;
+  uint64_t mw_rate_mbps_ = 0;  // the slowest rail's
+  std::vector<uint8_t> rail_mw_;
+  // Per rail: bytes of GET grants (READY sent, not yet released or revoked).
+  std::unique_ptr<std::atomic<uint64_t>[]> rail_grant_bytes_;
+  RamTier* mw_arena_tier_ = nullptr;
+  char* mw_arena_ = nullptr;
+  size_t mw_arena_bytes_ = 0;
+  size_t mw_extent_bytes_ = 0;
+  rdma::BindRegionRegistry mw_regions_;
+  std::mutex mw_quarantine_mu_;
+  std::multimap<uint64_t, MwQuarantined> mw_quarantine_;  // by end, us
+  std::atomic<uint64_t> mw_quarantine_bytes_{0};
+  std::atomic<uint64_t> mw_binds_{0}, mw_invalidations_{0},
+      mw_invalidation_failures_{0}, mw_quarantine_fallbacks_{0},
+      mw_fallback_grants_{0}, mw_fallback_connections_{0},
+      mw_quarantined_total_{0};
+  // Every GET grant's READ authorization (an exact MR, or a window bind).
+  std::atomic<uint64_t> grant_register_ns_{0}, grant_registers_{0};
+  // Test seams: a region registration (false fails it, may block: in
+  // progress), and the order of a windowed grant's life ("invalidated",
+  // "quarantined", "released", with the range's address).
+  std::function<bool(size_t rail, char* base)> mw_register_for_test_;
+  std::function<void(const char* event, const void* at)> mw_event_for_test_;
   // One anchor per resolved rail holds a lifetime shared device reference and
   // registers the initial receive chunk on that rail's PD.
   // Later chunks register lazily on the rail of the connection that leases

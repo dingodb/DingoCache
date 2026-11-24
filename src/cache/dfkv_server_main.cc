@@ -536,6 +536,7 @@ int main(int argc, char** argv) {
     // B5-3: dynamic-pull GETs of arena-resident values serve the pinned arena
     // address instead of staging a payload-sized copy per pull.
     if (srv.ram_enabled()) {
+      rsrv->set_mw_arena(srv.ram_tier());
       rsrv->set_pinned_ram_handler(
           [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
                  dfkv::PreparedRead* out) {

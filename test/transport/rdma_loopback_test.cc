@@ -167,6 +167,15 @@ class RdmaServerTestPeer {
   static void FailPinnedRegistration(RdmaServer& server) {
     server.fail_pinned_registration_for_test_ = true;
   }
+  static void SetMwRegister(RdmaServer& server,
+                            std::function<bool(size_t, char*)> hook) {
+    server.mw_register_for_test_ = std::move(hook);
+  }
+  static void SetMwEvents(
+      RdmaServer& server,
+      std::function<void(const char*, const void*)> hook) {
+    server.mw_event_for_test_ = std::move(hook);
+  }
   // The held-grant gauges, read without building the metrics text: fast
   // enough for a reply hook to act before the client has used its grant.
   static uint64_t LeasePutActive(const RdmaServer& server) {
@@ -592,6 +601,8 @@ struct RdmaNode {
   std::atomic<int> handler_delay_ms{0};
 
   std::function<void(size_t)> before_range;
+  // Runs on the RdmaServer before Start (test seams).
+  static inline std::function<void(RdmaServer&)> before_start;
   // Called by the direct PUT handler with the batch arrival it was given.
   std::function<void(std::chrono::steady_clock::time_point)> on_cache_direct;
   explicit RdmaNode(const std::string& tag, size_t max_msg = kMaxMsg,
@@ -673,7 +684,9 @@ struct RdmaNode {
                  PreparedRead* out) {
             return srv->RamPinnedHitForKey(key, off, len, out);
           });
+      rsrv->set_mw_arena(srv->ram_tier());  // as dfkv_server_main
     }
+    if (before_start) before_start(*rsrv);
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
     addr = "127.0.0.1:" + std::to_string(rsrv->port());
   }
@@ -12783,4 +12796,624 @@ TEST(RdmaSgRead, TouchingUnregisteredSegmentsShareARegistration) {
         layout == kMemlock ? static_cast<long>(kKeys) : 0);
     EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), 0u);
   }
+}
+
+// ---- Server memory windows (DFKV_RDMA_SERVER_MW) ---------------------------
+
+namespace {
+
+// Sets RdmaNode::before_start for one node's construction.
+struct BeforeStart {
+  explicit BeforeStart(std::function<void(RdmaServer&)> hook) {
+    RdmaNode::before_start = std::move(hook);
+  }
+  ~BeforeStart() { RdmaNode::before_start = nullptr; }
+};
+
+// The windowed grant's life as the server reports it, in order.
+struct MwEvents {
+  struct Event {
+    std::string name;
+    const void* at;
+    std::chrono::steady_clock::time_point when;
+  };
+  std::mutex mu;
+  std::vector<Event> events;
+  void Note(const char* name, const void* at) {
+    std::lock_guard<std::mutex> lock(mu);
+    events.push_back({name, at, std::chrono::steady_clock::now()});
+  }
+  // The events of the range at `at`, in order.
+  std::vector<Event> For(const void* at) {
+    std::lock_guard<std::mutex> lock(mu);
+    std::vector<Event> out;
+    for (const auto& event : events)
+      if (event.at == at) out.push_back(event);
+    return out;
+  }
+  bool WaitFor(const void* at, const std::string& name, int timeout_ms) {
+    const auto until = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < until) {
+      for (const auto& event : For(at))
+        if (event.name == name) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+  }
+};
+
+// 1 if the server's first rail binds GET grants with windows.
+long MwMode(const RdmaServer& server) {
+  const std::string text = server.MetricsText();
+  const std::string name = "dfkv_rdma_server_mw_mode{";
+  const size_t at = text.find("\n" + name);
+  if (at == std::string::npos) return -1;
+  const size_t value = text.find("} ", at);
+  return std::strtol(text.c_str() + value + 2, nullptr, 10);
+}
+long MwCounter(const RdmaServer& server, const char* name) {
+  return CounterVal(server.MetricsText(), name);
+}
+constexpr const char* kNoWindows =
+    "the device offers no type-2B memory windows";
+
+// A small RAM tier of one extent and one shard: a pinned value keeps its
+// slot, so whether its range is reused shows in a promotion.
+struct SmallRamTier {
+  ScopedEnv ram_on{"DFKV_RAM_TIER", "1"};
+  ScopedEnv ram_bytes{"DFKV_RAM_TIER_BYTES", "1048576"};
+  ScopedEnv extent{"DFKV_RAM_TIER_EXTENT_BYTES", "1048576"};
+  ScopedEnv reserve{"DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0"};
+  ScopedEnv shards{"DFKV_RAM_TIER_SHARDS", "1"};
+  ScopedEnv reclaim{"DFKV_RAM_RECLAIM_MS", "0"};
+};
+
+// Prepares `key` until a grant is bound by a window (the first ones use
+// per-grant MRs while the region registers); false if none is within 5 s.
+bool PrepareWindowed(RdmaNode& node, PinnedPullPeer& peer, const BlockKey& key,
+                     size_t offset, size_t length,
+                     rdma::DynamicPullReady* ready) {
+  const auto until =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < until) {
+    const long binds =
+        MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total");
+    if (!peer.Prepare(key, offset, length, ready)) {
+      ADD_FAILURE() << "the PREPARE failed";
+      return false;
+    }
+    if (MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total") > binds)
+      return true;
+    if (!peer.Release(key, *ready)) {
+      ADD_FAILURE() << "the RELEASE failed";
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return false;
+}
+
+}  // namespace
+
+// A GET of a RAM-tier value is read through a memory window. At its
+// RELEASE the window is invalidated, and only after the invalidation's
+// completion and then the quarantine is the range given back: the value's
+// slot stays pinned meanwhile (a promotion into the one-slot extent fails),
+// and is reused only after. The rkey the client held reads nothing after
+// the RELEASE.
+TEST(RdmaServerMw, AGrantIsReadThroughAWindowAndWaitsOutTheQuarantine) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  SmallRamTier ram_env;
+  MwEvents events;
+  BeforeStart seam([&](RdmaServer& server) {
+    RdmaServerTestPeer::SetMwEvents(
+        server, [&](const char* name, const void* at) { events.Note(name, at); });
+  });
+  RdmaNode node("mw-arena");
+  if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+  auto& ram = KvNodeServerTestPeer::Ram(*node.srv);
+  const BlockKey key = ToBlockKey(SelfHdr(), "windowed");
+  const BlockKey replacement = ToBlockKey(SelfHdr(), "replacement");
+  const std::string value = PatternValue(700000, 81);
+  const std::string other = PatternValue(value.size(), 82);
+  ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  const uint64_t mrs = rdma::RcEndpoint::LeaseReadMrActive();
+  rdma::DynamicPullReady ready;
+  ASSERT_TRUE(PrepareWindowed(node, peer, key, 97, 200013, &ready));
+  EXPECT_EQ(rdma::RcEndpoint::LeaseReadMrActive(), mrs) << "no MR for it";
+  std::string out;
+  ASSERT_TRUE(peer.Read(ready, &out));
+  EXPECT_EQ(out, value.substr(97, 200013));
+  const void* at = reinterpret_cast<const void*>(ready.address);
+  EXPECT_TRUE(events.For(at).empty());
+
+  ASSERT_TRUE(ram.Remove(key));
+  ASSERT_TRUE(peer.Release(key, ready));
+  ASSERT_TRUE(events.WaitFor(at, "quarantined", 2000));
+  // Released only after the quarantine: the slot is still pinned.
+  if (events.For(at).size() == 2)
+    EXPECT_FALSE(KvNodeServerTestPeer::Promote(*node.srv, replacement, other));
+  ASSERT_TRUE(events.WaitFor(at, "released", 2000));
+  const auto life = events.For(at);
+  ASSERT_EQ(life.size(), 3u);
+  EXPECT_EQ(life[0].name, "invalidated");
+  EXPECT_EQ(life[1].name, "quarantined");
+  EXPECT_EQ(life[2].name, "released");
+  EXPECT_GE(life[2].when - life[1].when, std::chrono::milliseconds(5))
+      << "released before the 5 ms floor";
+  EXPECT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, replacement, other));
+  EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_invalidations_total"),
+            MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total"));
+
+  // The key the client was given reads nothing now.
+  ibv_mr* mr = peer.ep.RegisterTransient(out.data(), out.size(), true);
+  ASSERT_NE(mr, nullptr);
+  ibv_wc wc{};
+  ASSERT_TRUE(peer.ep.PostRead(0, out.data(), out.size(), mr, ready.address,
+                               ready.rkey));
+  ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 10000), 1);
+  EXPECT_EQ(wc.status, IBV_WC_REM_ACCESS_ERR);
+}
+
+// A GET staged from the disk is read through a window on its receive chunk,
+// in the synchronous and the io_uring serve loop; a leased PUT keeps its
+// per-grant MR. Stop waits out the quarantine.
+TEST(RdmaServerMw, StagedGetsUseWindowsAndLeasedPutsKeepTheirMr) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  for (const bool uring : {false, true}) {
+    SCOPED_TRACE(uring ? "uring" : "sync");
+    ScopedEnv uring_env("DFKV_SERVER_URING", uring ? "1" : "0");
+    RdmaNode node(uring ? "mw-staged-uring" : "mw-staged-sync", kMaxMsg,
+                  false, /*prepare_reads=*/uring);
+    if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+    ScopedEnv inline_max("DFKV_RDMA_INLINE_PUT_MAX_BYTES", "65536");
+    RdmaTransport rt(kMaxMsg);
+    // Above the inline PUT (a lease), within the client's block bound.
+    const std::string value = PatternValue(200 * 1024 + 11, 91);
+    const BlockKey key = ToBlockKey(SelfHdr(), "staged");
+    const long leases =
+        MwCounter(*node.rsrv, "dfkv_rdma_leaseput_ops_total");
+    ASSERT_EQ(rt.Cache(node.addr, key, value.data(), value.size()),
+              Status::kOk);
+    EXPECT_GT(MwCounter(*node.rsrv, "dfkv_rdma_leaseput_ops_total"), leases)
+        << "the PUT did not take a lease";
+    EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total"), 0)
+        << "a PUT lease was bound by a window";
+    bool windowed = false;
+    for (int i = 0; i < 400 && !windowed; ++i) {
+      std::string out(value.size(), '\0');
+      std::vector<uint64_t> lens;
+      ASSERT_EQ(rt.RangeInto(node.addr, {key}, {{out.data(), out.size()}},
+                             &lens),
+                std::vector<Status>{Status::kOk});
+      ASSERT_EQ(out, value);
+      windowed = MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total") > 0;
+      if (!windowed) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_TRUE(windowed);
+    EXPECT_GE(MwCounter(*node.rsrv,
+                        "dfkv_rdma_server_mw_region_registrations_total"),
+              1);
+    node.rsrv->Stop();
+    EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_quarantine_bytes"),
+              0);
+    EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_quarantined_total"),
+              MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total"));
+  }
+}
+
+// A connection that ends holding a windowed grant (the client went away; the
+// grant timeout closes it): its endpoint, QP and windows go first, and only
+// then does the range enter quarantine, without an invalidation.
+TEST(RdmaServerMw, AClosedConnectionsWindowedRangeIsQuarantinedAfterItsQp) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  ScopedEnv grant("DFKV_RDMA_GRANT_TIMEOUT_MS", "300");
+  SmallRamTier ram_env;
+  MwEvents events;
+  BeforeStart seam([&](RdmaServer& server) {
+    RdmaServerTestPeer::SetMwEvents(
+        server, [&](const char* name, const void* at) { events.Note(name, at); });
+    RdmaServerTestPeer::SetBeforeEndpointTeardown(
+        &server, [&] { events.Note("teardown", nullptr); });
+  });
+  RdmaNode node("mw-close");
+  if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+  const BlockKey key = ToBlockKey(SelfHdr(), "abandoned");
+  const std::string value = PatternValue(200000, 83);
+  ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  rdma::DynamicPullReady ready;
+  ASSERT_TRUE(PrepareWindowed(node, peer, key, 0, value.size(), &ready));
+  const void* at = reinterpret_cast<const void*>(ready.address);
+  peer.Close();  // never released
+  ASSERT_TRUE(events.WaitFor(at, "released", 5000));
+  std::vector<std::string> order;
+  {
+    std::lock_guard<std::mutex> lock(events.mu);
+    for (const auto& event : events.events)
+      if (event.at == at || event.name == "teardown")
+        order.push_back(event.name);
+  }
+  EXPECT_EQ(order, (std::vector<std::string>{"teardown", "quarantined",
+                                             "released"}));
+}
+
+// Past the quarantine cap a grant takes a per-grant MR; without windows on a
+// connection (ibv_alloc_mw failing) every grant does, and the connection is
+// served.
+TEST(RdmaServerMw, AFullQuarantineOrNoWindowsGivesPerGrantMrs) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  SmallRamTier ram_env;
+  const BlockKey key = ToBlockKey(SelfHdr(), "fallback");
+  const std::string value = PatternValue(200000, 84);
+  {
+    ScopedEnv cap("DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES", "1");
+    RdmaNode node("mw-cap");
+    if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+    ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
+    PinnedPullPeer peer;
+    ASSERT_TRUE(peer.Open(node));
+    rdma::DynamicPullReady ready;
+    std::string out;
+    for (int i = 0; i < 200 && MwCounter(*node.rsrv,
+             "dfkv_rdma_server_mw_quarantine_fallbacks_total") == 0; ++i) {
+      ASSERT_TRUE(peer.Prepare(key, 0, value.size(), &ready));
+      ASSERT_TRUE(peer.Read(ready, &out));
+      ASSERT_EQ(out, value);
+      ASSERT_TRUE(peer.Release(key, ready));
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_GT(MwCounter(*node.rsrv,
+                        "dfkv_rdma_server_mw_quarantine_fallbacks_total"), 0);
+    EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total"), 0);
+  }
+  {
+    rdma::RcEndpoint::SetWindowAllocSeamForTest([] { return false; });
+    struct Restore {
+      ~Restore() { rdma::RcEndpoint::SetWindowAllocSeamForTest(nullptr); }
+    } restore;
+    RdmaNode node("mw-no-windows");
+    if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+    ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
+    PinnedPullPeer peer;
+    ASSERT_TRUE(peer.Open(node));
+    rdma::DynamicPullReady ready;
+    std::string out;
+    for (int i = 0; i < 20; ++i) {
+      ASSERT_TRUE(peer.Prepare(key, 0, value.size(), &ready));
+      ASSERT_TRUE(peer.Read(ready, &out));
+      ASSERT_EQ(out, value);
+      ASSERT_TRUE(peer.Release(key, ready));
+    }
+    EXPECT_EQ(MwCounter(*node.rsrv,
+                        "dfkv_rdma_server_mw_fallback_connections_total"), 1);
+    EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total"), 0);
+  }
+}
+
+// A region whose registration is under way, or failed, serves its grants
+// with per-grant MRs; it is registered once, and a failed one is not tried
+// again at once.
+TEST(RdmaServerMw, ARegionInProgressOrFailedIsServedWithMrsAndRegisteredOnce) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  SmallRamTier ram_env;
+  const BlockKey key = ToBlockKey(SelfHdr(), "in-progress");
+  const std::string value = PatternValue(100000, 85);
+  for (const bool fail : {false, true}) {
+    SCOPED_TRACE(fail ? "failed" : "in progress");
+    std::mutex mu;
+    std::condition_variable cv;
+    bool open = false;
+    std::atomic<int> calls{0};
+    BeforeStart seam([&](RdmaServer& server) {
+      RdmaServerTestPeer::SetMwRegister(server, [&](size_t, char*) {
+        calls.fetch_add(1);
+        if (fail) return false;
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return open; });
+        return true;
+      });
+    });
+    RdmaNode node(fail ? "mw-reg-fail" : "mw-reg-hold");
+    // Lets a held registration finish before the node stops, whatever ends
+    // the test.
+    struct Opener {
+      std::mutex& mu;
+      std::condition_variable& cv;
+      bool& open;
+      void Open() {
+        {
+          std::lock_guard<std::mutex> lock(mu);
+          open = true;
+        }
+        cv.notify_all();
+      }
+      ~Opener() { Open(); }
+    } opener{mu, cv, open};
+    if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+    ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
+    PinnedPullPeer peer;
+    ASSERT_TRUE(peer.Open(node));
+    rdma::DynamicPullReady ready;
+    std::string out;
+    for (int i = 0; i < 20; ++i) {
+      ASSERT_TRUE(peer.Prepare(key, 0, value.size(), &ready));
+      ASSERT_TRUE(peer.Read(ready, &out));
+      ASSERT_EQ(out, value);
+      ASSERT_TRUE(peer.Release(key, ready));
+    }
+    EXPECT_EQ(calls.load(), 1);
+    EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total"), 0);
+    EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_fallback_grants_total"),
+              20);
+    EXPECT_EQ(MwCounter(*node.rsrv,
+                        "dfkv_rdma_server_mw_region_register_failures_total"),
+              fail ? 1 : 0);
+    if (!fail) {
+      opener.Open();
+      ASSERT_TRUE(PrepareWindowed(node, peer, key, 0, value.size(), &ready));
+      ASSERT_TRUE(peer.Read(ready, &out));
+      EXPECT_EQ(out, value);
+      ASSERT_TRUE(peer.Release(key, ready));
+      EXPECT_EQ(calls.load(), 1);
+    }
+  }
+}
+
+// The client's next PREPARE on a slot can be polled before the completion
+// of the RELEASE reply that retires the slot's window (separate packets).
+// It waits for that completion instead of being refused as a busy slot.
+void ExercisePrepareAheadOfReleaseCompletion(bool uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "2");  // a free send slot meanwhile
+  SmallRamTier ram_env;
+  {
+    ScopedEnv uring_env("DFKV_SERVER_URING", uring ? "1" : "0");
+    HeldReplyCqe reorder;
+    reorder.captured = true;  // nothing held until armed
+    RdmaNode node(uring ? "mw-early-uring" : "mw-early-sync", kMaxMsg, false,
+                  /*prepare_reads=*/uring, {},
+                  [&](ibv_wc* batch, int* count, size_t capacity) {
+                    reorder.Filter(batch, count, capacity);
+                  },
+                  [&](size_t pending, size_t free, size_t head) {
+                    reorder.Observe(pending, free, head);
+                  });
+    struct ReleaseOnExit {
+      HeldReplyCqe& state;
+      ~ReleaseOnExit() { state.Release(); }
+    } unblock{reorder};
+    if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+    const BlockKey key = ToBlockKey(SelfHdr(), "early");
+    const std::string value = PatternValue(100000, 86);
+    ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
+    PinnedPullPeer peer;
+    ASSERT_TRUE(peer.Open(node, 2));
+    rdma::DynamicPullReady ready;
+    // Without pauses: the CQ seam makes the server poll every 1 ms, and a
+    // connection with nothing in flight would be taken for idle.
+    bool windowed = false;
+    for (int i = 0; i < 5000 && !windowed; ++i) {
+      const long binds =
+          MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total");
+      ASSERT_TRUE(peer.Prepare(key, 0, value.size(), &ready));
+      windowed =
+          MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total") > binds;
+      if (!windowed) ASSERT_TRUE(peer.Release(key, ready));
+    }
+    ASSERT_TRUE(windowed);
+    std::string out;
+    ASSERT_TRUE(peer.Read(ready, &out));
+    {
+      // Every earlier SEND completion polled (both send slots free): hold
+      // the RELEASE reply's, and let it go behind the next request's
+      // receive, in the same batch.
+      std::unique_lock<std::mutex> lock(reorder.mu);
+      ASSERT_TRUE(reorder.cv.wait_for(lock, std::chrono::seconds(5),
+                                      [&] { return reorder.free_slots == 2; }));
+      reorder.captured = false;
+      reorder.release_on_next_recv = true;
+    }
+    ASSERT_TRUE(peer.Release(key, ready));
+    rdma::DynamicPullReady again;
+    EXPECT_TRUE(peer.Prepare(key, 0, value.size(), &again))
+        << "the PREPARE was refused while the slot was revoking";
+    {
+      // The reply's completion was let go only with or after the next
+      // request's receive.
+      std::lock_guard<std::mutex> lock(reorder.mu);
+      EXPECT_TRUE(reorder.held.empty());
+    }
+    ASSERT_TRUE(peer.Read(again, &out));
+    EXPECT_EQ(out, value);
+    ASSERT_TRUE(peer.Release(key, again));
+  }
+}
+TEST(RdmaServerMw, APrepareAheadOfTheReleaseCompletionWaitsForItSync) {
+  ExercisePrepareAheadOfReleaseCompletion(false);
+}
+TEST(RdmaServerMw, APrepareAheadOfTheReleaseCompletionWaitsForItUring) {
+  ExercisePrepareAheadOfReleaseCompletion(true);
+}
+
+// A quarantine is never longer than DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS,
+// even when the rail's outstanding grants grew after the grant was admitted.
+TEST(RdmaServerMw, TheQuarantineEndsByTheMaximum) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  ScopedEnv max_ms("DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS", "5");
+  ScopedEnv link("DFKV_RDMA_SERVER_MW_LINK_GBPS", "1");
+  ScopedEnv ram_on("DFKV_RAM_TIER", "1");
+  ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "8388608");
+  ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "4194304");
+  ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
+  ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
+  MwEvents events;
+  BeforeStart seam([&](RdmaServer& server) {
+    RdmaServerTestPeer::SetMwEvents(
+        server, [&](const char* name, const void* at) { events.Note(name, at); });
+  });
+  RdmaNode node("mw-max");
+  if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+  const BlockKey small = ToBlockKey(SelfHdr(), "max-small");
+  const BlockKey big = ToBlockKey(SelfHdr(), "max-big");
+  const std::string small_value = PatternValue(65536, 87);
+  const std::string big_value = PatternValue(256 * 1024, 88);
+  ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, small, small_value));
+  ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, big, big_value));
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  rdma::DynamicPullReady ready;
+  // 64 KiB at 1 Gbit/s: 2 x 0.5 ms + 1 ms, under the 5 ms floor: windowed.
+  ASSERT_TRUE(PrepareWindowed(node, peer, small, 0, small_value.size(), &ready));
+  // Three more grants of 256 KiB held meanwhile: 832 KiB outstanding would
+  // quarantine about 14.6 ms.
+  std::vector<std::unique_ptr<PinnedPullPeer>> holders;
+  std::vector<rdma::DynamicPullReady> held(3);
+  for (int i = 0; i < 3; ++i) {
+    holders.push_back(std::make_unique<PinnedPullPeer>());
+    ASSERT_TRUE(holders.back()->Open(node));
+    ASSERT_TRUE(holders.back()->Prepare(big, 0, big_value.size(), &held[i]));
+  }
+  const void* at = reinterpret_cast<const void*>(ready.address);
+  ASSERT_TRUE(peer.Release(small, ready));
+  ASSERT_TRUE(events.WaitFor(at, "released", 2000));
+  const auto life = events.For(at);
+  ASSERT_EQ(life.size(), 3u);
+  EXPECT_GE(life[2].when - life[1].when, std::chrono::milliseconds(5));
+  EXPECT_LT(life[2].when - life[1].when, std::chrono::milliseconds(10))
+      << "the quarantine went past the 5 ms maximum";
+  for (int i = 0; i < 3; ++i) ASSERT_TRUE(holders[i]->Release(big, held[i]));
+}
+
+// A window whose deallocation is refused at close (EBUSY on a live QP)
+// does not stop the server: the QP goes to the error state, the
+// deallocation is tried again before the QP is destroyed, and the range is
+// still quarantined after it, without waiting on the bound window (on
+// Soft-RoCE, destroying the QP first held the close for about 50 s).
+TEST(RdmaServerMw, ARefusedWindowDeallocationIsRetriedBeforeTheQpGoes) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  ScopedEnv grant("DFKV_RDMA_GRANT_TIMEOUT_MS", "300");
+  SmallRamTier ram_env;
+  std::atomic<int> refused{0};
+  rdma::RcEndpoint::SetWindowDeallocSeamForTest([&](ibv_mw*) {
+    refused.fetch_add(1);
+    return EBUSY;
+  });
+  struct Restore {
+    ~Restore() { rdma::RcEndpoint::SetWindowDeallocSeamForTest(nullptr); }
+  } restore;
+  MwEvents events;
+  BeforeStart seam([&](RdmaServer& server) {
+    RdmaServerTestPeer::SetMwEvents(
+        server, [&](const char* name, const void* at) { events.Note(name, at); });
+  });
+  RdmaNode node("mw-dealloc-retry");
+  if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+  const BlockKey key = ToBlockKey(SelfHdr(), "dealloc");
+  const std::string value = PatternValue(100000, 89);
+  ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
+  {
+    PinnedPullPeer peer;
+    ASSERT_TRUE(peer.Open(node));
+    rdma::DynamicPullReady ready;
+    ASSERT_TRUE(PrepareWindowed(node, peer, key, 0, value.size(), &ready));
+    const void* at = reinterpret_cast<const void*>(ready.address);
+    const auto closed = std::chrono::steady_clock::now();
+    peer.Close();  // never released: the grant timeout closes it
+    ASSERT_TRUE(events.WaitFor(at, "released", 5000));
+    EXPECT_LT(std::chrono::steady_clock::now() - closed,
+              std::chrono::seconds(3))
+        << "the close waited on the bound window";
+  }
+  EXPECT_GE(refused.load(), 1);
+  // The server goes on serving.
+  PinnedPullPeer again;
+  ASSERT_TRUE(again.Open(node));
+  rdma::DynamicPullReady ready;
+  std::string out;
+  ASSERT_TRUE(again.Prepare(key, 0, value.size(), &ready));
+  ASSERT_TRUE(again.Read(ready, &out));
+  EXPECT_EQ(out, value);
+  ASSERT_TRUE(again.Release(key, ready));
+}
+
+// The window primitives on their own: a READ through a bound window reads
+// the range; after its invalidation the same rkey is refused.
+TEST(RdmaServerMw, AnInvalidatedWindowsRkeyIsRefused) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string first =
+      devs ? std::string(devs).substr(0, std::string(devs).find(',')) : "";
+  const char* dev = first.empty() ? nullptr : first.c_str();
+  rdma::RcEndpoint target;
+  rdma::RcEndpoint reader;
+  target.set_window_slots(1);
+  ASSERT_TRUE(target.Open(dev, 4096, 1));
+  if (!target.ProbeType2Windows()) GTEST_SKIP() << kNoWindows;
+  ASSERT_TRUE(reader.Open(dev, 4096, 1));
+  ASSERT_TRUE(target.Connect(reader.Local()));
+  ASSERT_TRUE(reader.Connect(target.Local()));
+  ASSERT_TRUE(target.AllocWindows(1));
+  std::vector<char> region(1 << 20);
+  for (size_t i = 0; i < region.size(); ++i)
+    region[i] = static_cast<char>((i * 7 + 3) & 0xff);
+  ibv_mr* bind_mr = target.RegisterBindRegion(region.data(), region.size());
+  ASSERT_NE(bind_mr, nullptr);
+  constexpr size_t kOffset = 4096 + 17, kLen = 65536;
+  uint32_t rkey = 0;
+  ASSERT_TRUE(target.PostBindWindow(0, bind_mr, region.data() + kOffset, kLen,
+                                    1, &rkey, /*signaled=*/true));
+  ibv_wc wc{};
+  ASSERT_EQ(target.WaitComp(&wc, 1, 10000), 1);
+  ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+  std::vector<char> out(kLen);
+  ibv_mr* out_mr = reader.RegisterTransient(out.data(), out.size(), true);
+  ASSERT_NE(out_mr, nullptr);
+  ASSERT_TRUE(reader.PostRead(0, out.data(), kLen, out_mr,
+                              reinterpret_cast<uint64_t>(region.data() + kOffset),
+                              rkey));
+  ASSERT_EQ(reader.WaitComp(&wc, 1, 10000), 1);
+  ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+  EXPECT_EQ(std::memcmp(out.data(), region.data() + kOffset, kLen), 0);
+  ASSERT_TRUE(target.PostLocalInvalidate(rkey, 2, /*signaled=*/true));
+  ASSERT_EQ(target.WaitComp(&wc, 1, 10000), 1);
+  ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+  // The same window bound again, elsewhere, under a new key, as the next
+  // grant on its slot does.
+  const uint32_t old_rkey = rkey;
+  ASSERT_TRUE(target.PostBindWindow(0, bind_mr, region.data() + 2 * kOffset,
+                                    kLen, 3, &rkey, /*signaled=*/true));
+  ASSERT_EQ(target.WaitComp(&wc, 1, 10000), 1);
+  ASSERT_EQ(wc.status, IBV_WC_SUCCESS) << "a second bind of the window";
+  ASSERT_NE(rkey, old_rkey);
+  ASSERT_TRUE(reader.PostRead(
+      0, out.data(), kLen, out_mr,
+      reinterpret_cast<uint64_t>(region.data() + 2 * kOffset), rkey));
+  ASSERT_EQ(reader.WaitComp(&wc, 1, 10000), 1);
+  ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+  EXPECT_EQ(std::memcmp(out.data(), region.data() + 2 * kOffset, kLen), 0);
+  ASSERT_TRUE(target.PostLocalInvalidate(rkey, 4, /*signaled=*/true));
+  ASSERT_EQ(target.WaitComp(&wc, 1, 10000), 1);
+  ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+  rkey = old_rkey;
+  ASSERT_TRUE(reader.PostRead(0, out.data(), kLen, out_mr,
+                              reinterpret_cast<uint64_t>(region.data() + kOffset),
+                              rkey));
+  ASSERT_EQ(reader.WaitComp(&wc, 1, 10000), 1);
+  EXPECT_EQ(wc.status, IBV_WC_REM_ACCESS_ERR);
+  reader.ReleaseTransient(out_mr);
+  // Nothing is bound any more: the region deregisters.
+  EXPECT_EQ(rdma::RcEndpoint::DeregisterBindRegion(bind_mr), 0);
 }

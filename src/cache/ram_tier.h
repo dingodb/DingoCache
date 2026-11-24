@@ -435,6 +435,18 @@ class RamTier {
   // Registers the arena's RDMA MR (set once by the RDMA server after reg_mr).
   void SetArenaMr(void* mr);
   uint64_t arena_bytes() const { return arena_bytes_; }
+  // The arena and the extent its values never cross, for an RDMA server
+  // that registers it per extent (DFKV_RDMA_SERVER_MW).
+  char* arena_base() const { return arena_; }
+  uint64_t extent_bytes() const { return extent_bytes_; }
+  // An RDMA server holds registrations over the arena while this count is
+  // nonzero (DFKV_RDMA_SERVER_MW). The arena is mapped once and never
+  // released, remapped or madvised away for the tier's life; with a
+  // registration over it that is required, and the destructor aborts if
+  // one is still held rather than free memory a device can still read.
+  void HoldArenaRegistrations(int delta) {
+    arena_registrations_.fetch_add(delta, std::memory_order_acq_rel);
+  }
   // The arena is locked in memory (mlock2); false if that was turned off or
   // could not be done.
   bool arena_locked() const { return arena_locked_; }
@@ -764,6 +776,7 @@ class RamTier {
   uint64_t arena_bytes_ = 0;
   uint64_t large_budget_bytes_ = 0;
   std::atomic<void*> arena_mr_{nullptr};
+  std::atomic<int> arena_registrations_{0};  // see HoldArenaRegistrations
   bool arena_locked_ = false;
   bool arena_hugepages_requested_ = false;
   uint64_t arena_hugepage_bytes_ = 0;

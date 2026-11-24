@@ -1,10 +1,9 @@
 # Server memory windows for GET grants
 
-Status: design, round 2, for review before any code. Ledger RDS-09 (part A).
-Switch: `DFKV_RDMA_SERVER_MW`, server side, default off. Nothing changes on
-the wire. Code follows only after #540 (RDS-15) and #553 (RDS-06) merge, on
-top of #539 (per-connection slot registrations), #527 (chunk trimming) and
-#542 (io_uring serve loop).
+Status: implemented (ledger RDS-09, part A), on top of #539, #527, #540,
+#542 and #553. Switch: `DFKV_RDMA_SERVER_MW`, server side, default off.
+Nothing changes on the wire. Section 13 lists where the code differs from
+this design and why.
 
 ## 1. Why
 
@@ -130,23 +129,43 @@ So the doc does not claim a tight bound on mlx5.
 
 ### Quarantine time
 
-Per grant: `max(floor, 2 x grant_bytes / slowest_link_rate + margin)`, where
+Per grant: `max(floor, 2 x rail_bytes / slowest_link_rate + margin)`, where
+- `rail_bytes` is the bytes of GET grants outstanding on the grant's rail
+  (READY sent, not yet released or revoked), this one included, when the
+  window goes: what the port could still have to send ahead of a READ
+  already in the responder. The design first used the grant's own bytes;
+  the incast measurement below showed a READ's lag follows the port's
+  backlog, not its own size;
 - `slowest_link_rate` is the lowest active rate among the server's rails
   (`ibv_query_port`: active speed x width) or a configured lower bound,
   whichever is lower;
 - `floor` defaults to 5 ms (`DFKV_RDMA_SERVER_MW_QUARANTINE_MS` can only raise
   it). The HCA reads host memory as it builds each packet, so credit stalls
   and incast queueing can stretch a READ well past its nominal wire time.
-- `margin`: fixed only after measuring, on a host with real InfiniBand, the p99.99 completion lag
-  of large READs (1 MiB and 4 MiB) under a 16-to-1 incast (16 client
-  processes on one host reading from one server, modest host load, the
-  setup recorded with the numbers). If the lag varies too much for a fixed
-  margin, the margin becomes adaptive: twice the connection's observed p99
-  READY-to-RELEASE time, the server's best view of how long its clients'
-  READs take.
+- `margin`: 1 ms, from the measurement below.
 
-For example, with the 5 ms floor at 100 Gb/s, grants up to about 30 MiB
-quarantine 5 ms, a 64 MiB grant about 11 ms plus the margin.
+**Measured** (host with real InfiniBand, 400 Gb/s; server on one port, 16
+client processes on the other port of the same host, through the switch;
+each reads RAM-tier values one READ at a time, 2000 READs per process and
+size; the READ timed from its post to its completion; the host otherwise
+idle):
+
+| READ | wire time | p50 | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|---|
+| 1 MiB, per-grant MRs | 21 us | 306 us | 471 us | 657 us | 741 us | 884 us |
+| 4 MiB, per-grant MRs | 84 us | 655 us | 1160 us | 1270 us | 1333 us | 1392 us |
+| 1 MiB, windows | 21 us | 123 us | 459 us | 611 us | 764 us | 855 us |
+| 4 MiB, windows | 84 us | 634 us | 1168 us | 1310 us | 1439 us | 1514 us |
+
+The lag at p99.99 is 0.7 ms (1 MiB) and 1.4 ms (4 MiB): 35 and 17 times the
+READ's own wire time, but within twice the backlog of 16 such grants on
+the port (0.7 ms and 2.7 ms) plus 1 ms. Every such grant here quarantines
+the 5 ms floor.
+
+For example, with the 5 ms floor at 400 Gb/s, up to about 95 MiB of
+outstanding grants on a rail quarantine 5 ms; 1 GiB about 44 ms; past
+`DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS` (50 ms) a grant takes a per-grant
+MR.
 
 ### What remains
 
@@ -338,9 +357,95 @@ Tests (seams where the device would not fail on its own):
 - `dfkv_rdma_server_mw_mode{dev}` (gauge).
 - `dfkv_rdma_server_mw_binds_total`, `_invalidations_total`,
   `_invalidation_failures_total`.
-- `dfkv_rdma_server_mw_quarantine_bytes` (gauge),
+- `dfkv_rdma_server_mw_quarantine_bytes` (gauge), `_quarantined_total`,
   `_quarantine_fallbacks_total`.
 - `dfkv_rdma_server_mw_arena_registered_bytes{dev}`,
-  `_arena_register_failures_total`, `_fallback_grants_total`,
-  `_fallback_connections_total`.
-- `dfkv_rdma_server_grant_register_seconds` (both modes).
+  `_region_registrations_total`, `_region_register_failures_total` (chunks
+  and extents), `_fallback_grants_total`, `_fallback_connections_total`.
+- `dfkv_rdma_server_grant_register_seconds` (summary: `_sum`, `_count`;
+  both modes).
+
+### Measured with the code
+
+Host with real InfiniBand (400 Gb/s), one rail, one GET at a time, the
+switch off and on alternated three times per size (the host is shared;
+medians of the three runs), in microseconds:
+
+| GET | auth. per grant, off -> on | p50 off -> on | p99 off -> on |
+|---|---|---|---|
+| RAM tier 4 KiB | 27.6 -> 1.6 | 214 -> 164 | 292 -> 388 |
+| RAM tier 64 KiB | 24.2 -> 1.2 | 221 -> 146 | 287 -> 285 |
+| RAM tier 1 MiB | 20.3 -> 1.0 | 220 -> 198 | 385 -> 397 |
+| RAM tier 4 MiB | 29.9 -> 1.5 | 424 -> 508 | 1822 -> 1578 |
+| disk 4 KiB | 18.4 -> 1.0 | 157 -> 103 | 217 -> 166 |
+| disk 64 KiB | 20.0 -> 1.0 | 170 -> 118 | 228 -> 455 |
+| disk 1 MiB | 14.5 -> 0.7 | 187 -> 155 | 225 -> 431 |
+| disk 4 MiB | 21.1 -> 1.3 | 448 -> 383 | 793 -> 786 |
+
+"auth." is `dfkv_rdma_server_grant_register_seconds` per grant: the exact
+MR's registration, or the bind's post. A GET's phases timed alone: the
+PREPARE 67 -> 38 us (1 MiB), the READ unchanged, the RELEASE 35-67 -> about
+135 us: its reply waits behind the invalidation on the send queue, which
+shows at 4 MiB in the RAM tier. Raw verbs on the same host, one QP pair:
+bind, READ and invalidate 31 us (64 KiB) and 76 us (1 MiB), against 50 and
+116 us for a per-operation MR. The p99 column moves with the host's other
+load between runs.
+
+## 13. Where the code differs
+
+- **Completions**: the bind and the invalidation are posted unsignalled. A
+  completion of each, signalled, woke the serve thread twice more per GET,
+  which put up to 0.5 ms on the GET's tail (measured, phases above). The
+  READY's successful completion, after the bind on the send queue, means the
+  bind took effect, and the RELEASE reply's means the invalidation did (an
+  RC send queue completes in order; a failure of either ends the QP, and its
+  completion, with its `wr_id`, still comes). The range goes into
+  quarantine at the reply's completion.
+- **RELEASE**: the invalidation and the reply are posted on the send queue
+  in that order, as designed; the slot stays busy until the reply's
+  completion. A PREPARE on a slot still revoking is
+  held in the receive FIFO until the reply's completion retires the slot,
+  as designed (the reply's completion comes with the client's ACK, a
+  separate packet from its next request, so either may be polled first).
+- **Quarantine time**: the rail's outstanding grant bytes, not the grant's
+  own (section 4, from the measurement); the admission check at the grant
+  uses the same bound. The end is clamped to the maximum: grants added
+  to the rail after the admission do not stretch it. A server sees only its
+  own outstanding bytes; queueing at one client's link from several servers
+  is covered by the 5 ms floor alone.
+- **Registration**: one background thread registers both receive chunks
+  and arena extents (section 7 and 8), on the first grant into each; there
+  is no registration ahead of need.
+- **Chunk trim**: two-phase for every trim, also with the switch off (the
+  chunk is freed after the pool lock is released); a chunk whose
+  deregistration fails is kept, never freed, and counted.
+- **Close order**: `Close()` deallocates the windows, then destroys the
+  QP (section 4 path 4 has it the other way). Deallocation invalidates and
+  unbinds each window, so a READ through it fails from then on; on
+  Soft-RoCE a still-bound window holds its QP, whose destruction then
+  waited (about 50 s in CI). The ranges are still released only after the
+  endpoint is gone. A deallocation the device refuses (`EBUSY` on a live
+  QP in the middle of a transfer) is tried again after the QP is moved to
+  the error state, which ends its work in flight, up to 10 times within
+  10 ms, and only then is the QP destroyed: destroying it with the window
+  still bound waited about 50 s on Soft-RoCE. A window still refused is
+  tried once more after the QP's destruction; only a failure then aborts.
+- **Throughput with many clients, measured** (2.35.7 `dfkv_bench`, 4
+  client threads on pinned CPUs, off and on alternated, medians of 3-6
+  runs):
+  - values in the RAM tier: windows equal or faster. 64 KiB in batches of
+    8: 26600 -> 42700 GET/s; 256 KiB one key at a time, four runs on one
+    node: 12500-19900 off, 15100-26100 on.
+  - GETs staged from disk, under that concurrency: slower with windows,
+    e.g. 3900 -> 3400 and 6100 -> 4700 GET/s at 256 KiB. Cause open
+    (RDS-29): not the per-grant bind and invalidation (a window bound once
+    per slot over its whole region was as slow), not the quarantine (none
+    at all was as slow), not the READ (raw verbs: a READ through a window
+    takes as long as one through an MR, 64 KiB to 1 MiB, one or four
+    connections). To be resolved before the default changes.
+  - An earlier "batched GETs halve" (5981 -> 2883 GET/s) came from a RAM
+    tier too small for the bench's data: those GETs were staged from disk.
+    The PUT refusals (`kCacheFull`) seen in such runs come from the RAM
+    tier's writeback backlog and happen with the switch off too.
+- **Link rate**: the slowest rail's active rate, or
+  `DFKV_RDMA_SERVER_MW_LINK_GBPS` if lower; 10 Gb/s if neither is known.
