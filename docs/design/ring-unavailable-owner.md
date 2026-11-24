@@ -1,6 +1,6 @@
 # Unavailable owners: absent grace, cooldown reroute, recent-REMOVE memory, read-back
 
-Status: design, revision 7 (after stage A's measurement). Stage A is
+Status: design, revision 8 (stage C reviewed). Stage A is
 implemented; the rest is design. Each
 mechanism sits behind its own switch, off by default; none changes a released
 binary. A and C are client-side only. The recent-REMOVE memory (M) adds one
@@ -118,23 +118,113 @@ it; its unconfirmed REMOVEs are retried when it returns.
 ### 3.2 C: cooldown reroute (`DFKV_RING_COOLDOWN_REROUTE`, default 0 = off)
 
 A key whose owner this client's PeerHealth has in cooldown is routed, for
-PUT, GET and EXIST alike, to the next successor that is not in cooldown (the
-*substitute*).
+PUT, GET, EXIST and RETAIN alike, to a *substitute*: a successor that is not
+in cooldown, chosen by the rule below. A miss at the substitute is a miss
+(the cooling owner is not asked; reading it back is B's).
 
 - **Episode end.** The cooldown check is non-mutating (a cooldown that has not
-  expired). A cooling owner receives no traffic from this client, so its
-  cooldown ends only by expiry; from then routing returns to the owner, and
-  the first operation after expiry takes the PeerHealth trial as today. A
-  failed trial starts the next (longer) cooldown and a new episode.
-- **REMOVE fan-out.** A REMOVE from a C-enabled client goes to the key's first
-  `DFKV_RING_REMOVE_FANOUT` successors on the full ring (default 3, so any
-  substitute any client could have picked within two cooling members), the
-  owner included, **whatever this client's own cooldown state**: client Y
-  may be rerouting a key to S while client Z, not cooling the owner, removes
-  it. The REMOVE succeeds when the owner confirms, or, for an owner in
-  cooldown, when every reachable successor confirms; the owner's part is then
-  queued and retried as A's. Cost: up to 3 round trips per REMOVE, in
-  parallel.
+  expired; no trial taken). A cooling owner receives no traffic from this
+  client, so its cooldown ends only by expiry; from then routing returns to
+  the owner, and the first operation after expiry takes the PeerHealth trial
+  as today. A failed trial starts the next (longer) cooldown and a new
+  episode. While the registry gate is closed (below), C routes as today:
+  closing it mid-episode ends the substitution at once.
+- **Successor order.** Every member has fixed points on the hash circle, so
+  the members clockwise from a key come in one global order, and the
+  successors of the key on any ring are that order restricted to the ring's
+  members. The *write ring* is the adopted view without drainers and absent
+  members; substitutes are picked there.
+- **Recent rings and stable members.** Each client keeps the write rings of
+  every view it adopted or its member poller saw (admitted by #497's guard or
+  not) within the last `S = settle + poll_max = 11 × poll_max`, where
+  `poll_max` is the largest poll interval among this client and the marked
+  clients of the last registry answer (the marker carries it, below), and
+  `settle = 10 × poll_max` as in §3.4 (B uses the same `poll_max`). Readers
+  and removers use the same S. The current write ring is always among them.
+  A member is *stable* for this client when it is in every one of its
+  recent rings.
+- **When S changes.** A registry answer can change `poll_max`. When S grows
+  (a slower client registers), the recent-ring history may not yet span the
+  new S: C and B stay off (the gate counts as closed, `reason="s_growing"`)
+  until the new S has elapsed since the change, so that the history covers
+  it. When S shrinks (the slowest client leaves), the client keeps using the
+  old S for one old S before it switches. Both rules apply to B's `settle`
+  too.
+- **Reader: the substitute.** For key K whose owner O cools in this client:
+  walk the union of this client's recent rings in K's successor order. The
+  first `DFKV_RING_REMOVE_FANOUT` members of that walk are the candidates;
+  members that are unusable (cooling, or not stable) still count toward the
+  rank. The substitute is the first candidate that is stable and not
+  cooling; with none, there is no substitute and the key behaves as today
+  (the cooling owner is skipped: a miss, a refused write).
+- **Remover: the fan-out targets.** Whenever C or B is configured, a REMOVE
+  goes, for each of this client's recent rings, to every member of that ring
+  in K's successor order up to and including the `DFKV_RING_REMOVE_FANOUT`-th
+  member stable for this client; plus the drainer (MDS-04) and the absent
+  owner (§3.1); each target once. With no view change in S that is one
+  ring, and the targets are its first `DFKV_RING_REMOVE_FANOUT` members (all
+  of them on a smaller ring).
+- **Why the targets hold the substitute.** Let reader Y use substitute T for
+  K, and remover Z REMOVE K. T is in every ring of Y's recent set and is
+  among the first `DFKV_RING_REMOVE_FANOUT` members of their union. If Y's
+  and Z's recent sets share a ring V, then T is in V, and every member before
+  T in V is in Y's union before T: fewer than `DFKV_RING_REMOVE_FANOUT`
+  members, stable for Z or not. Z's walk of V goes up to its
+  `DFKV_RING_REMOVE_FANOUT`-th Z-stable member, which therefore comes at or
+  after T: T is a target. The two sets share a ring when the view the MDS
+  served at Z's REMOVE was seen by Y's poller within S of Y's read and by Z's
+  within S of the REMOVE: a poller sees every view served for at least one
+  poll interval, and S covers the slowest marked poller. One hole remains,
+  stated as a limit: **a view served for less than one poll interval**, the
+  only view naming T for one of the two (as in §3.4's residual).
+- **Substitute copies outlive the episode; the episode end removes them.**
+  The argument above covers a read near the REMOVE. A copy on a substitute
+  stays after the episode, and a later episode may substitute the same
+  member again under another view: T ranks third under V0 and is
+  substituted; V1 adds N before T; much later a REMOVE under V1 walks to
+  its third stable member and misses T; V2 drops N; a new episode
+  substitutes T and serves K. So each client records the keys it wrote (PUT
+  or RETAIN SET) to a substitute, per (owner, episode), at most
+  `DFKV_RING_REROUTE_KEYS` in total (default 65536). At the cap, further
+  rerouted PUTs are refused (a miss for the caller, counted); nothing is
+  written to a substitute untracked. When the episode ends (the owner's
+  cooldown expires, or the gate closes), the client REMOVEs those keys from
+  their substitutes; a failure goes to stage A's per-member queue (sent from
+  the tick, cleanup only). A substitute copy therefore lives at most one
+  episode plus its cleanup, and no later episode finds it. Cost: one REMOVE
+  per key written to a substitute. A clean close (`dfkv_close`, which a
+  restart goes through) runs the same cleanup for every open episode first,
+  bounded by `DFKV_RING_REROUTE_CLOSE_MS` (default 2000); what it could not
+  send is counted (`dfkv_client_reroute_cleanup_total{result="abandoned"}`)
+  and logged. Residual: a client killed mid-episode (or whose close ran out
+  of time) leaves its substitute copies until the substitute evicts them (or
+  their RETAIN TTL ends); a later episode of another client may serve them
+  under the view-change sequence above.
+- **REMOVE: who must confirm.** Whenever C or B is configured (fan-out on),
+  a REMOVE is ok only if every target confirms in this call: the owner, the
+  drainer and every fan-out target (counted as above). A target that cools in
+  this client, or that fails, makes the REMOVE not ok; the owner included
+  (today a REMOVE to a cooling owner already fails at once, without a
+  dial). A cooling target's part is still queued (stage A's queue, by
+  member) and sent from the poll thread's tick once its cooldown has
+  expired, for cleanup only: it is never grounds for ok. The one exception
+  is the absent owner (§3.1): its part goes to its queue entry and does not
+  decide the result, since no reader asks an absent member until B, and B
+  asks M first. Counted as `dfkv_client_remove_unconfirmed_total{reason}`
+  (`cooling`, `failed`). Cost: up to `DFKV_RING_REMOVE_FANOUT` + 2 round
+  trips per REMOVE, in parallel; more while views change.
+- **The cost of that rule during an outage.** While one of N members cools,
+  a REMOVE fails for the keys that have it among their targets: about
+  (`DFKV_RING_REMOVE_FANOUT` + 1)/N of the keys, against 1/N today (only its
+  own keys), for the cooldown's length. The caller sees the failure and may
+  retry. A smaller `DFKV_RING_REMOVE_FANOUT` is the lever (it also narrows
+  the substitutes: fewer cooling members can be routed around); answering
+  ok on a queued part is not. A member that left the view stays a REMOVE
+  target while it is in a recent ring, for S after it left: if it left
+  because it died, REMOVEs of the keys in its neighbourhood are not ok for
+  S after each removal (`reason="failed"`, or `"cooling"` once it cools).
+  That is required: a reader whose recent rings still hold it may use it as
+  substitute. DEPLOY states this when C ships.
 - **The registry gate: every registered remover must fan out.** A REMOVE by
   a client without the fan-out (an older release, or fan-out off) reaches the
   owner only, and a C-enabled reader could keep serving its substitute's copy
@@ -143,14 +233,27 @@ PUT, GET and EXIST alike, to the next successor that is not in cooldown (the
   fans out.
   - The registry holds a free-form info string per client (today the
     caller's `client_info`); the native library of this release appends a
-    capability marker (`dfkv-remove-fanout=1`) whenever fan-out is on. A
-    registered client without the marker (an older release, or fan-out off)
-    counts as not fanning out, and turns C and B off at the next poll (logged
-    once, counted).
-  - The gate reads the registry with the member poller. A registry answer
-    older than two poll intervals fails the gate (C and B off until a fresh
-    one passes); so does a client that cannot see the registry (no MDS
-    discovery, or registration off).
+    capability marker (`dfkv-remove-fanout=1;poll_ms=<n>`, its member-poll
+    interval) whenever fan-out is on. A registered client without the
+    marker (an older release, or fan-out off) counts as not fanning out, and
+    turns C and B off at the next poll (logged once, counted); so does a
+    marked client without the `poll_ms` field. The largest `poll_ms` sets S
+    (above).
+  - The gate reads the registry (`kListClients`) with the member poller, at
+    every poll. A registry answer older than two poll intervals fails the
+    gate (C and B off until a fresh one passes); so does a client that
+    cannot see the registry (no MDS discovery, or registration off).
+  - **Cost and staleness.** The MDS answers `kListClients` from the
+    per-group list cache that serves `kListMembers` (`DFKV_MDS_LIST_CACHE_MS`),
+    invalidated by a client register or deregister on that MDS; the wire is
+    unchanged. The cache TTL is capped below the member-poll interval: the
+    MDS clamps `DFKV_MDS_LIST_CACHE_MS` to at most 1000 ms (with a WARNING),
+    and C and B stay off (with a WARNING) on a client polling faster than
+    every 1000 ms. With several MDS
+    instances an invalidation is local to the one that handled it, so another
+    may serve a list up to the TTL old; the unsafe direction is a new
+    unmarked client hidden from the gate, which extends the window below by
+    up to the TTL.
   - No registration wait is added to open. A client with C or B configured
     fans its REMOVEs out from its first one, so it is safe before its
     registration is visible; a client with all switches off opens exactly
@@ -160,11 +263,18 @@ PUT, GET and EXIST alike, to the next successor that is not in cooldown (the
     remover registers, and the switch documentation says so. A client of
     this release with C and B off (no fan-out) that REMOVEs right after it
     opens is not seen by the gate until its registration is visible: within
-    about one registration attempt plus one registry poll. In that interval
+    about one registration attempt plus one registry poll plus the MDS list
+    cache's TTL (at most 1000 ms). In that interval
     such a REMOVE reaches the owner only, as a REMOVE by any client does
     today.
   - REMOVE fan-out itself is on whenever C or B is configured, even while the
-    gate keeps them off, so a mixed group converges.
+    gate keeps them off, so a mixed group converges. There is no switch for
+    fan-out alone: the marker means "C or B is configured here".
+  - **Rollout.** The gate needs every registered client marked, read-only
+    clients included (it cannot tell who removes): C or B must be configured
+    on every registered client of the group. A registered client of an older
+    release, a read-only connector among them, keeps the gate closed; it is
+    visible as `dfkv_client_registry_unmarked_clients`.
 - **Scatter.** With a warm return the substitute's copies are superfluous.
   With an empty return (a flap with a wipe, a replacement) the keys written
   during the episode are on the substitute only: B reads them back (§3.4).
@@ -236,8 +346,9 @@ current owner may ask the previous owner once.
   steady decline only once it stops, and a freshly started client adopts its
   first view at once. B therefore does not try to track when views diverged.
   Every M question asks about the same age,
-  `H = DFKV_RING_READBACK_MS + settle`, with `settle = 10 × mds_poll_ms`
-  (30 s at the default 3 s poll). Why ten polls: #497 adopts a held shrink
+  `H = DFKV_RING_READBACK_MS + settle`, with `settle = 10 × poll_max`
+  (30 s at the default 3 s poll; `poll_max` as in §3.2, one value for B and
+  C, and when it changes §3.2's rule for S applies). Why ten polls: #497 adopts a held shrink
   after two polls, a decline of one member per poll is adopted when it
   stops, and a client that starts or reconnects during the change takes up
   to a poll to see it; ten polls covers a decline of several members plus
@@ -247,11 +358,11 @@ current owner may ask the previous owner once.
   `F`, the first time since its last adoption that it saw an MDS view
   different from the adopted ring (admitted or not). A flap does not reset
   `F`; only an adoption does. On adopting a change, if `adoption − F >
-  settle − mds_poll_ms` (nine polls), the change gets no read-back window:
+  settle − poll_max` (nine polls), the change gets no read-back window:
   B is off for it, its misses stand, and it is counted in
   `dfkv_client_readback_changes_refused_total{reason="held"}`. Otherwise:
   any other client's newer ring was served by the MDS at most a poll before
-  `F`, so a remover acting on it did so no earlier than `F − mds_poll_ms ≥
+  `F`, so a remover acting on it did so no earlier than `F − poll_max ≥
   adoption − settle`, and a read inside the window, at most
   `DFKV_RING_READBACK_MS` after adoption, asks about an age that covers it.
 - **The read-back rule.** Key K, missed (*not found*) at current owner O,
@@ -275,10 +386,10 @@ current owner may ask the previous owner once.
   H after its start) answers *unknown*, so B fails closed there and reads
   nothing back. At configuration time the client clamps
   `DFKV_RING_READBACK_MS` to `600000 − settle` (so that H fits M's
-  default of 600 s) with a WARNING; if that leaves nothing (a poll interval
-  of 60 s or more), B is off with a WARNING. The server documentation states
-  the rule: M at least the clients' read-back window plus ten poll
-  intervals.
+  default of 600 s) with a WARNING, against the current `poll_max`; if that
+  leaves nothing (a `poll_max` of 60 s or more), B is off with a WARNING.
+  The server documentation states the rule: M at least the clients'
+  read-back window plus ten of the group's longest poll intervals.
 - **What remains.** A REMOVE older than H, or one that went to a node outside
   the asked successors (a remover whose ring differs from the reader's by
   `DFKV_RING_REMOVE_FANOUT` or more member changes). A change given a
@@ -317,7 +428,8 @@ current owner may ask the previous owner once.
 - **Wire and disk.** A and C: unchanged. M: one new op (§3.3); servers
   without it answer `kInvalid`, which disables B (fail closed). The MDS
   protocol is unchanged (C reads the existing client registry; the marker
-  rides its existing info string).
+  rides its existing info string). The MDS serves `kListClients` from its
+  list cache, whose TTL is capped at 1000 ms (§3.2).
 - **Older clients** route by the plain ring and see no difference. With
   C-enabled clients present they read a cooling owner's rerouted keys as
   misses, as today. Their REMOVEs do not fan out, which is why C is gated on
@@ -332,6 +444,8 @@ current owner may ask the previous owner once.
 | `DFKV_RING_ABSENT_GRACE_MS` | client | 0 (off) | 0-600000 |
 | `DFKV_RING_COOLDOWN_REROUTE` | client | 0 (off) | 0 or 1 |
 | `DFKV_RING_REMOVE_FANOUT` | client | 3 | 1-8 |
+| `DFKV_RING_REROUTE_KEYS` | client | 65536 | 1024-16777216; keys written to substitutes, tracked for the episode-end cleanup |
+| `DFKV_RING_REROUTE_CLOSE_MS` | client | 2000 | 0-60000; how long a clean close spends on the cleanup |
 | `DFKV_REMOVE_MEMORY_MS` | server | 0 (off) | 0-3600000 |
 | `DFKV_REMOVE_MEMORY_ENTRIES` | server | 1048576 | 1024-67108864 |
 | `DFKV_RING_READBACK_MS` | client | 0 (off) | 0-600000; window plus settle (ten polls) at most the nodes' M |
@@ -343,13 +457,16 @@ current owner may ask the previous owner once.
 | `dfkv_client_ring_absent_members` | gauge | members kept absent now |
 | `dfkv_client_ring_absent_dropped_total` | counter | absent members dropped (grace over, over the bound, planned leave) |
 | `dfkv_client_ring_absent_removes_unconfirmed_total` | counter | REMOVEs an absent or cooling owner did not confirm; `..._retried_total`, `..._dropped_total` |
-| `dfkv_client_cooldown_reroutes_total{op}` | counter | keys routed past a cooling owner (get, put, exist, remove, retain) |
+| `dfkv_client_cooldown_reroutes_total{op}` | counter | keys routed past a cooling owner (get, put, exist, retain); `op="none"`: the owner cooled and no candidate was usable |
 | `dfkv_client_registry_gate_open` | gauge | 1 while the registry gate passes (C and B may act) |
-| `dfkv_client_registry_gate_failures_total{reason}` | counter | gate transitions from open to closed, by first failing reason: unmarked_client, stale_registry, no_registry |
+| `dfkv_client_registry_gate_failures_total{reason}` | counter | gate transitions from open to closed, by first failing reason: unmarked_client (or a marker without poll_ms), stale_registry, no_registry, s_growing |
 | `dfkv_client_registry_unmarked_clients` | gauge | registered clients without the fan-out marker in the last registry answer (operators find such clients by this, then by the registry) |
-| `dfkv_client_remove_fanout_total{result}` | counter | REMOVE fan-out messages (ok, absent, error) |
+| `dfkv_client_remove_fanout_total{result}` | counter | REMOVE fan-out messages: ok, error, queued_cooling (sent for cleanup after the target's cooldown) |
+| `dfkv_client_reroute_cleanup_total{result}` | counter | episode-end REMOVEs of keys written to substitutes: ok, queued (failed, sent from the tick), abandoned (not sent before a close's bound) |
+| `dfkv_client_reroute_refused_total` | counter | rerouted PUTs refused because `DFKV_RING_REROUTE_KEYS` keys are tracked |
+| `dfkv_client_remove_unconfirmed_total{reason}` | counter | REMOVEs answered not ok because a target did not confirm in the call: cooling (in this client), failed |
 | `dfkv_client_readback_reads_total{result}` | counter | read-back attempts: hit, miss, refused_removed, refused_unknown, refused_length, refused_gate |
-| `dfkv_client_readback_changes_refused_total{reason}` | counter | adopted changes given no read-back window: held (guard held the change longer than `settle − mds_poll_ms`) |
+| `dfkv_client_readback_changes_refused_total{reason}` | counter | adopted changes given no read-back window: held (guard held the change longer than `settle − poll_max`) |
 | `dfkv_client_readback_window_active` | gauge | 1 while a previous ring or a C episode is held |
 
 ## 7. Measurement plan for the code PRs
@@ -397,6 +514,43 @@ all variants. The removers and readers include:
   the change is counted as refused (`held`) with no read-back;
 - a registry answer older than two poll intervals (MDS made unreachable for
   the reader only): C and B report the gate failed.
+- for C, each must fail on revision 7's fan-out rule:
+  - view skew, three cases with `DFKV_RING_REMOVE_FANOUT=3` and two members
+    cooling in the reader: a member added in the reader's view only (the
+    reader substitutes it), a drain in the reader's view only, an absence in
+    the reader's view only; a REMOVE by a remover on the other view, then a
+    read: 0 violations;
+  - a fan-out target that is not cooling and times out (busy, not down): the
+    REMOVE is not ok, and the reader does not serve the key;
+  - a successor cooling in the remover only, and an owner cooling in the
+    remover only (both reachable from the reader): each REMOVE is not ok,
+    counted with `reason="cooling"`, and the reader misses the key once the
+    cleanup send has landed (each must fail on revision 8's first rule,
+    which answered ok on a queued part);
+  - two MDS instances: a new unmarked client registered at one, the reader
+    polling the other; the time until the gate closes is at most one poll
+    plus the list cache TTL plus one registration attempt;
+  - small rings (N = 2 and 3, `DFKV_RING_REMOVE_FANOUT` ≥ N): targets are
+    distinct, also with a drainer or an absent owner that is also a
+    successor;
+  - the gate closing mid-episode: routing returns to today's at once;
+  - an older read-only client registered: the gate stays closed;
+  - the five-step sequence (T third under V0 and substituted; V1 adds N;
+    a REMOVE under V1; V2 drops N; a new episode substitutes T): the
+    episode-end cleanup removed T's copy, 0 violations;
+  - a failed cleanup (the substitute refuses at the episode end): the key is
+    queued, sent from the tick, and not served meanwhile by a later episode;
+  - the reroute cap (`DFKV_RING_REROUTE_KEYS` lowered): rerouted PUTs past it
+    are refused and counted, none is written untracked;
+  - a marked client without `poll_ms`: the gate stays closed; clients with
+    different poll intervals: S follows the largest;
+  - a slow client registering mid-episode (S grows): the gate holds C and B
+    off until the recent-ring history covers the new S; the slowest client
+    leaving (S shrinks): the old S is kept for one old S;
+  - a clean close mid-episode: no tracked key is left on the substitute
+    (with a substitute refusing, the abandoned keys are counted);
+  - C and B unconfigured: routing and REMOVE are today's, byte for byte
+    (owners of 2000 keys compared, REMOVE targets recorded).
 
 Footprint as before: under 2 GiB written, private etcd and ports, everything
 removed afterwards.
@@ -414,6 +568,25 @@ removed afterwards.
 ## 9. Revisions
 
 - Revision 1: first version, after two prototype measurement runs.
+- Revision 8 (stage C's design review): C picks a substitute from the union
+  of the write rings it adopted or saw within S (settle plus a poll), stable
+  members only, ranked with unusable members counted; a remover fans out
+  along each of its recent rings up to its `DFKV_RING_REMOVE_FANOUT`-th
+  stable member, plus the drainer and the absent owner, each once, with the
+  argument and its remaining hole (a view served for less than a poll); whenever C or B is configured a REMOVE is ok
+  only if every target (owner, drainer, fan-out set) confirms in the call,
+  a cooling or failing one makes it not ok, and a cooling target's queued
+  part is cleanup only (the absent owner keeps stage A's treatment), with
+  the cost during an outage stated (a departed member stays a target for S);
+  substitute copies are removed at the episode end (tracked per owner and
+  episode, capped by `DFKV_RING_REROUTE_KEYS`, refused past the cap), which
+  replaces the misstated cooldown bound; the marker carries `poll_ms` and S
+  follows the largest marked poller (one `poll_max` for B and C; when S
+  grows, C and B wait until the history spans it, and a shrink waits one old
+  S); a clean close runs the episode-end cleanup, bounded and counted; the MDS serves the client registry from its
+  list cache with the TTL capped at 1000 ms and the gate's window states
+  it; rollout needs C or B on every registered client (no fan-out-only
+  switch); eight more measurement cases.
 - Revision 7 (stage A's measurement): A does not read an absent member after
   a miss (a fresh remover's REMOVE does not reach it); that read moves to B
   under its rules. A REMOVE an absent member missed is sent when it returns,
