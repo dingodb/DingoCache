@@ -440,6 +440,11 @@ RamTier::RamTier(Options opt, FlushFn flush)
 
 RamTier::~RamTier() {
   StopBackground(/*abandon_backlog=*/false);
+  if (arena_registrations_.load(std::memory_order_acquire) != 0) {
+    DFKV_LOG_ERROR("ram tier: the arena is freed while an RDMA server still "
+                   "holds registrations over it; aborting");
+    std::abort();
+  }
   if (arena_) std::free(arena_);
 }
 

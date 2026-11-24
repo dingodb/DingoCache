@@ -22,6 +22,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -119,6 +120,8 @@ std::atomic<uint64_t> g_transient_user_mr_active{0};
 std::atomic<uint64_t> g_lease_write_mr_active{0};
 std::atomic<uint64_t> g_lease_read_mr_active{0};
 std::atomic<uint64_t> g_cq_completions{0};
+std::function<bool()> g_window_alloc_seam;  // test seam, see header
+std::function<int(ibv_mw*)> g_window_dealloc_seam;  // test seam, see header
 std::atomic<uint64_t> g_cq_errors{0};
 
 
@@ -633,10 +636,42 @@ RcEndpoint::~RcEndpoint() { Close(); }
 void RcEndpoint::Close() {
   // Successful QP destruction fences inbound DMA before any MR or buffer is
   // released, including bootstrap failures and abandoned initiator READs.
+  // Windows first: deallocating one invalidates and unbinds it (a READ
+  // through it fails from then on), and a bound window may hold its QP
+  // (Soft-RoCE: the QP's destruction then waits for it). Nothing a window
+  // covered is released before the endpoint is gone.
+  // A deallocation can fail on a live QP in the middle of a transfer
+  // (EBUSY): then the QP goes first and the deallocation is tried once
+  // more; only a second failure aborts.
+  std::vector<ibv_mw*> refused;
+  for (auto* mw : windows_) {
+    const int error = g_window_dealloc_seam ? g_window_dealloc_seam(mw)
+                                            : ibv_dealloc_mw(mw);
+    if (error != 0) refused.push_back(mw);
+  }
+  windows_.clear();
+  window_rkeys_.clear();
+  if (!refused.empty() && qp_) {
+    ibv_qp_attr attr{};
+    // Destroying a QP with a live window bound can wait for that window
+    // on rxe. Reaching ERR first stops its work so the window can go.
+    attr.qp_state = IBV_QPS_ERR;
+    ibv_modify_qp(qp_, &attr, IBV_QP_STATE);
+    for (int round = 0; round < 10 && !refused.empty(); ++round) {
+      if (round != 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      refused.erase(std::remove_if(refused.begin(), refused.end(),
+                                   [](ibv_mw* mw) {
+                                     return ibv_dealloc_mw(mw) == 0;
+                                   }),
+                    refused.end());
+    }
+  }
   if (qp_) {
     RequireVerbsRelease(ctx_, ibv_destroy_qp(qp_), "ibv_destroy_qp");
     qp_ = nullptr;
   }
+  for (auto* mw : refused)
+    RequireVerbsRelease(ctx_, ibv_dealloc_mw(mw), "ibv_dealloc_mw");
   for (auto* mr : lease_write_mr_) DeregisterMr(mr);
   g_lease_write_mr_active.fetch_sub(lease_write_mr_.size(),
                                    std::memory_order_relaxed);
@@ -705,7 +740,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
 
   chan_ = ibv_create_comp_channel(ctx_);
   if (!chan_) return fail();
-  int cqe = static_cast<int>(depth_ * 2 + 4);
+  int cqe = static_cast<int>(depth_ * 2 + 4 + window_slots_ * 2);
   cq_ = ibv_create_cq(ctx_, cqe, nullptr, chan_, 0);
   if (!cq_) return fail();
   if (ibv_req_notify_cq(cq_, 0) != 0) return fail();
@@ -739,8 +774,12 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
     Close();
     return false;
   }
-  const uint32_t send_wr =
-      static_cast<uint32_t>(depth_ * wr_per_slot + 1);
+  if (window_slots_ > (std::numeric_limits<uint32_t>::max() / 4)) {
+    Close();
+    return false;
+  }
+  const uint32_t send_wr = static_cast<uint32_t>(
+      depth_ * wr_per_slot + 1 + window_slots_ * 2);
   if (max_qp_wr != 0 && send_wr > max_qp_wr) {
     DFKV_LOG_ERROR("rdma: required send WRs " + std::to_string(send_wr) +
                    " exceed device max_qp_wr " +
@@ -1156,6 +1195,125 @@ void RcEndpoint::ReleaseLeaseReadRegion(ibv_mr* mr) {
 uint64_t RcEndpoint::LeaseReadMrActive() {
   return g_lease_read_mr_active.load(std::memory_order_relaxed);
 }
+bool RcEndpoint::ProbeType2Windows() {
+  if (!ctx_ || !pd_) return false;
+  ibv_device_attr attr{};
+  if (ibv_query_device(ctx_, &attr) != 0 ||
+      (attr.device_cap_flags & IBV_DEVICE_MEM_WINDOW_TYPE_2B) == 0)
+    return false;
+  ibv_mw* mw = ibv_alloc_mw(pd_, IBV_MW_TYPE_2);
+  if (!mw) return false;
+  RequireVerbsRelease(ctx_, ibv_dealloc_mw(mw), "ibv_dealloc_mw");
+  return true;
+}
+
+int RcEndpoint::MaxWindows() const {
+  ibv_device_attr attr{};
+  if (!ctx_ || ibv_query_device(ctx_, &attr) != 0) return 0;
+  return attr.max_mw;
+}
+
+uint64_t RcEndpoint::PortRateMbps() const {
+  if (!ctx_) return 0;
+  ibv_port_attr attr{};
+  if (ibv_query_port(ctx_, ib_port_, &attr) != 0) return 0;
+  uint64_t lane = 0;  // Mbit/s per lane
+  switch (attr.active_speed) {
+    case 1: lane = 2500; break;     // SDR
+    case 2: lane = 5000; break;     // DDR
+    case 4: lane = 10000; break;    // QDR
+    case 8: lane = 10000; break;    // FDR10
+    case 16: lane = 14000; break;   // FDR
+    case 32: lane = 25000; break;   // EDR
+    case 64: lane = 50000; break;   // HDR
+    case 128: lane = 100000; break; // NDR
+    default: return 0;
+  }
+  uint64_t lanes = 0;
+  switch (attr.active_width) {
+    case 1: lanes = 1; break;
+    case 2: lanes = 4; break;
+    case 4: lanes = 8; break;
+    case 8: lanes = 12; break;
+    case 16: lanes = 2; break;
+    default: return 0;
+  }
+  return lane * lanes;
+}
+
+void RcEndpoint::SetWindowAllocSeamForTest(std::function<bool()> seam) {
+  g_window_alloc_seam = std::move(seam);
+}
+
+void RcEndpoint::SetWindowDeallocSeamForTest(std::function<int(ibv_mw*)> seam) {
+  g_window_dealloc_seam = std::move(seam);
+}
+
+bool RcEndpoint::AllocWindows(size_t n) {
+  if (!pd_ || !windows_.empty()) return false;
+  for (size_t i = 0; i < n; ++i) {
+    ibv_mw* mw = g_window_alloc_seam && !g_window_alloc_seam()
+                     ? nullptr
+                     : ibv_alloc_mw(pd_, IBV_MW_TYPE_2);
+    if (!mw) {
+      for (auto* allocated : windows_)
+        RequireVerbsRelease(ctx_, ibv_dealloc_mw(allocated), "ibv_dealloc_mw");
+      windows_.clear();
+      window_rkeys_.clear();
+      return false;
+    }
+    windows_.push_back(mw);
+    window_rkeys_.push_back(mw->rkey);
+  }
+  return true;
+}
+
+bool RcEndpoint::PostBindWindow(size_t i, ibv_mr* region, const void* addr,
+                                size_t len, uint64_t wr_id, uint32_t* rkey,
+                                bool signaled) {
+  if (!qp_ || i >= windows_.size() || !region || len == 0) return false;
+  const uint32_t next = ibv_inc_rkey(window_rkeys_[i]);
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = wr_id;
+  wr.opcode = IBV_WR_BIND_MW;
+  wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+  wr.bind_mw.mw = windows_[i];
+  wr.bind_mw.rkey = next;
+  wr.bind_mw.bind_info.mr = region;
+  wr.bind_mw.bind_info.addr = reinterpret_cast<uint64_t>(addr);
+  wr.bind_mw.bind_info.length = len;
+  wr.bind_mw.bind_info.mw_access_flags = IBV_ACCESS_REMOTE_READ;
+  if (ibv_post_send(qp_, &wr, &bad) != 0) return false;
+  // The window's current key, which the next bind must name (Soft-RoCE
+  // refuses a bind that names an older one); a posted bind does not update
+  // it as ibv_bind_mw does.
+  windows_[i]->rkey = next;
+  window_rkeys_[i] = next;
+  *rkey = next;
+  return true;
+}
+
+bool RcEndpoint::PostLocalInvalidate(uint32_t rkey, uint64_t wr_id,
+                                     bool signaled) {
+  if (!qp_) return false;
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = wr_id;
+  wr.opcode = IBV_WR_LOCAL_INV;
+  wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+  wr.invalidate_rkey = rkey;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
+}
+
+ibv_mr* RcEndpoint::RegisterBindRegion(void* base, size_t size) {
+  if (!pd_ || !base || size == 0) return nullptr;
+  return ibv_reg_mr(pd_, base, size,
+                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_MW_BIND);
+}
+
+int RcEndpoint::DeregisterBindRegion(ibv_mr* mr) {
+  return mr ? ibv_dereg_mr(mr) : 0;
+}
+
 int RcEndpoint::QpAccessFlags() const {
   if (!qp_) return -1;
   ibv_qp_attr attr{};

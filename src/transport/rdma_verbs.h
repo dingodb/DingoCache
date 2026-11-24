@@ -459,6 +459,45 @@ class RcEndpoint {
   uint64_t NotifyArms() const {
     return notify_arms_.load(std::memory_order_relaxed);
   }
+
+  // Memory windows: a server GET grant bound by a type-2 window on a
+  // region registered once (DFKV_RDMA_SERVER_MW, see
+  // docs/design/server-memory-windows.md). Set before Open: room in the
+  // send queue and the CQ for one bind and one invalidation per window.
+  void set_window_slots(size_t n) { window_slots_ = n; }
+  // The device offers type-2B windows: the capability flag, and one window
+  // allocated and freed again.
+  bool ProbeType2Windows();
+  // The device's max_mw (0 if it cannot say).
+  int MaxWindows() const;
+  // This port's active rate in Mbit/s (speed x width); 0 if unknown.
+  uint64_t PortRateMbps() const;
+  // n type-2 windows, deallocated by Close after the QP is destroyed. False
+  // (and none kept) if any allocation fails.
+  bool AllocWindows(size_t n);
+  size_t window_count() const { return windows_.size(); }
+  // Binds window i to [addr, addr+len) of `region` for remote READ under a
+  // fresh rkey, returned in *rkey. Posted on this QP ahead of the SEND that
+  // carries the rkey, which the send queue orders after it. Unsignalled
+  // unless asked: the completion of a later signalled request on the send
+  // queue means it completed, and a failure ends the QP (its completion,
+  // with wr_id, still comes).
+  bool PostBindWindow(size_t i, ibv_mr* region, const void* addr, size_t len,
+                      uint64_t wr_id, uint32_t* rkey, bool signaled = false);
+  // Invalidates a window's rkey; unsignalled unless asked, as above.
+  bool PostLocalInvalidate(uint32_t rkey, uint64_t wr_id,
+                           bool signaled = false);
+  // A region windows bind to: local write and window binding, no remote
+  // access, so its own rkey authorizes nothing. Owned by the caller.
+  ibv_mr* RegisterBindRegion(void* base, size_t size);
+  // 0, or the error ibv_dereg_mr returned (EBUSY: a window is still bound).
+  // Unlike every other deregistration here it does not abort.
+  static int DeregisterBindRegion(ibv_mr* mr);
+  // Test seam: consulted before each window allocation; false fails it.
+  static void SetWindowAllocSeamForTest(std::function<bool()> seam);
+  // Test seam: replaces Close()'s first deallocation of each window (the
+  // retry after the QP's destruction is real); nonzero fails it.
+  static void SetWindowDeallocSeamForTest(std::function<int(ibv_mw*)> seam);
   void set_num_qp(size_t n) { num_qp_ = n > 0 ? n : 1; }
   size_t num_qp() const { return num_qp_; }
   // The QP's access flags as the device reports them; -1 if it cannot say.
@@ -516,6 +555,9 @@ class RcEndpoint {
   std::vector<ibv_mr*> lease_write_mr_;
   std::vector<ibv_mr*> own_mr_;
   std::vector<ibv_mr*> lease_read_mr_;
+  size_t window_slots_ = 0;
+  std::vector<ibv_mw*> windows_;
+  std::vector<uint32_t> window_rkeys_;  // the key of each window's last bind
   QpInfo local_;
   // See failed_wc(). Written once, after a failure; declared last so the
   // members every post and poll reads stay where they were.

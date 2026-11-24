@@ -339,6 +339,13 @@ RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
                                                  int numa_node,
                                                  LeaseClass lease_class) {
   if (bytes == 0 || !IsPowerOfTwo(alignment)) return {};
+  // Chunks a trim unlinks below are freed after the lock is released.
+  std::vector<std::unique_ptr<Chunk>> unlinked;
+  struct FreeAfterUnlock {
+    RecvSegmentPool* pool;
+    std::vector<std::unique_ptr<Chunk>>* chunks;
+    ~FreeAfterUnlock() { pool->FreeUnlinked(chunks); }
+  } free_after_unlock{this, &unlinked};
   std::lock_guard<std::mutex> lock(mu_);
   auto lease = AllocateFromChunks(bytes, alignment, affinity, lease_class);
   if (lease) return lease;
@@ -346,7 +353,8 @@ RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
   // Empty chunks (of another rail, say, or left by a failover) hold budget
   // until TrimIdle releases them, up to DFKV_RDMA_RECV_CHUNK_IDLE_MS later.
   // A growth the budget refuses releases them now and tries again.
-  if (!chunk && TrimEmptyLocked(AlignUpChecked(bytes, alignment_)) != 0)
+  if (!chunk &&
+      TrimEmptyLocked(AlignUpChecked(bytes, alignment_), &unlinked) != 0)
     chunk = NewChunk(bytes, affinity, numa_node);
   if (!chunk) {
     allocation_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -368,6 +376,13 @@ size_t RecvSegmentPool::TrimIdle(uint64_t idle_ms) {
   if (idle_ms == 0) return 0;
   const uint64_t now = SteadyMs();
   size_t released = 0;
+  // Two phases: unlinked under the pool lock, freed outside it.
+  std::vector<std::unique_ptr<Chunk>> unlinked;
+  struct FreeAfterUnlock {
+    RecvSegmentPool* pool;
+    std::vector<std::unique_ptr<Chunk>>* chunks;
+    ~FreeAfterUnlock() { pool->FreeUnlinked(chunks); }
+  } free_after_unlock{this, &unlinked};
   std::lock_guard<std::mutex> lock(mu_);
   for (size_t i = chunks_.size(); i > 1; --i) {
     auto& chunk = chunks_[i - 1];
@@ -379,6 +394,7 @@ size_t RecvSegmentPool::TrimIdle(uint64_t idle_ms) {
         now - empty_since < idle_ms)
       continue;
     released += chunk->segment->size();
+    unlinked.push_back(std::move(chunk));
     chunks_.erase(chunks_.begin() + static_cast<std::ptrdiff_t>(i - 1));
   }
   if (released != 0) {
@@ -388,7 +404,20 @@ size_t RecvSegmentPool::TrimIdle(uint64_t idle_ms) {
   return released;
 }
 
-size_t RecvSegmentPool::TrimEmptyLocked(size_t wanted) {
+void RecvSegmentPool::FreeUnlinked(
+    std::vector<std::unique_ptr<Chunk>>* chunks) {
+  for (auto& chunk : *chunks) {
+    if (release_hook_ && !release_hook_(chunk->segment.get())) {
+      // The hook could not take its registrations off: kept, never freed.
+      (void)chunk.release();
+      kept_chunks_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  chunks->clear();
+}
+
+size_t RecvSegmentPool::TrimEmptyLocked(
+    size_t wanted, std::vector<std::unique_ptr<Chunk>>* unlinked) {
   size_t committed = 0;
   for (const auto& chunk : chunks_) committed += chunk->segment->size();
   size_t released = 0;
@@ -398,6 +427,7 @@ size_t RecvSegmentPool::TrimEmptyLocked(size_t wanted) {
     if (chunk->segment->stats().used_bytes != 0) continue;
     released += chunk->segment->size();
     committed -= chunk->segment->size();
+    unlinked->push_back(std::move(chunk));
     chunks_.erase(chunks_.begin() + static_cast<std::ptrdiff_t>(i - 1));
   }
   if (released != 0) {
