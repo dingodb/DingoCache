@@ -130,6 +130,16 @@
   KiB published in 2.6 ms instead of 6.9 ms and hit in 2.6 ms instead of 6.8
   ms; 64 keys in 0.37 and 0.34 ms instead of 0.91 and 0.99 ms.
 
+- RDMA client: registering or growing memory with `RegisterMemory` no
+  longer stops the transport's operations (TRN-17). Every rail's region
+  was pinned under the lock every connection checkout and return takes:
+  growing a region to 2 GiB took 666-850 ms on two rails, and an operation
+  started meanwhile waited all of it (0.03 ms otherwise). The rails are now
+  registered without that lock, one after another (registering them at
+  once was slower: 620-683 ms against 411-417 ms for 1 GiB on two rails),
+  and the lock is taken only to publish the new declaration, whole. A
+  destroyed transport waits for a registration in flight.
+
 - Server, read coalescing (`DFKV_READ_COALESCE=1`, REQ-20): a read nobody
   else is waiting for goes straight into its own buffer. The leader of a
   synchronous read allocated a scratch of the full capacity and copied it

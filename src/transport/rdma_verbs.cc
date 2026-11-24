@@ -75,6 +75,10 @@ struct SharedDevice {
 std::mutex g_dev_mu;
 // Test seam: consulted before each pool registration; false fails it.
 std::function<bool()> g_pool_registration_seam;
+// Test seam: called before a pool MR no endpoint references is deregistered.
+std::function<void()> g_pool_deregistration_seam;
+// Test seam: called right after a pool MR is handed back to `retired`.
+std::function<void()> g_pool_retire_seam;
 std::unordered_map<std::string, SharedDevice> g_devs;
 
 // Cumulative one-shot user MRs registered outside explicit pool regions.
@@ -253,9 +257,16 @@ ibv_mr* SharedAddPoolMr(ibv_context* ctx, ibv_pd* pd, void* base, size_t size,
 
 // Release one endpoint cache reference. The MR is deregistered as soon as no
 // endpoint can return its lkey, which retires superseded growth generations
-// without invalidating in-flight users on older endpoints.
-void SharedReleasePoolMr(ibv_context* ctx, ibv_mr* mr) {
+// without invalidating in-flight users on older endpoints. With `retired`
+// it is handed back there instead, for the caller to deregister once it
+// holds no lock (ibv_dereg_mr of a GiB region takes tens of ms).
+void SharedReleasePoolMr(ibv_context* ctx, ibv_mr* mr,
+                         std::vector<ibv_mr*>* retired = nullptr) {
   if (!ctx || !mr) return;
+  // Room first: once the MR is out of the registry, nothing else would
+  // deregister it, and a throw there would leave it registered (and the
+  // device's PD undeallocatable).
+  if (retired) retired->reserve(retired->size() + 1);
   {
     std::lock_guard<std::mutex> lk(g_dev_mu);
     SharedDevice* device = FindDeviceLocked(ctx);
@@ -267,6 +278,12 @@ void SharedReleasePoolMr(ibv_context* ctx, ibv_mr* mr) {
     device->pool_mrs.erase(it);
     g_pool_mr_active.fetch_sub(1, std::memory_order_relaxed);
   }
+  if (retired) {
+    retired->push_back(mr);  // cannot throw: reserved above
+    if (g_pool_retire_seam) g_pool_retire_seam();
+    return;
+  }
+  if (g_pool_deregistration_seam) g_pool_deregistration_seam();
   DeregisterMr(mr);
 }
 
@@ -346,6 +363,15 @@ uint64_t RcEndpoint::AdhocUserMrTotal() {
 
 void RcEndpoint::SetPoolRegistrationSeamForTest(std::function<bool()> seam) {
   g_pool_registration_seam = std::move(seam);
+}
+
+void RcEndpoint::SetPoolDeregistrationSeamForTest(
+    std::function<void()> seam) {
+  g_pool_deregistration_seam = std::move(seam);
+}
+
+void RcEndpoint::SetPoolRetireSeamForTest(std::function<void()> seam) {
+  g_pool_retire_seam = std::move(seam);
 }
 
 uint64_t RcEndpoint::PortQueries() {
@@ -838,7 +864,8 @@ void RcEndpoint::RollbackPoolMr(PoolMrRegistration* registration) {
   registration->added = false;
 }
 
-void RcEndpoint::CommitPoolMr(PoolMrRegistration* registration) {
+void RcEndpoint::CommitPoolMr(PoolMrRegistration* registration,
+                              std::vector<ibv_mr*>* retired) {
   if (!registration || !registration->added) return;
   bool kept_generation = false;
   for (auto it = pool_mr_.begin(); it != pool_mr_.end();) {
@@ -861,7 +888,7 @@ void RcEndpoint::CommitPoolMr(PoolMrRegistration* registration) {
     }
     ibv_mr* old = it->mr;
     it = pool_mr_.erase(it);
-    SharedReleasePoolMr(ctx_, old);
+    SharedReleasePoolMr(ctx_, old, retired);
   }
   registration->added = false;
 }
@@ -874,7 +901,8 @@ bool RcEndpoint::AddPoolMr(void* base, size_t size, bool remote_write) {
 }
 
 bool RcEndpoint::EnsurePoolMrs(
-    const std::vector<std::pair<void*, size_t>>& regions, bool remote_write) {
+    const std::vector<std::pair<void*, size_t>>& regions, bool remote_write,
+    std::vector<ibv_mr*>* retired) {
   std::vector<PoolMrRegistration> registrations(regions.size());
   return RunPoolMrTransaction(
       regions.size(),
@@ -882,8 +910,17 @@ bool RcEndpoint::EnsurePoolMrs(
         return StagePoolMr(regions[index].first, regions[index].second,
                            remote_write, &registrations[index]);
       },
-      [&](size_t index) { CommitPoolMr(&registrations[index]); },
+      [&](size_t index) { CommitPoolMr(&registrations[index], retired); },
       [&](size_t index) { RollbackPoolMr(&registrations[index]); });
+}
+
+void RcEndpoint::DeregisterRetired(std::vector<ibv_mr*>* retired) {
+  if (!retired) return;
+  for (ibv_mr* mr : *retired) {
+    if (g_pool_deregistration_seam) g_pool_deregistration_seam();
+    DeregisterMr(mr);
+  }
+  retired->clear();
 }
 
 ibv_mr* RcEndpoint::RegisterOwnRegion(void* base, size_t size) {
