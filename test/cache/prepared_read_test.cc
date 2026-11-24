@@ -207,6 +207,17 @@ TEST(PreparedRead, CoalescedRangeClampsHostileLength) {
   EXPECT_EQ(range(Key(7), value.size(), 16, &out, &value_len), Status::kOk);
   EXPECT_TRUE(out.empty());
   EXPECT_EQ(value_len, value.size());
+  // The coalescer gives the leader's fill the caller's own buffer, which is
+  // null with capacity 0 here (nothing to read at the end offset): no fill
+  // may pass it to memcpy (UBSan: null pointer argument). Same for a caller
+  // of RangeInto with no buffer.
+  size_t n = 1;
+  value_len = 0;
+  EXPECT_EQ(server.RangeIntoForKey(Key(7), value.size(), 16, nullptr, 0, &n,
+                                   &value_len),
+            Status::kOk);
+  EXPECT_EQ(n, 0u);
+  EXPECT_EQ(value_len, value.size());
   // The reported attack: an UNKNOWN key with a hostile length misses before
   // any sized allocation, exactly like the non-coalesced path.
   EXPECT_EQ(range(Key(404), 0, kHostile, &out, &value_len),

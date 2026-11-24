@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+
+- Server, read coalescing (`DFKV_READ_COALESCE=1`, REQ-20): a read nobody
+  else is waiting for goes straight into its own buffer. The leader of a
+  synchronous read allocated a scratch of the full capacity and copied it
+  over, followers or not: measured about 600 us extra on a 1 MiB read
+  (2.5 ms on 4 MiB), more than the read itself from the page cache. A fill
+  that fails by throwing no longer leaves its flight registered, and a
+  follower that times out takes a stuck flight out, so later identical
+  reads no longer each wait the full timeout (500 ms by default) for it.
 - Server, slab: extents can follow a change in the mix of value sizes
   (STO-35, `DFKV_SLAB_BALANCE=1`, off by default). When the share of the
   bytes of each size changes while every size class is still written (for
