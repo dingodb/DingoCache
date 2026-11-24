@@ -278,6 +278,18 @@ class KVClient {
   // write refused because DFKV_RING_REROUTE_KEYS keys are tracked.
   enum class RouteOp { kGet, kExist, kPut, kRetainSet, kRetainRefresh };
   std::string RouteFor(const std::string& key, RouteOp op);
+  // RouteFor for every key of a batch read (kGet or kExist), key_of(j) for
+  // j < n, with the substitute-read checks of revision 11 asked together.
+  std::vector<std::string> RouteReads(
+      size_t n, const std::function<const std::string&(size_t)>& key_of,
+      RouteOp op);
+  // RouteFor without revision 11's check; a substitute read that needs it
+  // is reported in *check_owner (when not null). A RETAIN SET on another
+  // episode's copy is then not tracked: *set_episode (when not null) gets
+  // its episode, for RouteFor to track it once the check passed.
+  std::string RouteForUnchecked(const std::string& key, RouteOp op,
+                                std::string* check_owner,
+                                uint64_t* set_episode);
   uint64_t NowMs() const;
   void ProbeLoop();
   // Swap in a freshly-built ring under ring_mu_ and log the membership delta
@@ -517,6 +529,77 @@ class KVClient {
   // REMOVE `keys`' absent-owned ones at their absent owner; the ones it
   // does not confirm are queued for its return.
   void RemoveAtAbsent(const std::vector<std::string>& keys);
+
+  // ---- Previous-owner read-back (CLI-02 stage B, §3.4) ----
+  bool readback_on_ = false;
+  uint64_t readback_ms_ = 0;  // DFKV_RING_READBACK_MS
+  // The write ring held for the window of the last adopted change, and its
+  // addresses (ring_mu_). Empty when no window is open.
+  ConHash held_ring_;
+  std::map<std::string, std::string> held_addr_;
+  uint64_t held_until_ms_ = 0;
+  // When the member poller first saw a view different from the adopted
+  // write ring since the last adoption (0: not since); ring_mu_.
+  uint64_t first_diverge_ms_ = 0;
+  std::atomic<bool> length_mismatch_seen_{false};
+  std::atomic<uint64_t> poll_max_now_ms_{0};  // the gate's poll_max, for H
+  // Grouped by previous owner: the positions (into `keys`) to read back
+  // there, each asked about with M first. `keys` are reads just answered
+  // not found by their owner.
+  std::map<std::string, std::vector<size_t>> PlanReadBack(
+      const std::vector<std::string>& keys);
+  // A read-back candidate: keys[i], its owner O, its previous owner (or the
+  // substitute a read would go to), the nodes asked, and why it is refused
+  // (-1: not refused; kRbRefusals: dropped without counting).
+  struct RbCand {
+    size_t i;
+    std::string owner, prev;
+    std::set<std::string> ask;
+    int refusal = -1;
+  };
+  // The first DFKV_RING_REMOVE_FANOUT members for `hash` on every recent
+  // ring and on the held ring (ring_mu_).
+  void AddAskSetLocked(uint32_t hash, uint64_t now,
+                       std::set<std::string>* ask) const;
+  // Asks M at each unrefused candidate's ask set (plus drainer and absent
+  // owner, without O) and refuses on any 1 or 2; counts the refusals.
+  void AskRemoved(const std::vector<std::string>& keys, uint64_t now,
+                  std::vector<RbCand>* cands);
+  // Revision 11: a substitute read of a key outside this client's current
+  // episode is a read-back: asks M (ask set without the owner) and blanks
+  // subs[k] (a miss) unless every answer is 0.
+  void CheckSubstituteReads(const std::vector<std::string>& keys,
+                            const std::vector<std::string>& owners,
+                            std::vector<std::string>* subs);
+  // Every registered client advertises B (readback=1): only then do ended
+  // episodes' cleanups wait for the window (revision 11).
+  std::atomic<bool> registry_readback_all_{false};
+  // Some registered client advertises B: a client with C but not B then
+  // misses substitute reads outside its own current episode (revision 11).
+  std::atomic<bool> registry_readback_any_{false};
+  // Revision 11 (a): B on, the gate open (a fresh answer), and every
+  // registered client with readback=1.
+  bool DeferralHolds() const;
+  void CountReadBack(bool hit) {
+    (hit ? readback_hit_ : readback_miss_)
+        .fetch_add(1, std::memory_order_relaxed);
+  }
+  // The window decision at an adoption that changed the write ring.
+  void NoteWriteRingChangeLocked(const ConHash& before,
+                                 const std::map<std::string, std::string>&
+                                     before_addr,
+                                 uint64_t now);
+  enum ReadBackRefusal { kRbRemoved, kRbUnknown, kRbLength, kRbGate,
+                         kRbCooling, kRbRefusals };
+  std::atomic<uint64_t> readback_hit_{0}, readback_miss_{0};
+  std::atomic<uint64_t> readback_refused_[kRbRefusals] = {};
+  std::atomic<uint64_t> readback_changes_held_{0},
+      readback_changes_chained_{0};
+  std::atomic<uint64_t> readback_memory_short_{0};
+  std::mutex memory_short_mu_;
+  // node -> since when its covered_ms is below H (0: not), and whether
+  // it was reported already.
+  std::map<std::string, std::pair<uint64_t, bool>> memory_short_;
   // Second requests to a draining owner: reads that found the key there /
   // did not; REMOVEs and RETAINs it confirmed / did not.
   std::atomic<uint64_t> drain_reads_hit_{0}, drain_reads_miss_{0};
@@ -605,6 +688,9 @@ class KVClient {
   size_t reroute_tracked_ = 0;
   size_t reroute_cap_ = 65536;  // DFKV_RING_REROUTE_KEYS
   std::map<std::string, std::set<std::string>> episode_cleanup_;
+  // With read-back on: the keys of an ended episode, key -> (substitute,
+  // end of its read-back window). Their cleanup waits for it.
+  std::map<std::string, std::pair<std::string, uint64_t>> episode_readback_;
   size_t episode_pending_ = 0;
   std::map<std::string, std::set<std::string>> fanout_cleanup_;
   size_t fanout_pending_ = 0;

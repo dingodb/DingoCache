@@ -447,6 +447,9 @@ Prometheus 调用。vLLM 使用同一 allowlist，区别只是在 family 前加 
 | `dfkv_client_ring_absent_dropped_total{reason}` | counter | 移出的缺席成员：`grace` 宽限期满，`bound` 超过 `max(1, N/8)` 的上限立即移出，`planned` 排空后下线、不保留 |
 | `dfkv_client_ring_absent_removes_unconfirmed_total` / `_retried_total` / `_dropped_total` | counter | 缺席成员没确认的 REMOVE / 它回来后重发的次数（每次发送都计）/ 最终没确认的（超出队列上限、成员被移出、回来后一个宽限期仍未确认） |
 | `dfkv_client_cooldown_reroutes_total{op}` | counter | 冷却改道（DEPLOY §4c-3）：owner 在本客户端回避期内、改走替补的 key（`get`、`exist`、`put`、`retain`）；`none`：owner 在回避期内但前几个候选都不能用，照旧跳过 |
+| `dfkv_client_readback_reads_total{result}` | counter | 回读前任 owner（DEPLOY §4c-5）：`hit`、`miss`，以及被拒的候选：`refused_removed`（有节点说删过）、`refused_unknown`（有节点说不知道、没有记忆或问不到）、`refused_length`（本客户端见过长度不符）、`refused_gate`（登记门关着）、`refused_cooling`（前任 owner 在回避期） |
+| `dfkv_client_readback_changes_refused_total{reason}` / `dfkv_client_readback_window_active` | counter / gauge | 没有回读窗口的环变化：`held`（被保护视图压得太久）、`chained`（窗口内又一次变化）/ 当前是否有窗口 |
+| `dfkv_client_readback_memory_short_total{reason}` | counter | 记忆长期短于回读所需时长 H 的节点（`window`：`DFKV_REMOVE_MEMORY_MS` 小于 H）；每个节点计一次并打一条 WARNING |
 | `dfkv_client_ring_reroute_episode_pending` | gauge | 回避期已结束、在替补上的 REMOVE 还没确认的 key 数；它和正在记账的 key 合计受 `DFKV_RING_REROUTE_KEYS` 限制，持续增长说明某个替补一直清不掉（例如它已经死了），改道写入快被拒绝了 |
 | `dfkv_client_reroute_refused_total` | counter | 已记账的替补 key 达到 `DFKV_RING_REROUTE_KEYS` 后被拒绝的改道写入 |
 | `dfkv_client_reroute_cleanup_total{result}` | counter | 回避期结束（或扇出目标回避期满）时对替补发的清理 REMOVE：`ok`，`queued`（失败，之后补发），`abandoned`（超过上限，或关闭前没发出去） |

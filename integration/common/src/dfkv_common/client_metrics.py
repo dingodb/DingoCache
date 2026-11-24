@@ -122,6 +122,10 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     "dfkv_client_remove_fanout_total": ("result",),
     "dfkv_client_remove_unconfirmed_total": ("reason",),
     "dfkv_client_registry_gate_failures_total": ("reason",),
+    # Previous-owner read-back (DFKV_RING_READBACK_MS).
+    "dfkv_client_readback_reads_total": ("result",),
+    "dfkv_client_readback_changes_refused_total": ("reason",),
+    "dfkv_client_readback_memory_short_total": ("reason",),
     "dfkv_rdma_client_no_compatible_rail_total": (),
     "dfkv_rdma_client_admission_failures_total": (),
     "dfkv_rdma_client_local_resource_failures_total": (),
@@ -185,6 +189,7 @@ _GAUGES: dict[str, tuple[str, ...]] = {
     "dfkv_client_registry_gate_open": (),
     "dfkv_client_registry_unmarked_clients": (),
     "dfkv_client_ring_reroute_episode_pending": (),
+    "dfkv_client_readback_window_active": (),
     "dfkv_client_ring_point_collisions": (),
     "dfkv_client_mds_reachable": (),
     "dfkv_client_peer_latency_max_seconds": ("peer",),

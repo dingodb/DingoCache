@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Client: previous-owner read-back (CLI-02 stage B), behind
+  `DFKV_RING_READBACK_MS` (default 0 = off; MDS discovery only; needs the
+  nodes' recent-REMOVE memory). Within the window after a write-ring change
+  (or the end of a cooldown-reroute episode), a GET or EXIST the current
+  owner answers "not found" asks the memory of the key's first successors
+  on every recent ring and the ring before the change (not the current
+  owner) whether the key was removed, and reads the previous owner once
+  only if every one answers "not removed"; "unknown" or an unreachable node
+  refuses. Requires `DFKV_RING_REMOVE_FANOUT` >= 3. With cooldown reroute,
+  and only while every registered client advertises B (`readback=1` in its
+  registry marker), an ended episode's keys stay on the substitute until
+  its window passes (they count toward `DFKV_RING_REROUTE_KEYS`; a close
+  removes them at once); a client with B asks the same question before
+  reading a substitute's copy it did not write in its current episode (GET,
+  EXIST and RETAIN), and
+  a client with cooldown reroute alone treats such a read as a miss while
+  any registered client advertises B. The deferral ends at once (every
+  deferred key cleaned up) when a client without B registers or one drops
+  it, the registry answer is stale, or the gate closes. New
+  `dfkv_client_readback_reads_total{result}`,
+  `dfkv_client_readback_changes_refused_total{reason}`,
+  `dfkv_client_readback_window_active`,
+  `dfkv_client_readback_memory_short_total{reason}`. Absent-owner read-back (design
+  §3.4): not in this stage. Off, no
+  `kRemovedWithin` is sent and every read is unchanged.
+
 - Server: recent-REMOVE memory (CLI-02 stage M), behind
   `DFKV_REMOVE_MEMORY_MS` (default 0 = off, up to 3600000). A node records
   every REMOVE it acknowledges (key and tenant, before the reply; RAM only,
