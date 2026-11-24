@@ -400,13 +400,20 @@ class RdmaTransport : public Transport {
   std::vector<size_t> IdleDataBounds(const std::string& node) const;
   std::vector<size_t> IdleDataDepths(const std::string& node) const;
   std::unordered_map<std::string, std::vector<Conn*>> control_pool_;
-  // Last successfully published caller memory declarations. RegisterMemory
-  // holds mu_ through per-rail stage/commit, so Acquire can observe either the
-  // complete old generation or the complete new one, never a partial growth.
+  // Last successfully published caller memory declarations (under mu_).
+  // RegisterMemory stages every rail without mu_ and commits and publishes
+  // under it, so Acquire observes either the complete old generation or the
+  // complete new one, never a partial growth.
   std::vector<std::pair<void*, size_t>> pools_;
-  // Lifetime endpoint per active rail. Its cache reference anchors the newest
-  // successful generation; old generations survive only while an older active
-  // connection still owns a cache reference.
+  // One RegisterMemory at a time, and the destructor waits for it. Taken
+  // before mu_, never while holding it. The destructor waits only for a call
+  // already in flight: a RegisterMemory that starts once destruction has
+  // begun is invalid, as is any other call on a transport being destroyed.
+  std::mutex register_mu_;
+  // Lifetime endpoint per active rail (under register_mu_). Its cache
+  // reference anchors the newest successful generation; old generations
+  // survive only while an older active connection still owns a cache
+  // reference.
   std::vector<std::unique_ptr<rdma::RcEndpoint>> anchors_;
   // min over rails of (negotiated max_sge) - 1; set once in the ctor.
   size_t sg_payload_segs_ = 29;

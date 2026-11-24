@@ -848,6 +848,8 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
 }
 
 RdmaTransport::~RdmaTransport() {
+  // A declaration still registering finishes before anything goes away.
+  std::lock_guard<std::mutex> declaring(register_mu_);
   keepalive_stop_.store(true, std::memory_order_relaxed);
   keepalive_cv_.notify_all();
   if (keepalive_thread_.joinable()) keepalive_thread_.join();
@@ -2615,8 +2617,16 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
     return false;
   }
 
-  std::lock_guard<std::mutex> lk(mu_);
-  std::vector<std::pair<void*, size_t>> candidate = pools_;
+  // One declaration at a time. The registrations themselves (anchors opened,
+  // every rail's region pinned: hundreds of ms for a GiB) run without mu_,
+  // so Acquire and Release on this transport go on with the published
+  // generation meanwhile; mu_ is taken only to commit and publish.
+  std::lock_guard<std::mutex> declaring(register_mu_);
+  std::vector<std::pair<void*, size_t>> candidate;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    candidate = pools_;
+  }
   auto existing =
       std::find_if(candidate.begin(), candidate.end(),
                    [base](const auto& pool) { return pool.first == base; });
@@ -2631,6 +2641,7 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
   // The first declaration creates one lifetime anchor per discovered ACTIVE
   // rail. Opening fewer than all rails is a rejected transaction: publishing
   // the declaration would otherwise make the gauge and future connections lie.
+  // anchors_ is only used here, under register_mu_.
   std::vector<std::unique_ptr<rdma::RcEndpoint>> new_anchors;
   std::vector<rdma::RcEndpoint*> rails;
   if (anchors_.empty()) {
@@ -2661,18 +2672,23 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
     for (auto& endpoint : anchors_) rails.push_back(endpoint.get());
   }
 
+  // Stage every rail, one after another (registering rails at once was
+  // slower: the pinning of the same pages contends). A failure rolls back
+  // what was staged; nothing was published.
   std::vector<rdma::RcEndpoint::PoolMrRegistration> registrations(rails.size());
-  const bool registered = rdma::RunPoolMrTransaction(
-      rails.size(),
-      [&](size_t rail) {
-        // Local access only: since v2.31 servers never WRITE into client
-        // memory (GET is a client READ of server staging).
-        return rails[rail]->StagePoolMr(base, size, /*remote_write=*/false,
-                                        &registrations[rail]);
-      },
-      [&](size_t rail) { rails[rail]->CommitPoolMr(&registrations[rail]); },
-      [&](size_t rail) { rails[rail]->RollbackPoolMr(&registrations[rail]); });
-  if (!registered) {
+  size_t staged = 0;
+  for (; staged < rails.size(); ++staged) {
+    // Local access only: since v2.31 servers never WRITE into client
+    // memory (GET is a client READ of server staging).
+    if (!rails[staged]->StagePoolMr(base, size, /*remote_write=*/false,
+                                    &registrations[staged]))
+      break;
+  }
+  if (staged != rails.size()) {
+    while (staged != 0) {
+      --staged;
+      rails[staged]->RollbackPoolMr(&registrations[staged]);
+    }
     mr_registration_rejections_.fetch_add(1, std::memory_order_relaxed);
     DFKV_LOG_ERROR(
         "rdma: explicit memory registration rejected for base=" +
@@ -2680,39 +2696,62 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
     return false;
   }
 
-  if (!new_anchors.empty()) anchors_ = std::move(new_anchors);
-  // Idle pooled endpoints have no in-flight WRs, so they can safely adopt the
-  // new generation now and release their superseded same-base cache reference.
-  // An endpoint that cannot resolve the already-anchored declaration is
-  // discarded; a future Acquire recreates it from the published generation.
-  const auto refresh_idle = [&](auto& idle) {
-    for (auto& [node, connections] : idle) {
-      (void)node;
-      for (auto it = connections.begin(); it != connections.end();) {
-        Conn* connection = *it;
-        if (connection->ep.EnsurePoolMrs(candidate, /*remote_write=*/false)) {
-          ++it;
-          continue;
+  // Superseded generations no endpoint references any more: deregistered
+  // after mu_ (tens of ms for a GiB), while the anchors keep the devices;
+  // by the holder's destructor if the commit throws.
+  rdma::RetiredPoolMrs retired;
+  std::vector<Conn*> unusable;
+  {
+    // Commit and publish together: Acquire sees the complete old generation
+    // or the complete new one, never a part of it.
+    std::lock_guard<std::mutex> lk(mu_);
+    // Room for every idle connection first: one taken out of its pool must
+    // not be lost to a failed allocation.
+    size_t idle_count = 0;
+    for (const auto* idle : {&pool_, &control_pool_})
+      for (const auto& entry : *idle) idle_count += entry.second.size();
+    unusable.reserve(idle_count);
+    for (size_t rail = 0; rail < rails.size(); ++rail)
+      rails[rail]->CommitPoolMr(&registrations[rail], retired.get());
+    if (!new_anchors.empty()) anchors_ = std::move(new_anchors);
+    // Idle pooled endpoints have no in-flight WRs, so they can safely adopt
+    // the new generation now and release their superseded same-base cache
+    // reference. An endpoint that cannot resolve the already-anchored
+    // declaration is discarded; a future Acquire recreates it from the
+    // published generation.
+    const auto refresh_idle = [&](auto& idle) {
+      for (auto& [node, connections] : idle) {
+        (void)node;
+        for (auto it = connections.begin(); it != connections.end();) {
+          Conn* connection = *it;
+          if (connection->ep.EnsurePoolMrs(candidate,
+                                           /*remote_write=*/false,
+                                           retired.get())) {
+            ++it;
+            continue;
+          }
+          it = connections.erase(it);
+          unusable.push_back(connection);  // reserved: cannot throw
         }
-        it = connections.erase(it);
-        Destroy(connection);
       }
+    };
+    refresh_idle(pool_);
+    refresh_idle(control_pool_);
+    pools_ = std::move(candidate);
+    uint64_t registered_bytes = 0;
+    for (const auto& pool : pools_) {
+      if (pool.second >
+          std::numeric_limits<uint64_t>::max() - registered_bytes) {
+        registered_bytes = std::numeric_limits<uint64_t>::max();
+        break;
+      }
+      registered_bytes += static_cast<uint64_t>(pool.second);
     }
-  };
-  refresh_idle(pool_);
-  refresh_idle(control_pool_);
-  pools_ = std::move(candidate);
-  uint64_t registered_bytes = 0;
-  for (const auto& pool : pools_) {
-    if (pool.second >
-        std::numeric_limits<uint64_t>::max() - registered_bytes) {
-      registered_bytes = std::numeric_limits<uint64_t>::max();
-      break;
-    }
-    registered_bytes += static_cast<uint64_t>(pool.second);
+    mr_regions_.store(pools_.size(), std::memory_order_relaxed);
+    mr_registered_bytes_.store(registered_bytes, std::memory_order_relaxed);
   }
-  mr_regions_.store(pools_.size(), std::memory_order_relaxed);
-  mr_registered_bytes_.store(registered_bytes, std::memory_order_relaxed);
+  retired.Deregister();
+  for (Conn* connection : unusable) Destroy(connection);
   if (grew) {
     DFKV_LOG_INFO(
         "rdma: explicit memory registration grew for base=" +
@@ -3270,10 +3309,18 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c,
   CompleteRemoteLease(c, remote_outcome);
   bool refresh_ok = false;
   {
-    std::lock_guard<std::mutex> lk(mu_);
-    // Refresh while still active and while pools_ is stable. A refresh failure
-    // is local MR evidence and must tear down before returning the lease.
-    refresh_ok = c->ep.EnsurePoolMrs(pools_, /*remote_write=*/false);
+    // A superseded generation this connection held last: deregistered
+    // without mu_ (also if the refresh throws), while the connection keeps
+    // its device open.
+    rdma::RetiredPoolMrs retired;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      // Refresh while still active and while pools_ is stable. A refresh
+      // failure is local MR evidence and must tear down before returning the
+      // lease.
+      refresh_ok =
+          c->ep.EnsurePoolMrs(pools_, /*remote_write=*/false, retired.get());
+    }
   }
   if (!refresh_ok) {
     Destroy(c, rdma::RailCompletion::kRailFailure);

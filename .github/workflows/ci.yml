@@ -370,6 +370,7 @@ jobs:
         RdmaPortState.ARailWhosePortGoesDownLeavesSelectionAndComesBack
         RdmaRailAdmission.ACooledRailIsProbedInTheBackground
         RdmaRailAdmission.ARailsLatencyExcludesConnectionSetup
+        RdmaRegisterMemory.AFailedRailUndoesTheOthersAndPublishesNothing
         RdmaServerPorts.ARailGoingDownEndsOnlyItsConnections
         RdmaServerPorts.NoDeviceNamedGetsTheFirstActiveRail
         RdmaVerbs.PoolRegistrationDoesNotStallOtherRails

@@ -187,14 +187,23 @@ class RcEndpoint {
   };
   bool StagePoolMr(void* base, size_t size, bool remote_write,
                    PoolMrRegistration* registration);
-  void CommitPoolMr(PoolMrRegistration* registration);
+  // A superseded generation no endpoint references any more is deregistered
+  // here, or, with `retired`, handed back for DeregisterRetired once the
+  // caller holds no lock.
+  void CommitPoolMr(PoolMrRegistration* registration,
+                    std::vector<ibv_mr*>* retired = nullptr);
   void RollbackPoolMr(PoolMrRegistration* registration);
   // Single-endpoint convenience wrapper, primarily used by server regions.
   bool AddPoolMr(void* base, size_t size, bool remote_write = false);
   // Atomically ensure all declarations on this endpoint. False leaves its
   // lookup cache exactly as it was before the call.
   bool EnsurePoolMrs(const std::vector<std::pair<void*, size_t>>& regions,
-                     bool remote_write);
+                     bool remote_write,
+                     std::vector<ibv_mr*>* retired = nullptr);
+  // Deregisters what CommitPoolMr or EnsurePoolMrs handed back. The device
+  // must still be open: call it while the endpoint that handed them back
+  // (or another on the same device) is.
+  static void DeregisterRetired(std::vector<ibv_mr*>* retired);
   // This endpoint's own remote-writable region (a server connection's
   // receive slots): an exact MR, never shared with another endpoint, so its
   // rkey reaches nothing else. Deregistered by Close, after the QP.
@@ -224,6 +233,12 @@ class RcEndpoint {
   // Test seam: called before each shared pool registration, outside any
   // lock; returning false fails that registration. Empty = none.
   static void SetPoolRegistrationSeamForTest(std::function<bool()> seam);
+  // Test seam: called before a pool MR no endpoint references any more is
+  // deregistered. Empty = none.
+  static void SetPoolDeregistrationSeamForTest(std::function<void()> seam);
+  // Test seam: called right after a pool MR is handed back to `retired`
+  // (it may throw, as an allocation there could). Empty = none.
+  static void SetPoolRetireSeamForTest(std::function<void()> seam);
   static uint64_t PoolMrRegistrationFailures();
   // Process-wide number of currently retained shared-PD pool MR generations.
   // Superseded generations remain only while an endpoint still references them.
@@ -423,6 +438,23 @@ class RcEndpoint {
   bool has_failed_wc_ = false;
   uint64_t succeeded_completions_ = 0;
   int open_errno_ = 0;
+};
+
+// Pool MRs CommitPoolMr or EnsurePoolMrs handed back, deregistered when the
+// holder goes (or at Deregister): declared before the lock a caller commits
+// under, it deregisters them after the unlock also when the commit throws.
+// The device must still be open then (see DeregisterRetired).
+class RetiredPoolMrs {
+ public:
+  RetiredPoolMrs() = default;
+  ~RetiredPoolMrs() { RcEndpoint::DeregisterRetired(&mrs_); }
+  RetiredPoolMrs(const RetiredPoolMrs&) = delete;
+  RetiredPoolMrs& operator=(const RetiredPoolMrs&) = delete;
+  std::vector<ibv_mr*>* get() { return &mrs_; }
+  void Deregister() { RcEndpoint::DeregisterRetired(&mrs_); }
+
+ private:
+  std::vector<ibv_mr*> mrs_;
 };
 
 

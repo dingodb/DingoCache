@@ -56,6 +56,7 @@ extern char** environ;
 #include <list>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <thread>
@@ -5840,6 +5841,221 @@ TEST(RdmaVerbs, ALosingConcurrentPoolRegistrationTakesTheWinners) {
   ibv_mr* mb = b.RegisterUser(region.data(), 4096);
   ASSERT_NE(ma, nullptr);
   EXPECT_EQ(ma, mb) << "both endpoints use the one registration";
+}
+
+// TRN-17: a region registered or grown with RegisterMemory is pinned on
+// every rail without the transport's pool lock; only the commit takes it.
+// Growing a region to 2 GiB took 666-850 ms on two rails, and every
+// operation of the transport waited for it. A seam holds the registration
+// here: an operation on the same transport completes meanwhile, and sees
+// the old declaration until the new one is published whole.
+// Holds every caller at a point until released.
+struct Gate {
+  std::mutex mu;
+  std::condition_variable cv;
+  int entered = 0;
+  bool released = false;
+  void Pass() {
+    std::unique_lock<std::mutex> lock(mu);
+    ++entered;
+    cv.notify_all();
+    cv.wait(lock, [this] { return released; });
+  }
+  bool AwaitEntry() {
+    std::unique_lock<std::mutex> lock(mu);
+    return cv.wait_for(lock, std::chrono::seconds(5),
+                       [this] { return entered > 0; });
+  }
+  void Release() {
+    std::lock_guard<std::mutex> lock(mu);
+    released = true;
+    cv.notify_all();
+  }
+};
+
+// A pool registration held until released.
+struct HeldPoolRegistration : Gate {
+  HeldPoolRegistration() {
+    rdma::RcEndpoint::SetPoolRegistrationSeamForTest([this] {
+      Pass();
+      return true;
+    });
+  }
+  ~HeldPoolRegistration() {
+    Release();
+    rdma::RcEndpoint::SetPoolRegistrationSeamForTest({});
+  }
+};
+
+// The deregistration of a superseded pool generation held until released.
+struct HeldPoolDeregistration : Gate {
+  HeldPoolDeregistration() {
+    rdma::RcEndpoint::SetPoolDeregistrationSeamForTest([this] { Pass(); });
+  }
+  ~HeldPoolDeregistration() {
+    Release();
+    rdma::RcEndpoint::SetPoolDeregistrationSeamForTest({});
+  }
+};
+
+TEST(RdmaRegisterMemory, OperationsGoOnWhileARegionGrows) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("register-grow");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  std::vector<char> region(3 << 20);
+  ASSERT_TRUE(rt.RegisterMemory(region.data(), 1 << 20));
+  const std::string v(4096, 'g');
+  ASSERT_TRUE(c.Put("grow", v.data(), v.size()));
+  ASSERT_TRUE(c.Exist("grow"));  // pooled connections from here on
+  // Whether an operation on the transport completes within 2 s. Metrics take
+  // the pool lock too: read them only if the operation got it.
+  const auto goes_on = [&](long* published) {
+    auto op = std::async(std::launch::async, [&] { return c.Exist("grow"); });
+    const bool done =
+        op.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    if (published)
+      *published = done ? CounterVal(rt.MetricsText(),
+                                     "dfkv_rdma_client_mr_registered_bytes")
+                        : -1;
+    return std::make_pair(done, std::move(op));
+  };
+  // Two growth steps: the second supersedes a generation the first made.
+  for (const size_t size : {size_t{2} << 20, size_t{3} << 20}) {
+    SCOPED_TRACE("growth to " + std::to_string(size >> 20) + " MiB");
+    const long before = CounterVal(rt.MetricsText(),
+                                   "dfkv_rdma_client_mr_registered_bytes");
+    bool grown = false;
+    std::thread growing;
+    {
+      // Both seams stay set until the registration has returned: the other
+      // rails' registrations read them after the first is released.
+      HeldPoolDeregistration dereg;
+      HeldPoolRegistration held;
+      growing = std::thread(
+          [&] { grown = rt.RegisterMemory(region.data(), size); });
+      ASSERT_TRUE(held.AwaitEntry());
+      {
+        long published = 0;
+        auto [went_on, op] = goes_on(&published);
+        held.Release();
+        EXPECT_TRUE(went_on) << "an operation waited for the registration";
+        // Not published until every rail is registered.
+        if (went_on) EXPECT_EQ(published, before);
+        EXPECT_TRUE(op.get());
+      }
+      // The superseded generation is deregistered once nothing references
+      // it, and not under the pool lock either.
+      ASSERT_TRUE(dereg.AwaitEntry());
+      auto [went_on, op] = goes_on(nullptr);
+      dereg.Release();
+      EXPECT_TRUE(went_on) << "an operation waited for a deregistration";
+      EXPECT_TRUE(op.get());
+      growing.join();
+    }
+    EXPECT_TRUE(grown);
+    EXPECT_EQ(CounterVal(rt.MetricsText(),
+                         "dfkv_rdma_client_mr_registered_bytes"),
+              static_cast<long>(size));
+  }
+  std::string out(v.size(), '\0');
+  ASSERT_TRUE(c.Get("grow", &out[0], out.size()));
+  EXPECT_EQ(out, v);
+}
+
+// A superseded generation handed back for deregistration after the pool
+// lock is deregistered also when the commit throws after that (an
+// allocation failing, here a seam): left registered, the device's PD could
+// not be deallocated when the transport goes, and that aborts.
+TEST(RdmaRegisterMemory, AThrowInTheCommitStillDeregistersTheOldGeneration) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const uint64_t active = rdma::RcEndpoint::PoolMrActiveRegistrations();
+  std::atomic<int> deregistered{0};
+  {
+    RdmaTransport rt(kMaxMsg);
+    std::vector<char> region(2 << 20);
+    ASSERT_TRUE(rt.RegisterMemory(region.data(), 1 << 20));
+    std::atomic<bool> thrown{false};
+    rdma::RcEndpoint::SetPoolRetireSeamForTest([&] {
+      if (!thrown.exchange(true)) throw std::bad_alloc();
+    });
+    rdma::RcEndpoint::SetPoolDeregistrationSeamForTest(
+        [&] { deregistered.fetch_add(1); });
+    struct ClearSeams {
+      ~ClearSeams() {
+        rdma::RcEndpoint::SetPoolRetireSeamForTest({});
+        rdma::RcEndpoint::SetPoolDeregistrationSeamForTest({});
+      }
+    } clear_seams;
+    EXPECT_THROW(rt.RegisterMemory(region.data(), region.size()),
+                 std::bad_alloc);
+    EXPECT_TRUE(thrown.load());
+    EXPECT_GE(deregistered.load(), 1)
+        << "the generation handed back before the throw was not deregistered";
+  }  // the transport goes: its PDs deallocate (an MR left would abort)
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrActiveRegistrations(), active);
+}
+
+// Destroying the transport while a declaration registers waits for it, and
+// tears down after it: nothing it registers is left behind.
+TEST(RdmaRegisterMemory, DestructionWaitsForARegistrationInFlight) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const uint64_t active = rdma::RcEndpoint::PoolMrActiveRegistrations();
+  std::vector<char> region(1 << 20);
+  auto rt = std::make_unique<RdmaTransport>(kMaxMsg);
+  bool registered = false;
+  std::atomic<bool> destroyed{false};
+  {
+    HeldPoolRegistration held;
+    std::thread registering(
+        [&] { registered = rt->RegisterMemory(region.data(), region.size()); });
+    ASSERT_TRUE(held.AwaitEntry());
+    std::thread destroying([&] {
+      rt.reset();
+      destroyed = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_FALSE(destroyed.load()) << "torn down under a registration";
+    held.Release();
+    registering.join();
+    destroying.join();
+  }
+  EXPECT_TRUE(registered);
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrActiveRegistrations(), active);
+}
+
+// A rail whose registration fails undoes the rails already registered; the
+// published declaration and the operations on it are as before.
+TEST(RdmaRegisterMemory, AFailedRailUndoesTheOthersAndPublishesNothing) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  if (ConfiguredRails().size() < 2)
+    GTEST_SKIP() << "needs DFKV_RDMA_DEV with two rails";
+  RdmaNode node("register-fail");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  std::vector<char> region(2 << 20);
+  ASSERT_TRUE(rt.RegisterMemory(region.data(), 1 << 20));
+  ASSERT_TRUE(c.Exist("fail") || true);
+  const uint64_t active = rdma::RcEndpoint::PoolMrActiveRegistrations();
+  std::atomic<int> calls{0};
+  rdma::RcEndpoint::SetPoolRegistrationSeamForTest(
+      [&] { return ++calls == 1; });  // the first rail registers, not the next
+  struct ClearSeam {
+    ~ClearSeam() { rdma::RcEndpoint::SetPoolRegistrationSeamForTest({}); }
+  } clear_seam;
+  EXPECT_FALSE(rt.RegisterMemory(region.data(), region.size()));
+  EXPECT_GE(calls.load(), 2);
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrActiveRegistrations(), active)
+      << "the first rail's registration was kept";
+  EXPECT_EQ(CounterVal(rt.MetricsText(), "dfkv_rdma_client_mr_registered_bytes"),
+            1 << 20);
+  EXPECT_EQ(CounterVal(rt.MetricsText(),
+                       "dfkv_rdma_client_mr_registration_rejections_total"),
+            1);
+  rdma::RcEndpoint::SetPoolRegistrationSeamForTest({});
+  const std::string v(4096, 'f');
+  EXPECT_TRUE(c.Put("fail", v.data(), v.size()));
+  EXPECT_TRUE(rt.RegisterMemory(region.data(), region.size()));
 }
 
 // Opt-in: what an endpoint costs to open, connect and close, by depth.
