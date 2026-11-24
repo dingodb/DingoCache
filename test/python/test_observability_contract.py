@@ -106,6 +106,7 @@ PUBLIC_FAMILIES = {
     "dfkv_rdma_rail_completion_errors_total",
     "dfkv_rdma_rail_get_bytes_total",
     "dfkv_rdma_rail_put_bytes_total",
+    "dfkv_rdma_rail_retry_exhausted_peers",
     "dfkv_rdma_recv_segment_bytes",
     "dfkv_rdma_recv_segment_max_bytes",
     "dfkv_rdma_recv_segment_chunks",
@@ -280,6 +281,13 @@ class ObservabilityContractTest(unittest.TestCase):
             "dfkv_rdma_recv_segment_used_bytes",
             panel["targets"][0]["expr"],
         )
+
+    def test_alert_rules_have_a_promtool_test_run_in_ci(self):
+        rule_test = (ALERTS.parent / "alerts_test.yml").read_text(encoding="utf-8")
+        self.assertIn("alerts.yml", rule_test)
+        self.assertIn("DfkvRdmaRailRetriesExhaustedForManyPeers", rule_test)
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("test rules /etc/prometheus/alerts_test.yml", workflow)
 
     def test_prometheus_mounts_the_checked_rule_file(self):
         prometheus = (ROOT / "deploy" / "observability" / "prometheus.yml").read_text()

@@ -241,6 +241,7 @@ RDMA-listener scrape inventory。
 | `dfkv_uring_reads_total` / `dfkv_uring_init_fallbacks_total` | counter | io_uring 路径实际读 / 初始化失败回退同步连接数 |
 | `dfkv_rdma_rail_active_conns{dev}` | gauge | 每个本地 HCA 上当前连接数 |
 | `dfkv_rdma_rail_completions_total{dev}` / `dfkv_rdma_rail_completion_errors_total{dev}` | counter | 每 rail 请求完成 / 错误完成 |
+| `dfkv_rdma_rail_retry_exhausted_peers{dev}` | gauge | 最近 30 s 内在这个设备上有连接以 RETRY_EXC 或 RNR_RETRY_EXC 结束的不同对端 IP 地址数（按地址计，不按 QP；同一台机器上不同 pod 的 client 各算一个；每 rail 最多记 64 个）。只有一个通常是那个 client 自己（进程被杀、卡住）；同一设备上有好几个、而本节点别的设备干净，多半是这个设备的端口或链路问题。只用于观察和告警（`DfkvRdmaRailRetriesExhaustedForManyPeers`：5 分钟内最大值 ≥3 即触发，因为 client 在一次突发之后很快就不再用这个设备，数值随之回落），不影响放置 |
 | `dfkv_rdma_rail_wc_errors_total{dev,status}` | counter | 上一行错误完成按 work completion status 分解；每条连接在首个失败完成处终止，所以同一 `dev` 各 `status` 之和等于 `dfkv_rdma_rail_completion_errors_total{dev}`。series 在首次出现时才导出，告警用上一行的总量；对端地址不做 label，见 §3.7 |
 | `dfkv_rdma_rail_put_writes_total{dev}` / `dfkv_rdma_rail_put_bytes_total{dev}` | counter | 每 rail 收到的 PUT one-sided writes / payload bytes |
 
