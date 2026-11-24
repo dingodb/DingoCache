@@ -106,6 +106,24 @@ class RdmaServerTestPeer {
   static void SetResponderReadDepth(RdmaServer* server, int depth) {
     server->responder_read_depth_for_test_ = depth;
   }
+  static void SetPortState(RdmaServer* server,
+                           std::function<int(size_t)> state) {
+    std::lock_guard<std::mutex> lock(server->rail_listener_mu_);
+    server->port_state_for_test_ = std::move(state);
+  }
+  static void SetBeforeLiveRegistration(RdmaServer* server,
+                                        std::function<void()> hook) {
+    server->before_live_registration_for_test_ = std::move(hook);
+  }
+  static size_t LiveConnectionsOnRail(RdmaServer& server, size_t rail) {
+    std::lock_guard<std::mutex> lock(server.conn_mu_);
+    size_t n = 0;
+    for (const auto& [ep, live] : server.live_eps_) n += live.rail == rail;
+    return n;
+  }
+  static size_t DefaultRail(const RdmaServer& server) {
+    return server.DefaultRail();
+  }
   static size_t AnchorCount(const RdmaServer& server) {
     return server.anchors_.size();
   }
@@ -11180,5 +11198,288 @@ TEST(RdmaReadDepth, OfferedOnlyIfEveryRailAcceptsTheDepth) {
         << "device depth " << device_depth;
     server.Stop();
   }
+  }
+namespace {
+// RDS-02: the server's port watcher, driven through its seam (no real port
+// is touched). Rails by name; the node serves every configured rail.
+struct ServerPorts {
+  std::vector<std::string> rails;
+  std::unique_ptr<std::atomic<int>[]> state;
+  explicit ServerPorts(const RdmaNode& node)
+      : rails(node.rsrv->DeviceNames()),
+        state(std::make_unique<std::atomic<int>[]>(rails.size())) {
+    for (size_t i = 0; i < rails.size(); ++i) state[i] = 1;
+  }
+};
+bool WaitFor(const std::function<bool()>& done, int timeout_ms = 3000) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  while (!done()) {
+    if (std::chrono::steady_clock::now() > deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return true;
+}
+// Clears the port seam before the state it reads goes away.
+// Stops the server first: the watcher calls a copy of the seam outside the
+// lock, so a poll in flight could still read the test's locals after the
+// reset. Stop() joins the watcher; the node's own Stop() later is a no-op.
+struct ResetPortSeam {
+  RdmaServer* server;
+  ~ResetPortSeam() {
+    server->Stop();
+    RdmaServerTestPeer::SetPortState(server, nullptr);
+  }
+};
+std::string RailPortLine(const std::string& rail) {
+  return "dfkv_rdma_rail_port_active{dev=\"" + rail + "\"} ";
+}
+bool RailPortIs(const RdmaNode& node, const std::string& rail, int value) {
+  return node.rsrv->MetricsText().find(RailPortLine(rail) +
+                                       std::to_string(value) + "\n") !=
+         std::string::npos;
+}
+}  // namespace
+
+// A client on a rail whose server port is not ACTIVE is refused at the
+// bootstrap: it fails at once instead of after RC retries on a QP that
+// cannot carry it, and is served again once the port is back.
+TEST(RdmaServerPorts, ARailWhosePortIsDownIsRefusedUntilItIsBack) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv check("DFKV_RDMA_PORT_CHECK_MS", "20");
+  RdmaNode node("port-down-refused");
+  ServerPorts ports(node);
+  const std::string rail = ports.rails.back();
+  ports.state[ports.rails.size() - 1] = 0;
+  RdmaServerTestPeer::SetPortState(
+      node.rsrv.get(), [&ports](size_t i) { return ports.state[i].load(); });
+  ResetPortSeam reset_seam{node.rsrv.get()};
+  ASSERT_TRUE(WaitFor([&] { return RailPortIs(node, rail, 0); }));
+  ScopedEnv no_client_watch("DFKV_RDMA_PORT_CHECK_MS", "0");
+  {
+    RdmaTransport rt(kMaxMsg, rail);
+    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+    const std::string v(4096, 'd');
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_FALSE(c.Put("port-down", v.data(), v.size()));
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    EXPECT_LT(ms, 1000.0) << "refused at the bootstrap, not after RC retries";
+    EXPECT_GE(CounterVal(node.rsrv->MetricsText(),
+                         "dfkv_rdma_inactive_rail_refusals_total"), 1);
+    EXPECT_GE(CounterVal(rt.MetricsText(), "dfkv_rdma_client_peer_busy_total"),
+              1);
+  }
+  ports.state[ports.rails.size() - 1] = 1;
+  ASSERT_TRUE(WaitFor([&] { return RailPortIs(node, rail, 1); }));
+  RdmaTransport rt(kMaxMsg, rail);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const std::string v(4096, 'u');
+  EXPECT_TRUE(c.Put("port-back", v.data(), v.size()));
+}
+
+// A rail whose port stops being ACTIVE has its connections ended at once,
+// and only its own: another rail's connections go on.
+TEST(RdmaServerPorts, ARailGoingDownEndsOnlyItsConnections) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  if (!devs || !std::strchr(devs, ','))
+    GTEST_SKIP() << "needs DFKV_RDMA_DEV with two rails";
+  ScopedEnv check("DFKV_RDMA_PORT_CHECK_MS", "20");
+  RdmaNode node("port-down-ends");
+  ServerPorts ports(node);
+  ASSERT_GE(ports.rails.size(), 2u);
+  RdmaServerTestPeer::SetPortState(
+      node.rsrv.get(), [&ports](size_t i) { return ports.state[i].load(); });
+  ResetPortSeam reset_seam{node.rsrv.get()};
+  ScopedEnv no_client_watch("DFKV_RDMA_PORT_CHECK_MS", "0");
+  RdmaTransport first(kMaxMsg, ports.rails[0]), second(kMaxMsg, ports.rails[1]);
+  KVClient c0({{"n", node.addr}}, SelfHdr(), &first);
+  KVClient c1({{"n", node.addr}}, SelfHdr(), &second);
+  const std::string v(4096, 'e');
+  ASSERT_TRUE(c0.Put("ends-0", v.data(), v.size()));
+  ASSERT_TRUE(c1.Put("ends-1", v.data(), v.size()));
+  ASSERT_GE(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0), 1u);
+  ASSERT_GE(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 1), 1u);
+  const size_t on_first =
+      RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0);
+  ports.state[1] = 0;
+  EXPECT_TRUE(WaitFor([&] {
+    return RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 1) == 0;
+  })) << "the down rail's connections were not ended";
+  EXPECT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0),
+            on_first) << "another rail's connection was ended";
+  EXPECT_GE(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_rail_down_connections_ended_total"), 1);
+  std::string out(v.size(), '\0');
+  EXPECT_TRUE(c0.Get("ends-0", &out[0], out.size()));
+}
+
+// A port that flaps reaches the listener (which asks the MDS for an early
+// heartbeat) at most once a second per rail; the first look at startup is
+// not reported.
+TEST(RdmaServerPorts, AFlappingPortNoticesTheListenerAtMostOnceASecond) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv check("DFKV_RDMA_PORT_CHECK_MS", "10");
+  RdmaNode node("port-flap");
+  ServerPorts ports(node);
+  std::mutex mu;
+  std::map<std::string, int> notices;
+  node.rsrv->set_rail_state_listener(
+      [&](const std::string& dev, bool) {
+        std::lock_guard<std::mutex> lock(mu);
+        ++notices[dev];
+      });
+  std::atomic<uint64_t> calls{0};
+  RdmaServerTestPeer::SetPortState(
+      node.rsrv.get(), [&ports, &calls](size_t i) {
+        if (i + 1 != ports.rails.size()) return 1;
+        return static_cast<int>(calls.fetch_add(1) % 2);  // flaps every poll
+      });
+  ResetPortSeam reset_seam{node.rsrv.get()};
+  std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+  node.rsrv->set_rail_state_listener(nullptr);
+  const long changes = CounterVal(node.rsrv->MetricsText(),
+                                  "dfkv_rdma_rail_port_changes_total");
+  std::lock_guard<std::mutex> lock(mu);
+  EXPECT_GE(changes, 20) << "the port did not flap as set";
+  EXPECT_GE(notices[ports.rails.back()], 1);
+  EXPECT_LE(notices[ports.rails.back()], 4) << changes << " changes";
+  for (size_t i = 0; i + 1 < ports.rails.size(); ++i)
+    EXPECT_EQ(notices[ports.rails[i]], 0) << ports.rails[i];
+}
+
+// A client that names no device gets the first rail not known to be down.
+TEST(RdmaServerPorts, NoDeviceNamedGetsTheFirstActiveRail) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  if (!devs || !std::strchr(devs, ','))
+    GTEST_SKIP() << "needs DFKV_RDMA_DEV with two rails";
+  ScopedEnv check("DFKV_RDMA_PORT_CHECK_MS", "20");
+  RdmaNode node("port-default");
+  ServerPorts ports(node);
+  RdmaServerTestPeer::SetPortState(
+      node.rsrv.get(), [&ports](size_t i) { return ports.state[i].load(); });
+  ResetPortSeam reset_seam{node.rsrv.get()};
+  EXPECT_EQ(RdmaServerTestPeer::DefaultRail(*node.rsrv), 0u);
+  ports.state[0] = 0;
+  ASSERT_TRUE(WaitFor([&] { return RailPortIs(node, ports.rails[0], 0); }));
+  EXPECT_EQ(RdmaServerTestPeer::DefaultRail(*node.rsrv), 1u);
+}
+
+// RDS-02 review: a connection that passed its rail check just before the
+// port went down registers after the watcher woke the rail's connections:
+// it must end itself rather than live on, unnoticed, on a dead rail.
+TEST(RdmaServerPorts, AConnectionRegisteringAsItsRailGoesDownEndsItself) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv check("DFKV_RDMA_PORT_CHECK_MS", "20");
+  RdmaNode node("port-down-registering");
+  ServerPorts ports(node);
+  const size_t rail = ports.rails.size() - 1;
+  RdmaServerTestPeer::SetPortState(
+      node.rsrv.get(), [&ports](size_t i) { return ports.state[i].load(); });
+  ResetPortSeam reset_seam{node.rsrv.get()};
+  std::atomic<bool> armed{true};
+  RdmaServerTestPeer::SetBeforeLiveRegistration(node.rsrv.get(), [&] {
+    if (!armed.exchange(false)) return;
+    ports.state[rail] = 0;  // after the rail check, before registration
+    WaitFor([&] { return RailPortIs(node, ports.rails[rail], 0); });
+    // Two more polls: the watcher has confirmed it and woken the rail's
+    // connections, of which this one is not yet.
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  });
+  struct ClearHook {
+    RdmaServer* server;
+    ~ClearHook() { RdmaServerTestPeer::SetBeforeLiveRegistration(server, {}); }
+  } clear_hook{node.rsrv.get()};
+  ScopedEnv no_client_watch("DFKV_RDMA_PORT_CHECK_MS", "0");
+  RdmaTransport rt(kMaxMsg, ports.rails[rail]);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const std::string v(4096, 'r');
+  (void)c.Put("registering", v.data(), v.size());  // may fail: rail is down
+  EXPECT_TRUE(WaitFor([&] {
+    return RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, rail) == 0;
+  })) << "the connection that registered after the wake lives on";
+  EXPECT_GE(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_rail_down_connections_ended_total"), 1);
+}
+
+// RDS-02 review: a change suppressed by the once-a-second limit is sent once
+// the second is over, if it still holds: a port down then up again within
+// the second ends with "up" notified.
+TEST(RdmaServerPorts, TheLastStateIsNotifiedAfterTheRateLimit) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv check("DFKV_RDMA_PORT_CHECK_MS", "20");
+  RdmaNode node("port-trailing-notice");
+  ServerPorts ports(node);
+  const size_t rail = ports.rails.size() - 1;
+  std::mutex mu;
+  std::vector<bool> heard;
+  node.rsrv->set_rail_state_listener([&](const std::string& dev, bool up) {
+    if (dev != ports.rails[rail]) return;
+    std::lock_guard<std::mutex> lock(mu);
+    heard.push_back(up);
+  });
+  RdmaServerTestPeer::SetPortState(
+      node.rsrv.get(), [&ports](size_t i) { return ports.state[i].load(); });
+  ResetPortSeam reset_seam{node.rsrv.get()};
+  ASSERT_TRUE(WaitFor([&] { return RailPortIs(node, ports.rails[rail], 1); }));
+  ports.state[rail] = 0;
+  ASSERT_TRUE(WaitFor([&] {
+    std::lock_guard<std::mutex> lock(mu);
+    return !heard.empty();
+  }));
+  ports.state[rail] = 1;  // within the second: suppressed for now
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  node.rsrv->set_rail_state_listener(nullptr);
+  std::lock_guard<std::mutex> lock(mu);
+  ASSERT_EQ(heard.size(), 2u);
+  EXPECT_FALSE(heard[0]);
+  EXPECT_TRUE(heard[1]) << "the port came back and nobody was told";
+}
+
+// RDS-02 review: one poll that sees the port down refuses new handshakes
+// but keeps the rail's connections (a link retraining within a poll); a
+// second poll in a row ends them.
+TEST(RdmaServerPorts, AOnePollFlapKeepsTheRailsConnections) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv check("DFKV_RDMA_PORT_CHECK_MS", "20");
+  RdmaNode node("port-short-flap");
+  ServerPorts ports(node);
+  const size_t rail = ports.rails.size() - 1;
+  std::atomic<int> down_polls{0};
+  RdmaServerTestPeer::SetPortState(
+      node.rsrv.get(), [&ports, &down_polls, rail](size_t i) {
+        if (i == rail && down_polls.load() > 0) {
+          down_polls.fetch_sub(1);
+          return 0;
+        }
+        return ports.state[i].load();
+      });
+  ResetPortSeam reset_seam{node.rsrv.get()};
+  ScopedEnv no_client_watch("DFKV_RDMA_PORT_CHECK_MS", "0");
+  RdmaTransport rt(kMaxMsg, ports.rails[rail]);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const std::string v(4096, 'f');
+  ASSERT_TRUE(c.Put("flap", v.data(), v.size()));
+  ASSERT_GE(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, rail), 1u);
+  const long changes_before = CounterVal(node.rsrv->MetricsText(),
+                                         "dfkv_rdma_rail_port_changes_total");
+  down_polls = 1;
+  ASSERT_TRUE(WaitFor([&] {
+    return CounterVal(node.rsrv->MetricsText(),
+                      "dfkv_rdma_rail_port_changes_total") >= changes_before + 2;
+  })) << "the one-poll flap was not seen";
+  EXPECT_GE(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, rail), 1u)
+      << "a one-poll flap ended the rail's connections";
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_rail_down_connections_ended_total"), 0);
+  std::string out(v.size(), '\0');
+  EXPECT_TRUE(c.Get("flap", &out[0], out.size()));
+  down_polls = 1000000;  // down for good: the second poll ends them
+  EXPECT_TRUE(WaitFor([&] {
+    return RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, rail) == 0;
+  }));
+  down_polls = 0;
 }
 

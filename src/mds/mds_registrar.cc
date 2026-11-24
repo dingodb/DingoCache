@@ -171,6 +171,13 @@ bool MdsRegistrar::BeatNow(int timeout_ms) {
   }) && beat_ok_seq_ >= target;
 }
 
+void MdsRegistrar::RequestBeat() {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!running_.load()) return;
+  beat_now_ = true;
+  cv_.notify_all();
+}
+
 bool MdsRegistrar::Deregister() {
   return SendOnce(static_cast<uint8_t>(WireOp::kDeregister), io_ms_,
                   /*deadline_ms=*/0);

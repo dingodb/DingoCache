@@ -105,6 +105,17 @@ class RdmaServer {
   ~RdmaServer();
 
   Status Start(int port);  // TCP bootstrap port
+  // Called from the port watcher, off any serve thread, when a rail's port
+  // turns ACTIVE or stops being ACTIVE; at most once a second per rail (a
+  // flapping port cannot storm the caller, which asks the MDS for an early
+  // heartbeat). Set it before Start, or at any time: it is copied under its
+  // own lock.
+  using RailStateListener =
+      std::function<void(const std::string& device, bool active)>;
+  void set_rail_state_listener(RailStateListener listener) {
+    std::lock_guard<std::mutex> lock(rail_listener_mu_);
+    rail_listener_ = std::move(listener);
+  }
   void Stop();
   // First half of Stop(): stops accepting and joins every connection thread,
   // so no handler runs once it returns. The rails and their receive-pool
@@ -293,6 +304,33 @@ class RdmaServer {
   void UnwatchSession(uint64_t id, int fd);
   std::mutex recv_trim_mu_;
   std::condition_variable recv_trim_cv_;
+  // Port state of each rail (RDS-02), polled every port_check_ms_ by
+  // port_thread_ (DFKV_RDMA_PORT_CHECK_MS; 0 = off): 1 ACTIVE, 0 not,
+  // -1 unknown (treated as usable). The poll holds no lock a handshake or a
+  // serve loop takes; a rail going down takes conn_mu_ only to wake that
+  // rail's connections.
+  int port_check_ms_ = 0;  // off unless set (new behaviour defaults off)
+  std::unique_ptr<rdma::PortWatcher> port_watcher_;
+  std::unique_ptr<std::atomic<int>[]> rail_port_state_;
+  std::vector<uint64_t> rail_last_notice_ms_;  // port_thread_ only
+  std::vector<int> rail_notified_state_;       // port_thread_ only
+  std::vector<int> rail_down_polls_;           // port_thread_ only
+  // Down on two polls in a row: the rail's connections are ended.
+  std::unique_ptr<std::atomic<bool>[]> rail_down_confirmed_;
+  // Runs before a connection registers in live_eps_ (after its rail check).
+  std::function<void()> before_live_registration_for_test_;
+  std::thread port_thread_;
+  std::mutex port_mu_;
+  std::condition_variable port_cv_;
+  std::mutex rail_listener_mu_;
+  RailStateListener rail_listener_;
+  std::atomic<uint64_t> inactive_rail_refusals_{0};
+  std::atomic<uint64_t> rail_down_connections_ended_{0};
+  std::atomic<uint64_t> rail_port_changes_{0};
+  void PortWatchLoop();
+  void CheckRailPorts();
+  // The rail a client that names no device gets: the first not known down.
+  size_t DefaultRail() const;
   // Track per-connection Serve threads + their endpoints so Stop() can wake them
   // out of WaitComp and join them before the handler's owner is destroyed, and
   // so finished threads are reaped incrementally (see ReapDoneLocked).
@@ -315,6 +353,7 @@ class RdmaServer {
     // The connection holds a grant its client has yet to use or release:
     // Quiesce lets it finish (DFKV_RDMA_STOP_DRAIN_MS) before waking it.
     std::atomic<bool>* holding_grants;
+    size_t rail = 0;  // index into anchor_devs_
   };
   // Bootstrap sockets of connections still in their handshake: Quiesce shuts
   // them down so their threads stop waiting for the peer's frames. A thread
@@ -385,6 +424,8 @@ class RdmaServer {
   bool TrialRegistration(rdma::RcEndpoint& anchor, const std::string& device,
                          rdma::RecvSegment* segment);
   // Replaces the startup trial registration on a rail (true = registered).
+  // Replaces the port query of a rail (1 ACTIVE, 0 not, -1 unknown).
+  std::function<int(size_t rail)> port_state_for_test_;
   std::function<bool(const std::string&)> startup_registration_for_test_;
   // Replaces the smallest responder READ depth of the rails' devices.
   int responder_read_depth_for_test_ = 0;
