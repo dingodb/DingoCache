@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+
+- Server, file store engine (`--store-engine file`, the explicit
+  diagnostic and rollback engine; slab is the default): CLOCK eviction no
+  longer evicts the object a PUT has just stored, and unread PUTs no longer
+  evict each other for good (REQ-16). A new entry went in at the front,
+  unreferenced, where the hand, sweeping toward the front, reached it right
+  after clearing the residents' bits: under pressure on read objects a PUT
+  returned kOk for an object already evicted, and with the hand at the
+  front each unread PUT evicted the one before while the older objects
+  behind the hand were never examined again. A new entry now goes in just
+  behind the hand, so it is examined last, and the eviction a PUT triggers
+  never takes that PUT's own object.
 - Server, RDMA: `dfkv_rdma_rail_retry_exhausted_peers{dev}`, the distinct
   peer IP addresses whose connection on a device ended with RETRY_EXC or
   RNR_RETRY_EXC in the last 30 s (addresses, not QPs, so clients in

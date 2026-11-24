@@ -388,7 +388,21 @@ bool KVStore::RenameToTrash(const std::string& path, std::string* trash) {
   return true;
 }
 
-bool KVStore::EvictLocked(Shard& sh, std::vector<std::string>* trash) {
+std::list<std::string>::iterator KVStore::InsertLocked(
+    Shard& sh, const std::string& fname) {
+  // At the front, an unreferenced new entry was what the hand, sweeping
+  // toward the front, reached right after clearing the residents: a PUT could
+  // evict its own object, and with the hand at the front each unread PUT
+  // evicted the previous one (LIFO), never reaching the cleared older ones.
+  if (sh.hand == sh.ring.end()) {
+    sh.ring.push_front(fname);
+    return sh.ring.begin();
+  }
+  return sh.ring.insert(std::next(sh.hand), fname);
+}
+
+bool KVStore::EvictLocked(Shard& sh, std::vector<std::string>* trash,
+                          std::list<std::string>::iterator fresh) {
   // size() > 1 (not !empty()): never evict a shard's last entry, so a value larger
   // than the per-shard capacity still stays cached (it just keeps the shard over).
   size_t spins = 0;
@@ -396,6 +410,10 @@ bool KVStore::EvictLocked(Shard& sh, std::vector<std::string>* trash) {
     const size_t limit = 2 * sh.ring.size();  // recomputed: ring shrinks as we evict
     if (sh.hand == sh.ring.end()) sh.hand = std::prev(sh.ring.end());  // (re)start at tail
     auto cur = sh.hand;
+    if (cur == fresh) {  // the object this PUT stored stays
+      sh.hand = HandNext(sh.ring, cur);
+      continue;
+    }
     auto it = sh.index.find(*cur);
     if (it == sh.index.end()) {  // ring/index drift (shouldn't happen): drop the node
       sh.hand = HandNext(sh.ring, cur);
@@ -536,14 +554,14 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
     if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }  // lost the race; keep first
     fs::rename(tmp, full, ec);  // atomic publish
     if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
-    sh.ring.push_front(fname);
+    const auto slot = InsertLocked(sh, fname);
     auto res =
         sh.index.try_emplace(fname, full.string(), len, key.tenant_hash);
-    res.first->second.it = sh.ring.begin();  // O(1) removal handle
+    res.first->second.it = slot;  // O(1) removal handle
     res.first->second.generation = ++next_generation_;
     sh.used_bytes += len;
     sh.tenant_used_bytes[key.tenant_hash] += len;
-    eviction_ok = EvictLocked(sh, &trash);
+    eviction_ok = EvictLocked(sh, &trash, slot);
   }
   for (auto& t : trash) { std::error_code e2; fs::remove(t, e2); }  // slow unlink off-lock
   return eviction_ok ? Status::kOk : Status::kIOError;
@@ -649,14 +667,14 @@ Status KVStore::CacheDirect(const BlockKey& key, char* data, size_t len,
       fs::remove(tmp, ec);
       return Status::kIOError;
     }
-    sh.ring.push_front(fname);
+    const auto slot = InsertLocked(sh, fname);
     auto res =
         sh.index.try_emplace(fname, full.string(), len, key.tenant_hash);
-    res.first->second.it = sh.ring.begin();
+    res.first->second.it = slot;
     res.first->second.generation = ++next_generation_;
     sh.used_bytes += len;
     sh.tenant_used_bytes[key.tenant_hash] += len;
-    direct_eviction_ok = EvictLocked(sh, &trash);
+    direct_eviction_ok = EvictLocked(sh, &trash, slot);
   }
   for (auto& path : trash) {
     std::error_code remove_error;
