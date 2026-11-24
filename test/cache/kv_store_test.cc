@@ -270,6 +270,54 @@ TEST_F(KVStoreTest, EvictsUnderAllReferencedPressure) {
   EXPECT_TRUE(s.IsCached(BlockKey{40, 0}));  // the newest insert survives
 }
 
+// REQ-16: CLOCK must not evict the object a PUT has just written. A new entry
+// started unreferenced at the front, where the hand, having cleared every
+// referenced resident, found it first: under all-referenced pressure many
+// PUTs returned kOk for an object already evicted (ids 6-9, 11, 14, ... in
+// this sequence).
+TEST_F(KVStoreTest, ANewObjectIsNeverEvictedByItsOwnInsertion) {
+  const uint64_t obj = 1000, cap = 5500;
+  KVStore s(Opts(cap, /*shards=*/1));
+  for (uint64_t id = 1; id <= 40; ++id) {
+    for (uint64_t j = (id > 8 ? id - 8 : 1); j < id; ++j) {
+      std::string out;
+      s.Range(BlockKey{j, 0}, 0, 8, &out);
+    }
+    std::string v(obj, char('a' + (id % 20)));
+    ASSERT_EQ(s.Cache(BlockKey{id, 0}, v.data(), v.size()), Status::kOk);
+    EXPECT_TRUE(s.IsCached(BlockKey{id, 0})) << "id=" << id << " evicted itself";
+  }
+}
+
+// REQ-16: with the hand at the front, each PUT that nobody read before the
+// next one evicted the previous PUT, for good (LIFO): the older objects
+// behind the hand, whose bits it had cleared, were never examined again.
+// Three-object shard: 1 (read), 2, 3, 2 read, then 4..9 unread. Before,
+// 3, 4, ..., 8 went and 1 and 2 stayed forever; now the hand gets back to
+// 1 and 2, and the shard ends holding the newest three.
+TEST_F(KVStoreTest, UnreadPutsDoNotEvictEachOtherForever) {
+  const uint64_t obj = 1000, cap = 3500;
+  KVStore s(Opts(cap, /*shards=*/1));
+  const auto put = [&](uint64_t id) {
+    std::string v(obj, char('a' + id));
+    return s.Cache(BlockKey{id, 0}, v.data(), v.size());
+  };
+  const auto read = [&](uint64_t id) {
+    std::string out;
+    s.Range(BlockKey{id, 0}, 0, 8, &out);
+  };
+  ASSERT_EQ(put(1), Status::kOk);
+  read(1);
+  ASSERT_EQ(put(2), Status::kOk);
+  ASSERT_EQ(put(3), Status::kOk);
+  read(2);
+  for (uint64_t id = 4; id <= 9; ++id) ASSERT_EQ(put(id), Status::kOk);
+  EXPECT_FALSE(s.IsCached(BlockKey{1, 0}));
+  EXPECT_FALSE(s.IsCached(BlockKey{2, 0}));
+  for (uint64_t id = 7; id <= 9; ++id)
+    EXPECT_TRUE(s.IsCached(BlockKey{id, 0})) << id;
+}
+
 TEST_F(KVStoreTest, ReloadFromDiskRebuildsIndex) {
   BlockKey k{55, 0};
   std::string v = "persisted";

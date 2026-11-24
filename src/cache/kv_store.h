@@ -117,7 +117,7 @@ class KVStore : public StoreEngine {
     // This entry's own node in Shard::ring. std::list iterators are stable
     // across other insert/erase, so Remove() drops the ring node in O(1)
     // instead of scanning the whole ring (the old O(n), O(n^2) under RemoveMany
-    // while holding the exclusive lock). Set right after the ring push_front.
+    // while holding the exclusive lock). Set right after the ring insert.
     std::list<std::string>::iterator it{};
     Entry(std::string p, uint64_t s, uint64_t tenant)
         : path(std::move(p)), size(s), tenant_hash(tenant) {}
@@ -125,7 +125,9 @@ class KVStore : public StoreEngine {
   struct Shard {
     mutable std::shared_mutex mu;
     std::unordered_map<std::string, Entry> index;  // filename -> entry
-    std::list<std::string> ring;                    // CLOCK ring, front = newest
+    // CLOCK ring. The hand sweeps it toward the front; a new entry goes in
+    // just behind the hand (InsertLocked), so it is examined last.
+    std::list<std::string> ring;
     uint64_t used_bytes = 0;
     std::unordered_map<uint64_t, uint64_t> tenant_used_bytes;
     uint64_t capacity = 0;
@@ -142,8 +144,14 @@ class KVStore : public StoreEngine {
   // only RENAMES their files to a unique sibling (a fast metadata op); the slow
   // block-freeing unlink is deferred to `*trash`, which the caller drains AFTER
   // releasing the lock so an eviction storm can't stall concurrent GETs.
-  bool EvictLocked(Shard& sh,
-                   std::vector<std::string>* trash);  // CLOCK 2nd-chance
+  // CLOCK 2nd-chance. `fresh`, the entry just inserted, is never the victim.
+  bool EvictLocked(Shard& sh, std::vector<std::string>* trash,
+                   std::list<std::string>::iterator fresh);
+  // Puts a new entry in the ring just behind the hand (at the front when the
+  // hand is to restart at the tail): the hand reaches it after everything
+  // else. Exclusive lock held.
+  std::list<std::string>::iterator InsertLocked(Shard& sh,
+                                                const std::string& fname);
   uint64_t ForceEvictLocked(Shard& sh, uint64_t target,
                             std::vector<std::string>* trash, bool* io_error);
   bool RenameToTrash(const std::string& path, std::string* trash);
