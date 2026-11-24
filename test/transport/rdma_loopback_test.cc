@@ -235,6 +235,27 @@ class RdmaTransportTestPeer {
  public:
   using Connection = RdmaTransport::Conn;
 
+  // Ends every idle pooled connection, data and control, as the idle
+  // reclaim or a failure would; nothing of the transport is left open.
+  static size_t DropAllPooled(RdmaTransport* transport) {
+    std::vector<Connection*> idle;
+    {
+      std::lock_guard<std::mutex> lock(transport->mu_);
+      for (auto* pools : {&transport->pool_, &transport->control_pool_}) {
+        for (auto& [node, connections] : *pools) {
+          (void)node;
+          idle.insert(idle.end(), connections.begin(), connections.end());
+        }
+        pools->clear();
+      }
+    }
+    for (Connection* conn : idle) transport->Destroy(conn);
+    return idle.size();
+  }
+  static long Rails(const RdmaTransport& transport) {
+    return static_cast<long>(transport.devs_.size());
+  }
+
   struct SeededFailure {
     uint64_t now_us = 0;
     RemoteRailCompletion completion;
@@ -11153,6 +11174,100 @@ TEST(RdmaSession, TheServerSeesTheClientDropTheConnection) {
   EXPECT_GE(CounterVal(node.rsrv->MetricsText(),
                        "dfkv_rdma_session_peer_closed_total"), 1);
   EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+}
+
+// TRN-16: a transport holds each rail's device from its first connection
+// until it is destroyed. Without that, a transport that never registered
+// memory closed the device when its last connection went (idle reclaim,
+// failures) and reopened it for the next: 12-13 ms to open an endpoint on a
+// device not held, against 1.4-1.5 ms, and 3 ms to close against 1.5 ms.
+TEST(RdmaTransportDevices, ADrainedPoolKeepsTheDevicesOpen) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  // The server, in this process, references the devices too: it ends its
+  // side of a connection as soon as the client drops it (session channel),
+  // so that the count below is the client's alone.
+  ScopedEnv session("DFKV_RDMA_SESSION_FD", "1");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  RdmaNode node("device-held");
+  const long before = rdma::RcEndpoint::DeviceReferences();
+  {
+    RdmaTransport rt(kMaxMsg);
+    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+    const std::string v(4096, 'd');
+    ASSERT_TRUE(c.Put("held", v.data(), v.size()));
+    ASSERT_TRUE(c.Exist("held"));
+    ASSERT_GE(RdmaTransportTestPeer::DropAllPooled(&rt), 1u);
+    ASSERT_TRUE(ServerHasNoConnections(node, 2000));
+    // Every connection is gone; the devices they used are still held.
+    const long held = rdma::RcEndpoint::DeviceReferences() - before;
+    EXPECT_GE(held, 1) << "the drained pool released the devices";
+    EXPECT_LE(held, RdmaTransportTestPeer::Rails(rt))
+        << "more than one reference per rail";
+    std::string out(v.size(), '\0');
+    ASSERT_TRUE(c.Get("held", &out[0], out.size()));
+    EXPECT_EQ(out, v);
+    RdmaTransportTestPeer::DropAllPooled(&rt);
+    ASSERT_TRUE(ServerHasNoConnections(node, 2000));
+    const long again = rdma::RcEndpoint::DeviceReferences() - before;
+    EXPECT_GE(again, held);
+    EXPECT_LE(again, RdmaTransportTestPeer::Rails(rt))
+        << "a reconnect took another reference";
+  }
+  EXPECT_EQ(rdma::RcEndpoint::DeviceReferences(), before)
+      << "the destroyed transport kept a device";
+}
+
+// A device that is gone or was reset (an Open fails with ENODEV or EIO) is
+// no longer held: once its endpoints are gone its context can close, and
+// the next Open opens the device again instead of the dead context.
+TEST(RdmaTransportDevices, ADeviceThatIsGoneIsNoLongerHeld) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv session("DFKV_RDMA_SESSION_FD", "1");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  RdmaNode node("device-gone");
+  const long before = rdma::RcEndpoint::DeviceReferences();
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const std::string v(4096, 'x');
+  ASSERT_TRUE(c.Put("gone", v.data(), v.size()));
+  ASSERT_TRUE(c.Exist("gone"));
+  RdmaTransportTestPeer::DropAllPooled(&rt);
+  ASSERT_TRUE(ServerHasNoConnections(node, 2000));
+  ASSERT_GE(rdma::RcEndpoint::DeviceReferences() - before, 1);
+  for (long rail = 0; rail < RdmaTransportTestPeer::Rails(rt); ++rail)
+    RdmaTransportTestPeer::FailOpenOn(&rt, static_cast<size_t>(rail), ENODEV);
+  EXPECT_FALSE(c.Exist("gone"));  // every rail's Open fails
+  EXPECT_EQ(rdma::RcEndpoint::DeviceReferences(), before)
+      << "a rail whose device is gone is still held";
+}
+
+// What the transport relies on: a device nothing references any more is
+// closed, and the next Open opens it again (a fresh context).
+TEST(RdmaVerbs, ADeviceNothingHoldsIsOpenedAgain) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  { rdma::RcEndpoint first;
+    ASSERT_TRUE(first.Open(nullptr, rdma::kV2ControlCap, 1)); }
+  // Run alone (as ctest does) nothing else in the process holds a device;
+  // in a run of the whole binary an earlier test's object may.
+  const bool unheld = rdma::RcEndpoint::DeviceReferences() == 0;
+  const uint64_t opens = rdma::RcEndpoint::DeviceOpens();
+  {
+    rdma::RcEndpoint again;
+    ASSERT_TRUE(again.Open(nullptr, rdma::kV2ControlCap, 1));
+  }
+  if (unheld) EXPECT_EQ(rdma::RcEndpoint::DeviceOpens(), opens + 1);
+  // Held by a reference after its last endpoint closed: not reopened.
+  auto holder = std::make_unique<rdma::RcEndpoint>();
+  ASSERT_TRUE(holder->Open(nullptr, rdma::kV2ControlCap, 1));
+  rdma::DeviceRef held = holder->ReferenceDevice();
+  ASSERT_TRUE(held.held());
+  holder.reset();
+  const uint64_t held_opens = rdma::RcEndpoint::DeviceOpens();
+  {
+    rdma::RcEndpoint reused;
+    ASSERT_TRUE(reused.Open(nullptr, rdma::kV2ControlCap, 1));
+  }
+  EXPECT_EQ(rdma::RcEndpoint::DeviceOpens(), held_opens);
 }
 
 // Mixed versions, server side: a client that does not ask (every release
