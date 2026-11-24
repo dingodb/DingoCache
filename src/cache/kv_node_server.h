@@ -21,6 +21,7 @@
 
 #include "cache/disk_cache_group.h"
 #include "cache/ram_tier.h"
+#include "cache/remove_memory.h"
 #include "cache/read_coalescer.h"
 #include "cache/recent_reads.h"
 #include "common/block_key_hash.h"
@@ -331,6 +332,9 @@ class KvNodeServer {
   // kRetain: per-key outcomes by mode (0 SET, 1 REFRESH) and RetainCode.
   std::atomic<size_t> retain_keys_[2][8] = {};
   std::atomic<size_t> retain_requests_{0};
+  Status ProcessRemovedWithin(const BlockKey& prefix_key, uint64_t count,
+                              const char* payload, uint64_t payload_len,
+                              std::string* out_data);
   Status ProcessRetain(const BlockKey& prefix_key, uint64_t count,
                        const char* payload, uint64_t payload_len,
                        std::string* out_data);
@@ -359,6 +363,8 @@ class KvNodeServer {
   std::unique_ptr<RecentReads> recent_reads_;
   std::atomic<size_t> promote_deferred_{0};
   std::atomic<size_t> remove_ok_{0}, remove_miss_{0};
+  // Recent-REMOVE memory (DFKV_REMOVE_MEMORY_MS; null = off).
+  std::unique_ptr<RemoveMemory> remove_memory_;
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
   // Read-side convoy collapse (env DFKV_READ_COALESCE=1; see read_coalescer.h).
   ReadCoalescer read_coalescer_;

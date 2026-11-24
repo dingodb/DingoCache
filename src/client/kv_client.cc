@@ -1570,6 +1570,59 @@ KVClient::~KVClient() {
 // was held after an earlier failed connect) is not evidence of anything new.
 // The transport's record of this thread's operation is taken on every report,
 // whatever the status, so that it never outlives the operation it describes.
+Status KVClient::RemovedWithin(const std::string& node,
+                               const std::vector<std::string>& keys,
+                               uint32_t age_ms, std::vector<uint8_t>* answers,
+                               uint32_t* covered_ms) {
+  constexpr uint64_t kNoMemoryRecheckMs = 60000;
+  answers->assign(keys.size(), 2);
+  if (covered_ms) *covered_ms = 0;
+  if (keys.empty()) return Status::kOk;
+  const uint64_t now = NowMs();
+  {
+    std::lock_guard<std::mutex> lk(no_memory_mu_);
+    const auto it = no_memory_until_.find(node);
+    if (it != no_memory_until_.end()) {
+      if (now < it->second) return Status::kInvalid;
+      no_memory_until_.erase(it);
+    }
+  }
+  if (!health_.Healthy(node, now)) return Status::kIOError;
+  uint32_t covered = UINT32_MAX;
+  for (size_t begin = 0; begin < keys.size();
+       begin += kRemovedWithinMaxKeys) {
+    const size_t n = std::min(kRemovedWithinMaxKeys, keys.size() - begin);
+    std::vector<BlockKey> bkeys;
+    bkeys.reserve(n);
+    for (size_t i = 0; i < n; ++i) bkeys.push_back(block_key_(keys[begin + i]));
+    const std::string payload =
+        EncodeRemovedWithinPayload(age_ms, bkeys.data(), n);
+    std::string out;
+    const Status st =
+        t_->RemovedWithin(node, bkeys[0].tenant_hash, n, payload, &out);
+    ReportPeer(node, st);
+    if (st == Status::kInvalid) {
+      // No memory there: unknown, and not asked again for a while (an
+      // older node counts every unknown op it is sent).
+      std::lock_guard<std::mutex> lk(no_memory_mu_);
+      no_memory_until_[node] = NowMs() + kNoMemoryRecheckMs;
+      answers->assign(keys.size(), 2);
+      return Status::kInvalid;
+    }
+    if (st != Status::kOk || out.size() != 4 + n) {
+      answers->assign(keys.size(), 2);
+      return st == Status::kOk ? Status::kIOError : st;
+    }
+    covered = std::min(covered, net::GetU32(out.data()));
+    for (size_t i = 0; i < n; ++i) {
+      const uint8_t a = static_cast<uint8_t>(out[4 + i]);
+      (*answers)[begin + i] = a <= 2 ? a : 2;
+    }
+  }
+  if (covered_ms) *covered_ms = covered;
+  return Status::kOk;
+}
+
 void KVClient::ReportPeer(const std::string& node, const Status* statuses,
                           size_t count) {
   PeerOutcome outcome;
