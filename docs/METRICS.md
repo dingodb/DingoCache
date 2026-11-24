@@ -492,6 +492,9 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 |---|---|---|
 | `dfkv_rdma_client_conns_opened_total` | counter | 累计打开的 RDMA client QP |
 | `dfkv_rdma_client_v2_put_writes_total` | counter | 实际发出的 v2 one-sided PUT |
+| `dfkv_rdma_client_unregistered_dest_registrations_total` | counter | GET 的目的地不在已注册内存（`dfkv_register_memory`）里时，为这次 GET 临时做的注册数；首尾相接或重叠的段合成一次。持续增长说明调用方没注册缓冲区：每次注册加注销约 40 µs，应改为启动时注册一次（日志里有限频 WARN） |
+| `dfkv_rdma_client_unregistered_dest_span_fallbacks_total` | counter | 合并后的范围网卡不肯注册、退回逐段注册的次数 |
+| `dfkv_rdma_client_unregistered_dest_memlock_fallbacks_total` | counter | 未注册的目的地一次整体注册被锁定内存上限（`ulimit -l`、`LimitMEMLOCK`）拒绝（ENOMEM/EAGAIN），改为每轮 READ 只注册这一轮的段的 GET 数 |
 | `dfkv_rdma_client_mr_regions` / `dfkv_rdma_client_mr_registered_bytes` | gauge | 所有 active rail 已成功 anchor 后才发布的 host pool MR 区域数 / 声明字节数；任一 rail 失败时两者保持上次成功值 |
 | `dfkv_rdma_client_mr_registration_rejections_total` | counter | 非法 range、rail anchor 或 `ibv_reg_mr` 失败而未发布（已回滚）的声明次数 |
 | `dfkv_rdma_client_adhoc_user_mr_total` / `dfkv_rdma_client_transient_user_mr_active` | counter / gauge | pool 外实际注册累计 / 当前仍存活的一次性 MR；公开调用返回后 active 必须回到调用前基线 |

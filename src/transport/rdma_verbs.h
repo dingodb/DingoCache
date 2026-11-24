@@ -240,6 +240,10 @@ class RcEndpoint {
   // (it may throw, as an allocation there could). Empty = none.
   static void SetPoolRetireSeamForTest(std::function<void()> seam);
   static uint64_t PoolMrRegistrationFailures();
+  // Test seam: consulted before each one-shot registration in
+  // RegisterTransient (not a pool hit); false fails it.
+  static void SetTransientRegistrationSeamForTest(
+      std::function<bool(void* addr, size_t len)> seam);
   // Process-wide number of currently retained shared-PD pool MR generations.
   // Superseded generations remain only while an endpoint still references them.
   static uint64_t PoolMrActiveRegistrations();

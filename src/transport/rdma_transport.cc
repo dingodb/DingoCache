@@ -3265,6 +3265,18 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_pull_reads_total counter\n";
   s += "dfkv_rdma_client_pull_reads_total " +
        std::to_string(pull_reads_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_unregistered_dest_registrations_total Registrations made for GET destinations outside registered memory (segments that touch share one)\n";
+  s += "# TYPE dfkv_rdma_client_unregistered_dest_registrations_total counter\n";
+  s += "dfkv_rdma_client_unregistered_dest_registrations_total " +
+       std::to_string(dest_registrations_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_unregistered_dest_memlock_fallbacks_total GETs whose unregistered destination the locked-memory limit refused as a whole, registered round by round instead\n";
+  s += "# TYPE dfkv_rdma_client_unregistered_dest_memlock_fallbacks_total counter\n";
+  s += "dfkv_rdma_client_unregistered_dest_memlock_fallbacks_total " +
+       std::to_string(dest_memlock_fallbacks_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_unregistered_dest_span_fallbacks_total Merged GET destination ranges the device would not register, registered segment by segment instead\n";
+  s += "# TYPE dfkv_rdma_client_unregistered_dest_span_fallbacks_total counter\n";
+  s += "dfkv_rdma_client_unregistered_dest_span_fallbacks_total " +
+       std::to_string(dest_span_fallbacks_.load(std::memory_order_relaxed)) + "\n";
   s += "# HELP dfkv_rdma_client_pull_read_wrs_total READ work requests posted (one may scatter into several destination segments)\n";
   s += "# TYPE dfkv_rdma_client_pull_read_wrs_total counter\n";
   s += "dfkv_rdma_client_pull_read_wrs_total " +
@@ -4280,7 +4292,13 @@ bool RdmaTransport::PullWindow(
     rdma::DynamicPullReady ready{};
     size_t copied = 0;
     size_t segment = 0;
-    std::vector<ibv_mr*> mrs;  // this round's destination registrations
+    // The lkey of each destination segment, and the registrations made for
+    // this pull (kept until its last READ completes).
+    std::vector<uint32_t> lkeys;
+    std::vector<ibv_mr*> mrs;
+    // Registered round by round instead (a locked-memory limit refused the
+    // whole destination at once): mrs then holds one round's.
+    bool per_round = false;
     size_t bytes = 0;
     bool grant = false;
   };
@@ -4361,6 +4379,101 @@ bool RdmaTransport::PullWindow(
       request.data_len = 0;
   }
 
+  // The destination's lkeys. A segment in registered memory (RegisterMemory)
+  // uses that registration. The others are registered for this pull, and
+  // segments that overlap or touch share one registration: it covers the
+  // same pages as theirs, so nothing else of the caller's is pinned (or,
+  // with fork support on, kept from a child). A merged range the device
+  // refuses is registered segment by segment, counted. If the locked-memory
+  // limit refuses the destination as a whole (ENOMEM, EAGAIN), the pull
+  // registers it round by round, as each READ goes, instead (counted).
+  const auto key_destination = [&](const PullRequest& request,
+                                   ReadState& state) -> bool {
+    state.lkeys.assign(request.segment_count, 0);
+    struct Piece {
+      uintptr_t begin;
+      uintptr_t end;
+      size_t index;
+      int kind;
+    };
+    std::vector<Piece> loose;
+    size_t left = request.data_len;
+    for (size_t i = 0; i < request.segment_count && left != 0; ++i) {
+      const auto& segment = request.segments[i];
+      if (segment.second == 0) continue;
+      const size_t bytes = std::min<size_t>(segment.second, left);
+      left -= bytes;
+      if (ibv_mr* pool = ep.RegisterUser(segment.first, bytes)) {
+        state.lkeys[i] = pool->lkey;
+        continue;
+      }
+      const auto begin = reinterpret_cast<uintptr_t>(segment.first);
+      loose.push_back({begin, begin + bytes, i,
+                       static_cast<int>(segment.memory_kind)});
+    }
+    if (loose.empty()) return true;
+    std::sort(loose.begin(), loose.end(), [](const Piece& a, const Piece& b) {
+      return a.kind != b.kind ? a.kind < b.kind : a.begin < b.begin;
+    });
+    const auto register_range = [&](uintptr_t begin, uintptr_t end) {
+      void* at = reinterpret_cast<void*>(begin);
+      if (ibv_mr* pool = ep.RegisterUser(at, end - begin)) return pool;
+      ibv_mr* mr = ep.RegisterTransient(
+          at, end - begin, rdma::RcEndpoint::TransientAccess::kLocalWrite);
+      if (mr) {
+        state.mrs.push_back(mr);
+        dest_registrations_.fetch_add(1, std::memory_order_relaxed);
+      }
+      return mr;
+    };
+    const auto per_round_instead = [&] {
+      for (ibv_mr* mr : state.mrs) ep.ReleaseTransient(mr);
+      state.mrs.clear();
+      state.per_round = true;
+      dest_memlock_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    };
+    for (size_t first = 0; first < loose.size();) {
+      size_t last = first + 1;
+      uintptr_t end = loose[first].end;
+      while (last < loose.size() && loose[last].kind == loose[first].kind &&
+             loose[last].begin <= end) {
+        end = std::max(end, loose[last].end);
+        ++last;
+      }
+      ibv_mr* span = last - first > 1 ? register_range(loose[first].begin, end)
+                                      : nullptr;
+      if (last - first > 1 && !span)
+        dest_span_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+      for (size_t i = first; i < last; ++i) {
+        ibv_mr* mr = span ? span : register_range(loose[i].begin, loose[i].end);
+        if (!mr) {
+          if (errno == ENOMEM || errno == EAGAIN) return per_round_instead();
+          NoteLocalRegistrationFailure(conn, loose[i].end - loose[i].begin);
+          return false;
+        }
+        state.lkeys[loose[i].index] = mr->lkey;
+      }
+      first = last;
+    }
+    uint64_t suppressed = 0;
+    if (dest_log_.Admit(LogThrottle::Key("unregistered destination", 0, 0),
+                        rdma::RailPolicy::NowMicros(), &suppressed))
+      DFKV_LOG_WARN("rdma: a GET's destination is not in registered memory, "
+                    "so it is registered (and pinned, against the "
+                    "locked-memory limit) for each GET: " +
+                    std::to_string(state.mrs.size()) + " registrations "
+                    "here. Register the buffers once with "
+                    "dfkv_register_memory. Similar lines suppressed: " +
+                    std::to_string(suppressed));
+    return true;
+  };
+  for (size_t slot = 0; slot < width; ++slot) {
+    if (requests[slot].status != Status::kOk || requests[slot].data_len == 0)
+      continue;
+    if (!key_destination(requests[slot], states[slot])) return false;
+  }
+
   // One READ per live item per round preserves depth-wide pipelining without
   // exceeding the endpoint's send-WR window for scatter-gather destinations.
   const size_t read_sge = ep.ReadSge();
@@ -4369,7 +4482,10 @@ bool RdmaTransport::PullWindow(
   const CompletionDeadline& deadline = window_deadline;
   for (;;) {
     size_t posted = 0;
-    for (size_t slot = 0; slot < width; ++slot) {
+    // A round registration the locked-memory limit refused while READs of
+    // this round hold theirs: that item waits for the next round.
+    bool deferred = false;
+    for (size_t slot = 0; slot < width && !deferred; ++slot) {
       auto& state = states[slot];
       const auto& request = requests[slot];
       if (request.status != Status::kOk ||
@@ -4379,29 +4495,47 @@ bool RdmaTransport::PullWindow(
       // scatters into (ReadSge): the remote range is contiguous.
       state.bytes = 0;
       sges.clear();
+      const size_t first_segment = state.segment;
       while (sges.size() < read_sge &&
              state.copied + state.bytes < request.data_len &&
              state.segment < request.segment_count) {
-        const auto& segment = request.segments[state.segment++];
+        const size_t index = state.segment++;
+        const auto& segment = request.segments[index];
         if (segment.second == 0) continue;
         const size_t bytes = std::min<size_t>(
             segment.second, request.data_len - state.copied - state.bytes);
-        // A READ destination: this side's NIC writes it, no peer does.
-        ibv_mr* mr = ep.RegisterTransient(
-            segment.first, bytes,
-            rdma::RcEndpoint::TransientAccess::kLocalWrite);
-        if (!mr) {
-          NoteLocalRegistrationFailure(conn, bytes);
-          return false;
+        uint32_t lkey = state.lkeys[index];
+        if (state.per_round) {
+          // A READ destination: this side's NIC writes it, no peer does.
+          ibv_mr* mr = ep.RegisterTransient(
+              segment.first, bytes,
+              rdma::RcEndpoint::TransientAccess::kLocalWrite);
+          if (!mr && posted != 0 && (errno == ENOMEM || errno == EAGAIN)) {
+            for (ibv_mr* held : state.mrs) ep.ReleaseTransient(held);
+            state.mrs.clear();
+            state.segment = first_segment;
+            state.bytes = 0;
+            deferred = true;
+            break;
+          }
+          if (!mr) {
+            NoteLocalRegistrationFailure(conn, bytes);
+            return false;
+          }
+          if (mr != ep.RegisterUser(segment.first, bytes)) {
+            state.mrs.push_back(mr);
+            dest_registrations_.fetch_add(1, std::memory_order_relaxed);
+          }
+          lkey = mr->lkey;
         }
-        state.mrs.push_back(mr);
         ibv_sge sge{};
         sge.addr = reinterpret_cast<uintptr_t>(segment.first);
         sge.length = static_cast<uint32_t>(bytes);
-        sge.lkey = mr->lkey;
+        sge.lkey = lkey;
         sges.push_back(sge);
         state.bytes += bytes;
       }
+      if (deferred) break;
       if (sges.empty()) return malformed();
       if (!ep.PostReadSg(slot, sges.data(), sges.size(),
                          state.ready.address + state.copied,
@@ -4431,12 +4565,21 @@ bool RdmaTransport::PullWindow(
     }
     for (size_t slot = 0; slot < width; ++slot) {
       auto& state = states[slot];
-      if (state.mrs.empty()) continue;
-      for (ibv_mr* mr : state.mrs) ep.ReleaseTransient(mr);
-      state.mrs.clear();
       state.copied += state.bytes;
       pull_read_bytes_.fetch_add(state.bytes, std::memory_order_relaxed);
+      state.bytes = 0;
+      // A round's registrations, or the whole destination's once its last
+      // READ is in: other items' rounds may need the locked memory.
+      if (!state.per_round && state.copied != requests[slot].data_len)
+        continue;
+      for (ibv_mr* mr : state.mrs) ep.ReleaseTransient(mr);
+      state.mrs.clear();
     }
+  }
+  // Every READ is complete: the destination registrations go.
+  for (size_t slot = 0; slot < width; ++slot) {
+    for (ibv_mr* mr : states[slot].mrs) ep.ReleaseTransient(mr);
+    states[slot].mrs.clear();
   }
 
   // Pack RELEASE messages in control slots while retaining each grant's

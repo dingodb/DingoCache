@@ -79,6 +79,7 @@ std::function<bool()> g_pool_registration_seam;
 std::function<void()> g_pool_deregistration_seam;
 // Test seam: called right after a pool MR is handed back to `retired`.
 std::function<void()> g_pool_retire_seam;
+std::function<bool(void*, size_t)> g_transient_registration_seam;
 std::unordered_map<std::string, SharedDevice> g_devs;
 
 // Cumulative one-shot user MRs registered outside explicit pool regions.
@@ -359,6 +360,11 @@ bool QueryPortInfo(ibv_context* ctx, uint8_t port, PortInfo* out) {
 
 uint64_t RcEndpoint::AdhocUserMrTotal() {
   return g_adhoc_user_mr.load(std::memory_order_relaxed);
+}
+
+void RcEndpoint::SetTransientRegistrationSeamForTest(
+    std::function<bool(void*, size_t)> seam) {
+  g_transient_registration_seam = std::move(seam);
 }
 
 void RcEndpoint::SetPoolRegistrationSeamForTest(std::function<bool()> seam) {
@@ -1014,6 +1020,11 @@ ibv_mr* RcEndpoint::RegisterTransient(void* addr, size_t len,
         (p.access & access) == access) {
       return p.mr;
     }
+  }
+  if (g_transient_registration_seam &&
+      !g_transient_registration_seam(addr, len)) {
+    errno = ENOMEM;
+    return nullptr;
   }
   ibv_mr* mr = ibv_reg_mr(pd_, addr, len, access);
   if (mr) {
