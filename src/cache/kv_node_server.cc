@@ -363,6 +363,31 @@ KvNodeServer::RamTierPlan KvNodeServer::PlanRamTier(size_t disk_count) {
                               std::to_string(o.ack_high_watermark_pct));
   config_dump::RecordResolved("DFKV_RAM_TIER_BYTES", std::to_string(o.bytes));
   config_dump::RecordResolved("DFKV_RAM_RECLAIM_MS", std::to_string(o.reclaim_interval_ms));
+  // Which whole-value cold reads are promoted into RAM: every one (first,
+  // as before) or only a key's repeat read within the window (second), so a
+  // one-time scan does not push out values that are read again.
+  const char* pe = std::getenv("DFKV_RAM_PROMOTE");
+  std::string promote = pe ? std::string(pe) : "";
+  if (promote != "first" && promote != "second") {
+    if (!promote.empty())
+      envparse::WarnOnce("DFKV_RAM_PROMOTE",
+                         "invalid DFKV_RAM_PROMOTE='" + promote +
+                             "': only first and second are known; using "
+                             "first");
+    promote = "first";
+  }
+  plan.promote_second = promote == "second";
+  config_dump::RecordResolved("DFKV_RAM_PROMOTE", promote);
+  if (plan.promote_second) {
+    envparse::U64Spec spec;
+    spec.fallback = plan.promote_window_ms;
+    spec.min = 1;
+    spec.max = 86400000;
+    plan.promote_window_ms =
+        envparse::EnvU64("DFKV_RAM_PROMOTE_WINDOW_MS", spec);
+    config_dump::RecordResolved("DFKV_RAM_PROMOTE_WINDOW_MS",
+                                std::to_string(plan.promote_window_ms));
+  }
   return plan;
 }
 
@@ -414,6 +439,9 @@ std::future<std::unique_ptr<RamTier>> KvNodeServer::StartRamTier() {
 void KvNodeServer::AdoptRamTier(std::unique_ptr<RamTier> tier) {
   ram_write_back_ = ram_plan_.write_back;
   ram_ack_enabled_ = ram_plan_.ack_enabled;
+  if (ram_plan_.promote_second)
+    recent_reads_ = std::make_unique<RecentReads>(ram_plan_.promote_window_ms,
+                                                  kRecentReadsMax);
   ram_flush_disks_.reserve(group_.DiskCount());
   for (size_t i = 0; i < group_.DiskCount(); ++i)
     ram_flush_disks_.push_back(std::make_unique<RamFlushDiskMetrics>());
@@ -1156,6 +1184,15 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_promote_declined_total", "counter",
            "Promotions the RAM tier did not take (no room, or a value it "
            "keeps out of RAM)", ram_->PromoteDeclined());
+    if (recent_reads_) {  // DFKV_RAM_PROMOTE=second only
+      metric("dfkv_ram_promote_deferred_total", "counter",
+             "Whole cold reads not promoted into RAM because the key was "
+             "not read within DFKV_RAM_PROMOTE_WINDOW_MS before",
+             promote_deferred_.load(std::memory_order_relaxed));
+      metric("dfkv_ram_recent_reads", "gauge",
+             "Keys remembered as read within DFKV_RAM_PROMOTE_WINDOW_MS",
+             recent_reads_->size());
+    }
     metric("dfkv_ram_reservations_aborted_total", "counter",
            "Promotion reservations that ended without a copy installed",
            ram_->ReservationsAborted());
@@ -1912,7 +1949,7 @@ Status KvNodeServer::RangeDirectForKey(
     // never replace the key's full contents or reported stored length.
     // Best-effort: the data is already durable, so no flush is needed.
     if (ram_ && own_read && offset == 0 && *out_data && *out_len > 0 &&
-        *out_len == *value_len)
+        *out_len == *value_len && PromoteRead(key))
       ram_->PutDurable(key, *out_data, *out_len, generation);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
@@ -1995,13 +2032,18 @@ PreparedRead KvNodeServer::PrepareReadForKey(
 
   const bool whole = offset == 0 && lease.value_len != 0 &&
                      lease.payload_len == lease.value_len;
+  // Decided before reserving: under DFKV_RAM_PROMOTE=second a read that is
+  // not promoted neither reserves RAM nor installs a copy when it lands. The
+  // read is noted only once it is sure to go ahead, as a read given up below
+  // is redone by the synchronous path, which notes it.
+  const bool promote = ram_ && whole && PromoteRead(key, /*note=*/false);
 
   // Reserve before publishing the async flight: followers may skip their
   // payload copy only when the flight is born with an immutable promise that
   // successful completion will publish a durable RAM entry before wakeup.
   RamTier::DurableReservation reservation;
   bool direct_reservation = false;
-  if (ram_ && whole && lease.head == 0 &&
+  if (promote && lease.head == 0 &&
       ram_->ReserveDurable(key, lease.value_len, &reservation, generation)) {
     direct_reservation = lease.aligned_len <= reservation.capacity();
     if (!direct_reservation)
@@ -2021,6 +2063,8 @@ PreparedRead KvNodeServer::PrepareReadForKey(
     }
   }
 
+  if (recent_reads_ && ram_ && whole) NoteRead(key, promote);
+
   // Whole-value misses can read O_DIRECT straight into their final registered
   // RAM slot. The reservation stays hidden and pinned across disk IO and RDMA
   // SEND; completion publishes the durable entry, then SEND completion drops
@@ -2037,8 +2081,30 @@ PreparedRead KvNodeServer::PrepareReadForKey(
         /*source_registered=*/true, staging, staging_cap, promoted);
   }
 
-  return PreparedRead::Storage(std::move(lease), staging, staging_cap, this,
-                               flight, &FinishDiskRead);
+  return PreparedRead::Storage(
+      std::move(lease), staging, staging_cap, this, flight,
+      recent_reads_ && !promote ? &FinishUnpromotedDiskRead : &FinishDiskRead);
+}
+
+namespace {
+uint64_t SteadyMs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+}  // namespace
+
+bool KvNodeServer::PromoteRead(const BlockKey& key, bool note) {
+  if (!recent_reads_) return true;
+  const bool again = recent_reads_->ReadAgain(key, SteadyMs(), note);
+  if (note && !again) promote_deferred_.fetch_add(1, std::memory_order_relaxed);
+  return again;
+}
+
+void KvNodeServer::NoteRead(const BlockKey& key, bool promoted) {
+  recent_reads_->ReadAgain(key, SteadyMs());
+  if (!promoted) promote_deferred_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void KvNodeServer::FinishDiskRead(
@@ -2046,35 +2112,50 @@ void KvNodeServer::FinishDiskRead(
     size_t bytes_read, double elapsed_sec, const char* data) noexcept {
   KvNodeServer* server = static_cast<KvNodeServer*>(owner);
   if (server == nullptr) return;
+  server->FinishStagedDiskRead(flight, committed, result, bytes_read,
+                               elapsed_sec, data, /*promote=*/true);
+}
+
+void KvNodeServer::FinishUnpromotedDiskRead(
+    void* owner, uint64_t flight, bool committed, Status result,
+    size_t bytes_read, double elapsed_sec, const char* data) noexcept {
+  KvNodeServer* server = static_cast<KvNodeServer*>(owner);
+  if (server == nullptr) return;
+  server->FinishStagedDiskRead(flight, committed, result, bytes_read,
+                               elapsed_sec, data, /*promote=*/false);
+}
+
+void KvNodeServer::FinishStagedDiskRead(uint64_t flight, bool committed,
+                                        Status result, size_t bytes_read,
+                                        double elapsed_sec, const char* data,
+                                        bool promote) noexcept {
   if (!committed) {
     if (flight)
-      server->read_coalescer_.CompleteAsync(flight, Status::kIOError, nullptr,
-                                            0);
+      read_coalescer_.CompleteAsync(flight, Status::kIOError, nullptr, 0);
     return;
   }
   const bool ok = result == Status::kOk;
   if (ok) {
-    server->cache_hit_.fetch_add(1, std::memory_order_relaxed);
-    server->bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
+    cache_hit_.fetch_add(1, std::memory_order_relaxed);
+    bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
   } else if (result == Status::kNotFound) {  // failed its check: a miss
-    server->cache_miss_.fetch_add(1, std::memory_order_relaxed);
+    cache_miss_.fetch_add(1, std::memory_order_relaxed);
   } else {
-    server->get_io_err_.fetch_add(1, std::memory_order_relaxed);
+    get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
   if (flight) {
     BlockKey key;
     bool whole = false;
     bool recurrent = false;
     uint64_t generation = 0;
-    (void)server->read_coalescer_.CompleteAsync(
+    (void)read_coalescer_.CompleteAsync(
         flight, ok ? Status::kOk : Status::kIOError, data, bytes_read, &key,
         &whole, &recurrent, &generation);
-    if (ok && whole && server->ram_ && data && bytes_read) {
-      server->ram_->PutDurable(key, data, bytes_read, generation);
+    if (promote && ok && whole && ram_ && data && bytes_read) {
+      ram_->PutDurable(key, data, bytes_read, generation);
     }
   }
-  if (server->lat_sampler_.ShouldSample())
-    server->get_lat_.Observe(elapsed_sec);
+  if (lat_sampler_.ShouldSample()) get_lat_.Observe(elapsed_sec);
 }
 
 void KvNodeServer::FinishPromotedDiskRead(

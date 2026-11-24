@@ -22,6 +22,7 @@
 #include "cache/disk_cache_group.h"
 #include "cache/ram_tier.h"
 #include "cache/read_coalescer.h"
+#include "cache/recent_reads.h"
 #include "utils/accept_guard.h"
 #include "utils/env_parse.h"
 #include "utils/latency_hist.h"
@@ -225,6 +226,13 @@ class KvNodeServer {
   static void FinishDiskRead(void* owner, uint64_t flight, bool committed,
                              Status result, size_t bytes_read,
                              double elapsed_sec, const char* data) noexcept;
+  // A staged read under DFKV_RAM_PROMOTE=second that is not to be promoted.
+  static void FinishUnpromotedDiskRead(
+      void* owner, uint64_t flight, bool committed, Status result,
+      size_t bytes_read, double elapsed_sec, const char* data) noexcept;
+  void FinishStagedDiskRead(uint64_t flight, bool committed, Status result,
+                            size_t bytes_read, double elapsed_sec,
+                            const char* data, bool promote) noexcept;
   struct PromotedRead {
     KvNodeServer* server = nullptr;
     RamTier::DurableReservation reservation;
@@ -252,6 +260,10 @@ class KvNodeServer {
     bool enabled = false;
     bool write_back = true;
     bool ack_enabled = false;
+    // DFKV_RAM_PROMOTE=second: a whole cold read is promoted only when the
+    // key was read within promote_window_ms before.
+    bool promote_second = false;
+    uint64_t promote_window_ms = 30000;
     RamTier::Options options;
   };
   static RamTierPlan PlanRamTier(size_t disk_count);
@@ -336,6 +348,16 @@ class KvNodeServer {
   int ApplyPendingRetain(const BlockKey& key, bool flushed);
   // The generation of the disk's value for a key (ValueMetadata), 0 if none.
   uint64_t DiskGeneration(const BlockKey& key) const;
+  // Whether a whole-value cold read of `key` may be promoted into RAM. With
+  // DFKV_RAM_PROMOTE=first (recent_reads_ null) always, without side
+  // effects; with second only on a repeat read within the window. Asked
+  // only for a read that would otherwise be promoted; `note` records the
+  // read (once per read: false when it may still be given up and redone).
+  bool PromoteRead(const BlockKey& key, bool note = true);
+  void NoteRead(const BlockKey& key, bool promoted);
+  static constexpr size_t kRecentReadsMax = 1u << 18;
+  std::unique_ptr<RecentReads> recent_reads_;
+  std::atomic<size_t> promote_deferred_{0};
   std::atomic<size_t> remove_ok_{0}, remove_miss_{0};
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
   // Read-side convoy collapse (env DFKV_READ_COALESCE=1; see read_coalescer.h).

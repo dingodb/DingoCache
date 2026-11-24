@@ -20,6 +20,8 @@ class KvNodeServerWiringTestPeer {
     uint32_t flush_threads;
     uint64_t bytes;
     uint64_t large_reserve_bytes;
+    bool promote_second;
+    uint64_t promote_window_ms;
   };
   static size_t FlushLanes(size_t disk_count) {
     return KvNodeServer::PlanRamTier(disk_count).options.flush_lanes;
@@ -28,7 +30,8 @@ class KvNodeServerWiringTestPeer {
     const auto plan = KvNodeServer::PlanRamTier(/*disk_count=*/1);
     return {plan.enabled, plan.options.ack_high_watermark_pct,
             plan.options.reclaim_interval_ms, plan.options.flush_threads,
-            plan.options.bytes, plan.options.large_reserve_bytes};
+            plan.options.bytes, plan.options.large_reserve_bytes,
+            plan.promote_second, plan.promote_window_ms};
   }
 };
 }  // namespace dfkv
@@ -54,7 +57,8 @@ class RamTierEnv : public ::testing::Test {
     for (const char* name :
          {"DFKV_RAM_TIER", "DFKV_RAM_TIER_BYTES", "DFKV_RAM_FLUSH_THREADS",
           "DFKV_RAM_RECLAIM_MS", "DFKV_RAM_ACK_HIGH_WATERMARK_PCT",
-          "DFKV_RAM_WRITE_MODE", "DFKV_PUT_ACK_MODE"})
+          "DFKV_RAM_WRITE_MODE", "DFKV_PUT_ACK_MODE", "DFKV_RAM_PROMOTE",
+          "DFKV_RAM_PROMOTE_WINDOW_MS"})
       ::unsetenv(name);
   }
   Peer::Plan defaults_{};
@@ -232,4 +236,40 @@ TEST_F(RamTierEnv, FlushLanesAreTheConfiguredDisks) {
 // asked: with the default --max-msg no value can use it.
 TEST_F(RamTierEnv, NoDedicatedBudgetByDefault) {
   EXPECT_EQ(defaults_.large_reserve_bytes, 0u);
+}
+
+// DFKV_RAM_PROMOTE: first (every whole cold read, as before) unless the
+// value is exactly "second"; the window is read only for second.
+TEST_F(RamTierEnv, PromoteIsFirstUnlessSecondIsAskedFor) {
+  EXPECT_FALSE(defaults_.promote_second);
+  EXPECT_EQ(defaults_.promote_window_ms, 30000u);
+  Seen seen = With("DFKV_RAM_PROMOTE", "second");
+  EXPECT_TRUE(seen.plan.promote_second);
+  EXPECT_EQ(seen.plan.promote_window_ms, 30000u);
+  EXPECT_EQ(seen.log.find("DFKV_RAM_PROMOTE"), std::string::npos) << seen.log;
+  seen = With("DFKV_RAM_PROMOTE", "first");
+  EXPECT_FALSE(seen.plan.promote_second);
+  EXPECT_EQ(seen.log.find("DFKV_RAM_PROMOTE"), std::string::npos) << seen.log;
+  for (const char* bad : {"Second", "2", "twice", " second"}) {
+    seen = With("DFKV_RAM_PROMOTE", bad);
+    EXPECT_FALSE(seen.plan.promote_second) << bad;
+    EXPECT_TRUE(Warned(seen, "DFKV_RAM_PROMOTE", bad)) << seen.log;
+  }
+}
+
+TEST_F(RamTierEnv, PromoteWindowKeepsItsDefaultForWhatIsNotAWindow) {
+  ::setenv("DFKV_RAM_PROMOTE", "second", 1);
+  Seen seen = With("DFKV_RAM_PROMOTE_WINDOW_MS", "5000");
+  EXPECT_EQ(seen.plan.promote_window_ms, 5000u);
+  EXPECT_EQ(seen.log.find("DFKV_RAM_PROMOTE_WINDOW_MS"), std::string::npos)
+      << seen.log;
+  seen = With("DFKV_RAM_PROMOTE_WINDOW_MS", "");  // empty counts as unset
+  EXPECT_EQ(seen.plan.promote_window_ms, 30000u);
+  for (const char* bad : {"0", "abc", "-1", "5s"}) {
+    seen = With("DFKV_RAM_PROMOTE_WINDOW_MS", bad);
+    EXPECT_EQ(seen.plan.promote_window_ms, 30000u) << "'" << bad << "'";
+    EXPECT_NE(seen.log.find("DFKV_RAM_PROMOTE_WINDOW_MS"), std::string::npos)
+        << "'" << bad << "' " << seen.log;
+  }
+  ::unsetenv("DFKV_RAM_PROMOTE");
 }

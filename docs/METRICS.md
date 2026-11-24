@@ -326,6 +326,8 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_ack_backpressure_total` | counter | 正的 RAM-ACK dirty 水位触发的新 key 接纳拒绝；水位为 0 时计数强制等待落盘的请求。已有 key 先解析 owner，不因水位切换覆盖首写者 |
 | `dfkv_ram_promoted_total` | counter | 整值冷读晋升：优先让 O_DIRECT 直接读入隐藏 arena reservation，成功后以 born-durable 身份发布；staged fallback 则读后复制晋升。不进 flushq、零重复刷盘、随时可驱逐；健康冷→热运行中首次读增长，随后应转为 `dfkv_ram_hit_total` 增长且磁盘字节不再增加 |
 | `dfkv_ram_promote_declined_total` | counter | RAM 没有接收的晋升（没有空间，或这类值不进 RAM） |
+| `dfkv_ram_promote_deferred_total` | counter | 仅 `DFKV_RAM_PROMOTE=second` 时输出：因为这个 key 在 `DFKV_RAM_PROMOTE_WINDOW_MS` 内没被读过而没有装进 RAM 的整值冷读。与 `dfkv_ram_promoted_total` 之比高 = 读的多半是只读一次的数据（扫描）；热数据的命中率却不涨，说明窗口比复用间隔短 |
+| `dfkv_ram_recent_reads` | gauge | 仅 `DFKV_RAM_PROMOTE=second` 时输出：当前记着"窗口内读过"的 key 数（上限 262144） |
 | `dfkv_ram_reservations_aborted_total` | counter | 晋升 reservation 没有装成副本就结束（读失败，或被 REMOVE、磁盘上的新值抢先） |
 | `dfkv_ram_evicted_unread_total` | counter | 因空间被淘汰、进 RAM 后从未被读过的值（读 = 从 RAM 送出过数据：TCP 读、RDMA 读和 RDMA pull 都算，EXIST 不算）；与 `dfkv_ram_evictions_total` 之比高说明 RAM 里放的多半没人读 |
 | `dfkv_ram_evicted_age_ms_total` | counter | 被淘汰的值在 RAM 里驻留时长之和（毫秒），除以 `dfkv_ram_evictions_total` 得平均驻留时长 |
