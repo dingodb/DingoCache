@@ -1253,6 +1253,42 @@ RETAIN 保护两份（排空节点那份还在服务读），哪边有 key 就�
 - 指标：`dfkv_remove_memory_entries`、`dfkv_remove_memory_covered_seconds`、
   `dfkv_remove_memory_dropped_total`、`dfkv_removed_within_queries_total{result}`（只在打开时输出）。
 
+### 4c-5. 回读前任 owner（read-back，`DFKV_RING_READBACK_MS`，客户端，默认 0=关）<a name="4c-readback"></a>
+
+客户端开关，只对 MDS 动态发现生效。设计见 [ring-unavailable-owner.md](design/ring-unavailable-owner.md) §3.4。
+要求节点打开近期删除记忆（4c-4），且 `DFKV_REMOVE_MEMORY_MS` 至少为本窗口加十个最长的轮询间隔。
+
+- **作用：** 环的写入成员变了（成员加入或离开、开始或结束排空/缺席，或者一次冷却改道结束）之后的
+  窗口内，一个 key 的现 owner 回答“不存在”时，客户端先问这个 key 的一组节点“最近在你这里删过吗”，
+  全都回答“没删过”才去它的前任 owner 读一次。新 owner 是空的（换了新节点、带空盘回来）时，
+  前任 owner 上的值还能用上。
+- **问谁：** 本客户端近期每个环和窗口里保留的旧环上，这个 key 的前 `DFKV_RING_REMOVE_FANOUT` 个后继，
+  加排空节点和缺席成员，**不问现 owner**（它刚回答“不存在”；刚启动的它也什么都记不住）。任何一个
+  回答“删过”或“不知道”（没有记忆、记忆不够长、问不到、整个请求失败）都不回读。
+- **前提：** `DFKV_RING_REMOVE_FANOUT` 至少 3，否则不启用并打 WARNING；登记门打开（与 4c-3 相同：
+  group 里每个登记的客户端都要打开 4c-3 或本开关）；窗口之内只有一次变化（第二次变化把窗口关掉）；
+  保护视图（#497）把这次变化压了超过九个轮询间隔的，这次变化没有窗口。
+- **与冷却改道（4c-3）一起用：** 打开本开关的客户端在登记信息里多带 `readback=1`。登记的客户端
+  **全部**带 `readback=1` 时，一次冷却结束后写到替补上的 key 留到窗口结束才清理（这期间只经回读读到，
+  前任 owner 带空盘回来时还能用上）；有一个不带，就像 4c-3 一样在冷却结束时立刻清理。这个条件每个 tick
+  和每次登记应答都重新检查：一旦有客户端不带 `readback=1`（新登记的或去掉了的）、应答过期或登记门关上，
+  所有等待中的 key 立刻清理，不再等待。新登记的不带 `readback=1` 的客户端最多一个轮询加列表缓存 TTL（≤ 1 s）
+  加一个 tick 后才被看到；本版本只开 4c-3 不开本开关的客户端在看到任何 `readback=1` 时，读替补上不是自己
+  这次冷却写的 key 一律按未命中处理，所以这段时间里只有更老的版本可能读到它们。打开本开关的
+  客户端读替补上不是自己这次冷却写的 key 时（GET、EXIST，以及 RETAIN 的 REFRESH 和 SET，它们的回答也报告
+  key 在不在），也先问记忆（同回读），全都“没删过”才读。
+  `dfkv_close` 立刻清理等待中的 key；进程被杀则留到替补淘汰它们（其他客户端读它们仍先问记忆）。
+- **`DFKV_RING_REROUTE_KEYS` 的大小：** 等待窗口的 key 也算在这个上限里。打开本开关后，它要容纳
+  约“改道写入速率 ×（一次冷却 + 本窗口）”个 key；满了以后改道写入被拒（调用方得到未命中，
+  计入 `dfkv_client_reroute_refused_total`），不会出错，只是少存。例如每秒改道写 500 个 key、冷却 30 s、
+  窗口 60 s，需要约 45000（默认 65536 够用）。
+- **代价：** 每个回读候选一次批量记忆查询（通常 3 个节点）加一次读；现 owner 命中的读没有任何额外开销。
+  窗口最长 `600000 − 10 × 轮询间隔` ms（更大的值按此处理并打 WARNING）。
+- 指标：`dfkv_client_readback_reads_total{result}`（hit、miss、refused_removed、refused_unknown、
+  refused_length、refused_gate、refused_cooling）、`dfkv_client_readback_changes_refused_total{reason}`
+  （held、chained）、`dfkv_client_readback_window_active`、`dfkv_client_readback_memory_short_total`
+  （节点的记忆长期短于需要的时长，每个节点一条 WARNING）。
+
 ### 4d. 成员漂移 / split-brain 巡检
 
 `deploy/dfkv_membership_audit.py` 分别查询每个 MDS（不是把 endpoints 当故障转移

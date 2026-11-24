@@ -300,6 +300,19 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
     reroute_close_ms_ = static_cast<uint64_t>(clamp(
         "DFKV_RING_REROUTE_CLOSE_MS",
         EnvNonnegativeInt("DFKV_RING_REROUTE_CLOSE_MS", 2000), 0, 60000));
+    // Previous-owner read-back (B). It needs the fan-out of at least three
+    // successors (§3.4: safe for c <= F - 2 view changes).
+    readback_ms_ = static_cast<uint64_t>(clamp(
+        "DFKV_RING_READBACK_MS",
+        EnvNonnegativeInt("DFKV_RING_READBACK_MS", 0), 0, 600000));
+    readback_on_ = readback_ms_ > 0;
+    if (readback_on_ && fanout_ < 3) {
+      DFKV_LOG_WARN("DFKV_RING_READBACK_MS: read-back needs "
+                    "DFKV_RING_REMOVE_FANOUT >= 3 (it is " +
+                    std::to_string(fanout_) + "); read-back stays off");
+      readback_on_ = false;
+    }
+    fanout_on_ = reroute_on_ || readback_on_;
     if (fanout_on_) {
       recent_keep_ms_.store(33000, std::memory_order_relaxed);  // 11 polls of 3 s
       // The ring adopted above, before the switch was read, is the first
@@ -469,6 +482,15 @@ void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr,
         (void)member;
         absent_ids += (absent_ids.empty() ? "" : ",") + id;
       }
+    }
+    if (readback_on_) {
+      bool changed = ring_.Nodes().size() != ring.Nodes().size();
+      if (!changed) {
+        std::map<std::string, int> a(ring_.Nodes().begin(), ring_.Nodes().end());
+        std::map<std::string, int> b(ring.Nodes().begin(), ring.Nodes().end());
+        changed = a != b;
+      }
+      if (changed) NoteWriteRingChangeLocked(ring_, addr_, NowMs());
     }
     ring_ = std::move(ring);
     addr_ = std::move(addr);
@@ -1031,10 +1053,56 @@ void KVClient::NoteSeenView(const std::vector<MemberInfo>& placement) {
     addr[m.id] = m.ip + ":" + std::to_string(m.port);
   }
   std::lock_guard<std::mutex> lk(ring_mu_);
-  NoteRecentLocked(weight, addr, false, NowMs());
+  const uint64_t now = NowMs();
+  if (readback_on_ && first_diverge_ms_ == 0 && !weight.empty()) {
+    std::map<std::string, int> adopted(ring_.Nodes().begin(),
+                                       ring_.Nodes().end());
+    if (adopted != weight) first_diverge_ms_ = now;
+  }
+  NoteRecentLocked(weight, addr, false, now);
 }
 
 std::string KVClient::RouteFor(const std::string& key, RouteOp op) {
+  std::string check_owner;
+  uint64_t set_episode = 0;
+  std::vector<std::string> sub{
+      RouteForUnchecked(key, op, &check_owner, &set_episode)};
+  if (check_owner.empty()) return sub[0];
+  CheckSubstituteReads({key}, {check_owner}, &sub);
+  // A SET on another episode's copy is tracked only once its check passed:
+  // a refused one is not sent, and must not make the copy this client's own.
+  if (set_episode != 0 && !sub[0].empty() &&
+      !TrackReroute(check_owner, set_episode, key, sub[0])) {
+    reroute_refused_.fetch_add(1, std::memory_order_relaxed);
+    return "";
+  }
+  return sub[0];
+}
+
+std::vector<std::string> KVClient::RouteReads(
+    size_t n, const std::function<const std::string&(size_t)>& key_of,
+    RouteOp op) {
+  std::vector<std::string> routes(n);
+  std::vector<size_t> at;
+  std::vector<std::string> keys, owners, subs;
+  for (size_t j = 0; j < n; ++j) {
+    std::string check_owner;
+    routes[j] = RouteForUnchecked(key_of(j), op, &check_owner, nullptr);
+    if (check_owner.empty()) continue;
+    at.push_back(j);
+    keys.push_back(key_of(j));
+    owners.push_back(std::move(check_owner));
+    subs.push_back(routes[j]);
+  }
+  if (at.empty()) return routes;
+  CheckSubstituteReads(keys, owners, &subs);
+  for (size_t k = 0; k < at.size(); ++k) routes[at[k]] = std::move(subs[k]);
+  return routes;
+}
+
+std::string KVClient::RouteForUnchecked(const std::string& key, RouteOp op,
+                                        std::string* check_owner,
+                                        uint64_t* set_episode) {
   if (!reroute_on_ || t_drain_pass || t_route_to != nullptr) return Route(key);
   const uint32_t hash = ConHash::KeyHash(key);
   std::string owner;
@@ -1060,7 +1128,35 @@ std::string KVClient::RouteFor(const std::string& key, RouteOp op) {
     reroutes_[kRrNone].fetch_add(1, std::memory_order_relaxed);
     return owner;  // as today: the cooling owner is skipped
   }
+  // Revision 11: a copy this client did not write in the owner's current
+  // episode may be another client's deferred one. Every op that reports on
+  // the copy (GET, EXIST, and RETAIN, whose answer is an existence check)
+  // is then a read-back with B; with C alone, while some client may defer,
+  // a miss.
+  const bool checks =
+      op != RouteOp::kPut &&
+      (readback_on_ || registry_readback_any_.load(std::memory_order_acquire));
+  auto own_copy = [&] {  // reroute_mu_ held
+    const auto o = reroute_keys_.find(owner);
+    if (o == reroute_keys_.end()) return false;
+    const auto ep = o->second.find(episode);
+    return ep != o->second.end() && ep->second.count({key, sub}) != 0;
+  };
+  bool own = true;
   if (op == RouteOp::kPut || op == RouteOp::kRetainSet) {
+    if (checks) {
+      std::lock_guard<std::mutex> lk(reroute_mu_);
+      own = own_copy();  // before this SET tracks it
+    }
+    if (!own && check_owner != nullptr) {
+      // Another episode's copy: not tracked here. C alone refuses it; with
+      // B, RouteFor tracks it once its check passed.
+      if (!readback_on_) return "";
+      *check_owner = owner;
+      if (set_episode != nullptr) *set_episode = episode;
+      reroutes_[kRrRetain].fetch_add(1, std::memory_order_relaxed);
+      return sub;
+    }
     if (!TrackReroute(owner, episode, key, sub)) {
       reroute_refused_.fetch_add(1, std::memory_order_relaxed);
       return "";  // never written to a substitute untracked
@@ -1072,6 +1168,11 @@ std::string KVClient::RouteFor(const std::string& key, RouteOp op) {
     const auto pending = episode_cleanup_.find(sub);
     if (pending != episode_cleanup_.end() && pending->second.count(key) != 0)
       return "";
+    if (checks) own = own_copy();
+  }
+  if (!own && check_owner != nullptr) {  // not RetainPrecheck
+    if (!readback_on_) return "";
+    *check_owner = owner;
   }
   const RerouteOpIndex index =
       op == RouteOp::kGet     ? kRrGet
@@ -1229,6 +1330,10 @@ size_t KVClient::RunCleanup(bool all, uint64_t deadline_ms) {
   std::map<std::string, std::set<std::string>> episode_work, fanout_work;
   {
     std::lock_guard<std::mutex> lk(reroute_mu_);
+    // Ended episodes' cleanups wait for B's window only while every
+    // registered client checks substitute reads (revision 11); otherwise
+    // they go now. Read under reroute_mu_, which OnRegistry's clearing takes.
+    const bool defer = !all && DeferralHolds();
     // Episodes that ended: any but the owner's running cooldown, all of
     // them once it does not cool or the gate closed.
     for (auto owner = reroute_keys_.begin(); owner != reroute_keys_.end();) {
@@ -1241,14 +1346,29 @@ size_t KVClient::RunCleanup(bool all, uint64_t deadline_ms) {
         }
         for (const auto& [key, sub] : ep->second) {
           if (episode_cleanup_[sub].insert(key).second) ++episode_pending_;
+          // With read-back on, the episode is a change with a window: its
+          // keys stay on the substitute, readable through B only, until the
+          // window has passed (design §3.4, revision 11).
+          if (defer) episode_readback_[key] = {sub, now + readback_ms_};
         }
         reroute_tracked_ -= ep->second.size();
         ep = owner->second.erase(ep);
       }
       owner = owner->second.empty() ? reroute_keys_.erase(owner) : ++owner;
     }
-    for (const auto& [node, keys] : episode_cleanup_)
-      if (all || !health_.Cooling(node, now)) episode_work[node] = keys;
+    for (auto it = episode_readback_.begin(); it != episode_readback_.end();)
+      it = !defer || now >= it->second.second ? episode_readback_.erase(it)
+                                              : ++it;
+    for (const auto& [node, keys] : episode_cleanup_) {
+      if (!all && health_.Cooling(node, now)) continue;
+      for (const auto& key : keys) {
+        const auto deferred = episode_readback_.find(key);
+        if (deferred != episode_readback_.end() &&
+            deferred->second.first == node)
+          continue;  // its read-back window is still open
+        episode_work[node].insert(key);
+      }
+    }
     for (auto it = fanout_cleanup_.begin(); it != fanout_cleanup_.end();) {
       if (!all && health_.Cooling(it->first, now)) {
         ++it;
@@ -1305,11 +1425,13 @@ size_t KVClient::RunCleanup(bool all, uint64_t deadline_ms) {
 void KVClient::OnRegistry(bool ok, const std::vector<MemberInfo>& clients) {
   if (!fanout_on_) return;
   const uint64_t now = NowMs();
+  {
   std::lock_guard<std::mutex> lk(gate_mu_);
   if (ok) {
     registry_seen_ = true;
     registry_ok_ms_ = now;
     size_t unmarked = 0;
+    bool readback_all = true, readback_any = false;
     uint64_t poll_max = static_cast<uint64_t>(own_poll_ms_);
     static const std::string kMarker = "dfkv-remove-fanout=1;poll_ms=";
     for (const auto& c : clients) {
@@ -1325,12 +1447,35 @@ void KVClient::OnRegistry(bool ok, const std::vector<MemberInfo>& clients) {
         ++unmarked;
       else
         poll_max = std::max(poll_max, poll);
+      // B configured there: it checks every substitute read it did not
+      // write in its own current episode (revision 11).
+      const size_t end = at == std::string::npos ? at : c.info.find(',', at);
+      const bool b =
+          at != std::string::npos &&
+          c.info.substr(at, end == std::string::npos ? end : end - at)
+                  .find(";readback=1") != std::string::npos;
+      readback_all = readback_all && b;
+      readback_any = readback_any || b;
     }
+    registry_readback_all_.store(readback_all, std::memory_order_release);
+    registry_readback_any_.store(readback_any, std::memory_order_release);
     unmarked_clients_ = unmarked;
     unmarked_gauge_.store(unmarked, std::memory_order_relaxed);
     poll_max_ms_ = poll_max;
   }
   EvaluateGateLocked(now);
+  }
+  // Revision 11 (a), re-checked at every answer: once it fails, every
+  // deferred key is due (the tick sends it) and is never deferred again.
+  if (readback_on_ && !DeferralHolds()) {
+    std::lock_guard<std::mutex> lk(reroute_mu_);
+    episode_readback_.clear();
+  }
+}
+
+bool KVClient::DeferralHolds() const {
+  return readback_on_ && gate_open_.load(std::memory_order_acquire) &&
+         registry_readback_all_.load(std::memory_order_acquire);
 }
 
 void KVClient::EvaluateGateLocked(uint64_t now) {
@@ -1358,8 +1503,9 @@ void KVClient::EvaluateGateLocked(uint64_t now) {
   }
   recent_keep_ms_.store(std::max(s_ms_, s_next_ms_),
                         std::memory_order_relaxed);
+  poll_max_now_ms_.store(std::max(poll_max_ms_, own), std::memory_order_relaxed);
   int reason = -1;
-  if (!reroute_on_ || own == 0 || !registered_ ||
+  if (!fanout_on_ || own == 0 || !registered_ ||
       !registry_seen_ || own < 1000)
     reason = kGateNoRegistry;
   else if (now - registry_ok_ms_ > 2 * own)
@@ -1424,6 +1570,189 @@ void KVClient::CloseReroute() {
   if (left != 0)
     DFKV_LOG_WARN("ring: close left " + std::to_string(left) +
                   " key(s) on substitutes it could not REMOVE");
+}
+
+// ---- Previous-owner read-back (CLI-02 stage B) ----
+
+void KVClient::NoteWriteRingChangeLocked(
+    const ConHash& before, const std::map<std::string, std::string>& before_addr,
+    uint64_t now) {
+  const uint64_t diverged = first_diverge_ms_;
+  first_diverge_ms_ = 0;
+  if (before.Nodes().empty()) return;  // the first view: nothing was before
+  if (now < held_until_ms_) {
+    // A second change inside the window: the previous ring is cleared, not
+    // chained (§3.4), and this change gets no window either.
+    held_until_ms_ = 0;
+    held_ring_ = ConHash();
+    held_addr_.clear();
+    readback_changes_chained_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  const uint64_t poll =
+      std::max<uint64_t>(poll_max_now_ms_.load(std::memory_order_relaxed),
+                         static_cast<uint64_t>(own_poll_ms_));
+  const uint64_t settle = 10 * poll;
+  if (diverged != 0 && now > diverged && now - diverged > settle - poll) {
+    // Held longer than settle - poll_max: a remover on the newer ring may
+    // have acted before H reaches (§3.4).
+    readback_changes_held_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  held_ring_ = before;
+  held_addr_ = before_addr;
+  held_until_ms_ = now + readback_ms_;
+}
+
+void KVClient::AddAskSetLocked(uint32_t hash, uint64_t now,
+                               std::set<std::string>* ask) const {
+  auto walk = [&](const ConHash& ring,
+                  const std::map<std::string, std::string>& addr) {
+    size_t n = 0;
+    ring.Walk(hash, [&](const std::string& id) {
+      const auto a = addr.find(id);
+      if (a != addr.end()) ask->insert(a->second);
+      return ++n < fanout_;
+    });
+  };
+  for (const RecentRing& r : recent_) walk(r.ring, r.addr);
+  if (now < held_until_ms_) walk(held_ring_, held_addr_);
+}
+
+std::map<std::string, std::vector<size_t>> KVClient::PlanReadBack(
+    const std::vector<std::string>& keys) {
+  std::map<std::string, std::vector<size_t>> plan;
+  if (!readback_on_ || keys.empty()) return plan;
+  const uint64_t now = NowMs();
+  std::vector<RbCand> cands;
+  {
+    std::lock_guard<std::mutex> lk(ring_mu_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const uint32_t hash = ConHash::KeyHash(keys[i]);
+      std::string o, p;
+      if (!ring_.LookupHash(hash, &o)) continue;
+      const auto oa = addr_.find(o);
+      if (oa == addr_.end()) continue;
+      std::string prev;
+      if (now < held_until_ms_ && held_ring_.LookupHash(hash, &p)) {
+        const auto pa = held_addr_.find(p);
+        if (pa != held_addr_.end()) prev = pa->second;
+      }
+      if (prev.empty() || prev == oa->second) {
+        // A cooldown-reroute episode of O that ended within the window: the
+        // substitute is the previous owner of the keys written there.
+        std::lock_guard<std::mutex> rk(reroute_mu_);
+        const auto ep = episode_readback_.find(keys[i]);
+        if (ep != episode_readback_.end() && now < ep->second.second)
+          prev = ep->second.first;
+      }
+      if (prev.empty() || prev == oa->second)
+        continue;  // the owner did not change
+      RbCand c{i, oa->second, prev, {}, -1};
+      c.ask.insert(prev);
+      AddAskSetLocked(hash, now, &c.ask);
+      cands.push_back(std::move(c));
+    }
+  }
+  if (cands.empty()) return plan;
+  const bool gate = gate_open_.load(std::memory_order_acquire);
+  for (RbCand& cand : cands) {
+    // A not found from a substitute (the owner cools here) is not the
+    // owner's answer: not a candidate.
+    if (gate && health_.Cooling(cand.owner, now))
+      cand.refusal = kRbRefusals;  // dropped silently
+    else if (!gate)
+      cand.refusal = kRbGate;
+    else if (health_.Cooling(cand.prev, now))
+      cand.refusal = kRbCooling;
+  }
+  AskRemoved(keys, now, &cands);
+  for (const RbCand& cand : cands)
+    if (cand.refusal < 0) plan[cand.prev].push_back(cand.i);
+  return plan;
+}
+
+void KVClient::AskRemoved(const std::vector<std::string>& keys, uint64_t now,
+                          std::vector<RbCand>* cands_in) {
+  std::vector<RbCand>& cands = *cands_in;
+  const bool length = length_mismatch_seen_.load(std::memory_order_relaxed);
+  std::map<std::string, std::vector<size_t>> by_node;  // -> cands
+  for (size_t c = 0; c < cands.size(); ++c) {
+    RbCand& cand = cands[c];
+    if (cand.refusal >= 0) continue;
+    if (length) { cand.refusal = kRbLength; continue; }
+    const std::string& key = keys[cand.i];
+    const std::string drainer = DrainRoute(key);
+    if (!drainer.empty()) cand.ask.insert(drainer);
+    std::string absent_id;
+    const std::string absent = AbsentRoute(key, &absent_id);
+    if (!absent.empty()) cand.ask.insert(absent);
+    cand.ask.erase(cand.owner);  // O answered not found or cools (§3.4)
+    for (const auto& node : cand.ask) by_node[node].push_back(c);
+  }
+  const uint64_t poll =
+      std::max<uint64_t>(poll_max_now_ms_.load(std::memory_order_relaxed),
+                         static_cast<uint64_t>(own_poll_ms_));
+  const uint64_t h64 = readback_ms_ + 10 * poll;
+  const uint32_t h = static_cast<uint32_t>(std::min<uint64_t>(h64, UINT32_MAX));
+  for (const auto& [node, list] : by_node) {
+    std::vector<std::string> ask_keys;
+    ask_keys.reserve(list.size());
+    for (size_t c : list) ask_keys.push_back(keys[cands[c].i]);
+    std::vector<uint8_t> answers;
+    uint32_t covered = 0;
+    const Status st = RemovedWithin(node, ask_keys, h, &answers, &covered);
+    if (st == Status::kOk) {
+      // A node whose M stays shorter than H past a start: counted once.
+      std::lock_guard<std::mutex> lk(memory_short_mu_);
+      auto& [since, reported] = memory_short_[node];
+      if (covered >= h) {
+        since = 0;
+      } else if (since == 0) {
+        since = now;
+      } else if (!reported && now - since > h) {
+        reported = true;
+        readback_memory_short_.fetch_add(1, std::memory_order_relaxed);
+        DFKV_LOG_WARN("read-back: " + node + " remembers REMOVEs for " +
+                      std::to_string(covered) + " ms, less than H = " +
+                      std::to_string(h) +
+                      " ms; its read-backs are refused (raise "
+                      "DFKV_REMOVE_MEMORY_MS there)");
+      }
+    }
+    for (size_t m = 0; m < list.size(); ++m) {
+      RbCand& cand = cands[list[m]];
+      if (answers[m] == 0) continue;
+      // Removed wins over unknown in the count; either refuses.
+      if (answers[m] == 1)
+        cand.refusal = kRbRemoved;
+      else if (cand.refusal != kRbRemoved)
+        cand.refusal = kRbUnknown;
+    }
+  }
+  for (const RbCand& cand : cands)
+    if (cand.refusal >= 0 && cand.refusal < kRbRefusals)
+      readback_refused_[cand.refusal].fetch_add(1, std::memory_order_relaxed);
+}
+
+void KVClient::CheckSubstituteReads(const std::vector<std::string>& keys,
+                                    const std::vector<std::string>& owners,
+                                    std::vector<std::string>* subs) {
+  const uint64_t now = NowMs();
+  std::vector<RbCand> cands;
+  cands.reserve(keys.size());
+  {
+    std::lock_guard<std::mutex> lk(ring_mu_);
+    for (size_t k = 0; k < keys.size(); ++k) {
+      RbCand c{k, owners[k], (*subs)[k], {}, -1};
+      c.ask.insert(c.prev);
+      AddAskSetLocked(ConHash::KeyHash(keys[k]), now, &c.ask);
+      cands.push_back(std::move(c));
+    }
+  }
+  AskRemoved(keys, now, &cands);
+  for (const RbCand& cand : cands)
+    if (cand.refusal >= 0) (*subs)[cand.i].clear();  // a miss
 }
 
 void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
@@ -1496,10 +1825,24 @@ void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
       s_ms_ = 11 * static_cast<uint64_t>(poll_ms > 0 ? poll_ms : 0);
       recent_keep_ms_.store(s_ms_, std::memory_order_relaxed);
     }
-    if (reroute_on_ && poll_ms < 1000)
-      DFKV_LOG_WARN("DFKV_RING_COOLDOWN_REROUTE: the member poll interval (" +
-                    std::to_string(poll_ms) +
-                    " ms) is below 1000 ms; cooldown reroute stays off");
+    if (poll_ms < 1000)
+      DFKV_LOG_WARN("DFKV_RING_COOLDOWN_REROUTE / DFKV_RING_READBACK_MS: the "
+                    "member poll interval (" + std::to_string(poll_ms) +
+                    " ms) is below 1000 ms; reroute and read-back stay off");
+    // H = window + settle must fit M's 600 s default (§3.4).
+    const uint64_t settle = 10 * static_cast<uint64_t>(poll_ms > 0 ? poll_ms : 0);
+    if (readback_on_ && readback_ms_ + settle > 600000) {
+      if (settle >= 600000) {
+        DFKV_LOG_WARN("DFKV_RING_READBACK_MS: ten poll intervals leave no "
+                      "read-back window under 600 s; read-back stays off");
+        readback_on_ = false;
+      } else {
+        DFKV_LOG_WARN("DFKV_RING_READBACK_MS=" + std::to_string(readback_ms_) +
+                      " plus ten poll intervals exceeds 600 s; using " +
+                      std::to_string(600000 - settle));
+        readback_ms_ = 600000 - settle;
+      }
+    }
     poller_->SetRegistry([this](bool ok, const std::vector<MemberInfo>& clients) {
       OnRegistry(ok, clients);
     });
@@ -1541,7 +1884,8 @@ void KVClient::StartClientRegistration(std::vector<std::string> mds_eps,
   if (fanout_on_ && own_poll_ms_ > 0)
     self.info += (self.info.empty() ? "" : ",") +
                  std::string("dfkv-remove-fanout=1;poll_ms=") +
-                 std::to_string(own_poll_ms_);
+                 std::to_string(own_poll_ms_) +
+                 (readback_on_ ? ";readback=1" : "");
   // is_client=true routes the registrar to kClientRegister/kClientHeartbeat,
   // which the MDS writes under /clients/<id> (never the placement ring). No
   // stats provider: a consumer has no ring-level stats to report.
@@ -1806,6 +2150,28 @@ std::string KVClient::MetricsSnapshot() const {
       std::lock_guard<std::mutex> lk(reroute_mu_);
       episode_pending = episode_pending_;
     }
+    s += "# HELP dfkv_client_readback_reads_total Previous-owner read-backs (DFKV_RING_READBACK_MS): hit, miss, and the candidates refused (removed or unknown in some asked node's M, a counted length mismatch, the registry gate closed, the previous owner cooling)\n";
+    s += "# TYPE dfkv_client_readback_reads_total counter\n";
+    s += "dfkv_client_readback_reads_total{result=\"hit\"} " + load(readback_hit_) + "\n";
+    s += "dfkv_client_readback_reads_total{result=\"miss\"} " + load(readback_miss_) + "\n";
+    s += "dfkv_client_readback_reads_total{result=\"refused_removed\"} " + load(readback_refused_[kRbRemoved]) + "\n";
+    s += "dfkv_client_readback_reads_total{result=\"refused_unknown\"} " + load(readback_refused_[kRbUnknown]) + "\n";
+    s += "dfkv_client_readback_reads_total{result=\"refused_length\"} " + load(readback_refused_[kRbLength]) + "\n";
+    s += "dfkv_client_readback_reads_total{result=\"refused_gate\"} " + load(readback_refused_[kRbGate]) + "\n";
+    s += "dfkv_client_readback_reads_total{result=\"refused_cooling\"} " + load(readback_refused_[kRbCooling]) + "\n";
+    s += "# HELP dfkv_client_readback_changes_refused_total Adopted write-ring changes given no read-back window: held (the guard held the change longer than settle - poll_max), chained (a second change inside an open window)\n";
+    s += "# TYPE dfkv_client_readback_changes_refused_total counter\n";
+    s += "dfkv_client_readback_changes_refused_total{reason=\"held\"} " + load(readback_changes_held_) + "\n";
+    s += "dfkv_client_readback_changes_refused_total{reason=\"chained\"} " + load(readback_changes_chained_) + "\n";
+    s += "# HELP dfkv_client_readback_memory_short_total Nodes whose recent-REMOVE memory stayed shorter than H for longer than H\n";
+    s += "# TYPE dfkv_client_readback_memory_short_total counter\n";
+    s += "dfkv_client_readback_memory_short_total{reason=\"window\"} " + load(readback_memory_short_) + "\n";
+    {
+      std::lock_guard<std::mutex> lk(ring_mu_);
+      s += "# HELP dfkv_client_readback_window_active 1 while a read-back window is open\n";
+      s += "# TYPE dfkv_client_readback_window_active gauge\n";
+      s += std::string("dfkv_client_readback_window_active ") + (NowMs() < held_until_ms_ ? "1" : "0") + "\n";
+    }
     s += "# HELP dfkv_client_ring_reroute_episode_pending Keys of ended reroute episodes whose REMOVE at the substitute is not confirmed yet; they count toward DFKV_RING_REROUTE_KEYS with the tracked keys\n";
     s += "# TYPE dfkv_client_ring_reroute_episode_pending gauge\n";
     s += "dfkv_client_ring_reroute_episode_pending " + std::to_string(episode_pending) + "\n";
@@ -2010,16 +2376,41 @@ void KVClient::CountDrainRead(bool hit) {
 // owner (the key may have been written before it drained).
 bool KVClient::GetDirect(const std::string& key, void* out, size_t n,
                          ItemStatus* status) {
-  if (GetDirectRouted(key, out, n, status)) return true;
-  if (t_drain_pass || DrainRoute(key).empty()) return false;
-  ItemStatus second = ItemStatus::kNoRoute;
+  ItemStatus first = ItemStatus::kNoRoute;
+  if (GetDirectRouted(key, out, n, &first)) {
+    if (status) *status = first;
+    return true;
+  }
+  if (status) *status = first;
+  if (!t_drain_pass && !DrainRoute(key).empty()) {
+    ItemStatus second = ItemStatus::kNoRoute;
+    bool hit;
+    {
+      DrainPass pass;
+      hit = GetDirectRouted(key, out, n, &second);
+    }
+    CountDrainRead(hit);
+    if (hit) {
+      if (status) *status = second;
+      return true;
+    }
+  }
+  // Previous-owner read-back (stage B): only after the owner's not found.
+  if (!readback_on_ || first != ItemStatus::kNotFound || t_drain_pass ||
+      t_route_to != nullptr)
+    return false;
+  const auto plan = PlanReadBack({key});
+  if (plan.empty()) return false;
+  ItemStatus back = ItemStatus::kNoRoute;
   bool hit;
   {
-    DrainPass pass;
-    hit = GetDirectRouted(key, out, n, &second);
+    RouteTo to(plan.begin()->first);
+    hit = GetDirectRouted(key, out, n, &back);
   }
-  CountDrainRead(hit);
-  if (hit && status) *status = second;
+  CountReadBack(hit);
+  if (back == ItemStatus::kLengthMismatch)
+    length_mismatch_seen_.store(true, std::memory_order_relaxed);
+  if (hit && status) *status = back;
   return hit;
 }
 
@@ -2038,30 +2429,78 @@ bool KVClient::GetAutoDirect(const std::string& key, std::string* out,
 
 bool KVClient::GetAutoDirect(const std::string& key, void* out, size_t cap,
                              size_t* out_len, ItemStatus* status) {
-  if (GetAutoDirectRouted(key, out, cap, out_len, status)) return true;
-  if (t_drain_pass || DrainRoute(key).empty()) return false;
-  ItemStatus second = ItemStatus::kNoRoute;
+  ItemStatus first = ItemStatus::kNoRoute;
+  if (GetAutoDirectRouted(key, out, cap, out_len, &first)) {
+    if (status) *status = first;
+    return true;
+  }
+  if (status) *status = first;
+  if (!t_drain_pass && !DrainRoute(key).empty()) {
+    ItemStatus second = ItemStatus::kNoRoute;
+    bool hit;
+    {
+      DrainPass pass;
+      hit = GetAutoDirectRouted(key, out, cap, out_len, &second);
+    }
+    CountDrainRead(hit);
+    if (hit) {
+      if (status) *status = second;
+      return true;
+    }
+  }
+  if (!readback_on_ || first != ItemStatus::kNotFound || t_drain_pass ||
+      t_route_to != nullptr)
+    return false;
+  const auto plan = PlanReadBack({key});
+  if (plan.empty()) return false;
+  ItemStatus back = ItemStatus::kNoRoute;
   bool hit;
   {
-    DrainPass pass;
-    hit = GetAutoDirectRouted(key, out, cap, out_len, &second);
+    RouteTo to(plan.begin()->first);
+    hit = GetAutoDirectRouted(key, out, cap, out_len, &back);
   }
-  CountDrainRead(hit);
-  if (hit && status) *status = second;
+  CountReadBack(hit);
+  if (back == ItemStatus::kLengthMismatch)
+    length_mismatch_seen_.store(true, std::memory_order_relaxed);
+  if (hit && status) *status = back;
   return hit;
 }
 
 bool KVClient::ExistDirect(const std::string& key, Status* status) {
-  if (ExistDirectRouted(key, status)) return true;
-  if (t_drain_pass || DrainRoute(key).empty()) return false;
-  Status second = Status::kInvalid;
+  Status first = Status::kInvalid;
+  if (ExistDirectRouted(key, &first)) {
+    if (status) *status = first;
+    return true;
+  }
+  if (status) *status = first;
+  if (!t_drain_pass && !DrainRoute(key).empty()) {
+    Status second = Status::kInvalid;
+    bool hit;
+    {
+      DrainPass pass;
+      hit = ExistDirectRouted(key, &second);
+    }
+    CountDrainRead(hit);
+    if (hit) {
+      if (status) *status = second;
+      return true;
+    }
+  }
+  // The owner answered and does not hold it (EXIST reports an absent key as
+  // kOk, not present).
+  if (!readback_on_ || first != Status::kOk || t_drain_pass ||
+      t_route_to != nullptr)
+    return false;
+  const auto plan = PlanReadBack({key});
+  if (plan.empty()) return false;
+  Status back = Status::kInvalid;
   bool hit;
   {
-    DrainPass pass;
-    hit = ExistDirectRouted(key, &second);
+    RouteTo to(plan.begin()->first);
+    hit = ExistDirectRouted(key, &back);
   }
-  CountDrainRead(hit);
-  if (hit && status) *status = second;
+  CountReadBack(hit);
+  if (hit && status) *status = back;
   return hit;
 }
 
@@ -2092,29 +2531,69 @@ bool KVClient::RemoveDirect(const std::string& key) {
 std::vector<bool> KVClient::BatchGetDirect(
     const std::vector<KvGetItem>& items,
     const std::function<void(size_t)>& on_hit, ItemStatus* st) {
+  // Read-back needs each key's answer, also when the caller wants none.
+  std::vector<ItemStatus> own;
+  if (!st && readback_on_ && t_->pipelined()) {
+    own.assign(items.size(), ItemStatus::kNoRoute);
+    st = own.data();
+  }
   std::vector<bool> hit = BatchGetDirectRouted(items, on_hit, st);
-  if (!t_->pipelined()) return hit;
+  if (!t_->pipelined()) return hit;  // the scalar bodies do both passes
+  std::vector<ItemStatus> first;
+  if (st) first.assign(st, st + items.size());
   const std::vector<size_t> again = DrainerOwned(
       items.size(), &hit,
       [&](size_t i) -> const std::string& { return items[i].key; });
-  if (again.empty()) return hit;
-  std::vector<KvGetItem> sub;
-  sub.reserve(again.size());
-  for (size_t i : again) sub.push_back(items[i]);
-  std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
-  std::vector<bool> sub_hit;
-  {
-    DrainPass pass;
-    sub_hit = BatchGetDirectRouted(
-        sub, on_hit ? std::function<void(size_t)>([&](size_t m) { on_hit(again[m]); })
-                    : std::function<void(size_t)>(),
-        sub_st.data());
+  if (!again.empty()) {
+    std::vector<KvGetItem> sub;
+    sub.reserve(again.size());
+    for (size_t i : again) sub.push_back(items[i]);
+    std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
+    std::vector<bool> sub_hit;
+    {
+      DrainPass pass;
+      sub_hit = BatchGetDirectRouted(
+          sub, on_hit ? std::function<void(size_t)>([&](size_t m) { on_hit(again[m]); })
+                      : std::function<void(size_t)>(),
+          sub_st.data());
+    }
+    for (size_t m = 0; m < again.size(); ++m) {
+      CountDrainRead(sub_hit[m]);
+      if (!sub_hit[m]) continue;
+      hit[again[m]] = true;
+      if (st) st[again[m]] = sub_st[m];
+    }
   }
-  for (size_t m = 0; m < again.size(); ++m) {
-    CountDrainRead(sub_hit[m]);
-    if (!sub_hit[m]) continue;
-    hit[again[m]] = true;
-    if (st) st[again[m]] = sub_st[m];
+  if (!readback_on_ || t_drain_pass || t_route_to != nullptr || !st) return hit;
+  std::vector<size_t> missed;
+  std::vector<std::string> missed_keys;
+  for (size_t i = 0; i < items.size(); ++i)
+    if (!hit[i] && first[i] == ItemStatus::kNotFound) {
+      missed.push_back(i);
+      missed_keys.push_back(items[i].key);
+    }
+  for (const auto& [prev, pos] : PlanReadBack(missed_keys)) {
+    std::vector<KvGetItem> sub;
+    for (size_t m : pos) sub.push_back(items[missed[m]]);
+    std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
+    std::vector<bool> sub_hit;
+    {
+      RouteTo to(prev);
+      sub_hit = BatchGetDirectRouted(
+          sub,
+          on_hit ? std::function<void(size_t)>(
+                       [&](size_t k) { on_hit(missed[pos[k]]); })
+                 : std::function<void(size_t)>(),
+          sub_st.data());
+    }
+    for (size_t k = 0; k < pos.size(); ++k) {
+      CountReadBack(sub_hit[k]);
+      if (sub_st[k] == ItemStatus::kLengthMismatch)
+        length_mismatch_seen_.store(true, std::memory_order_relaxed);
+      if (!sub_hit[k]) continue;
+      hit[missed[pos[k]]] = true;
+      st[missed[pos[k]]] = sub_st[k];
+    }
   }
   return hit;
 }
@@ -2122,34 +2601,77 @@ std::vector<bool> KVClient::BatchGetDirect(
 std::vector<bool> KVClient::BatchGetAutoDirect(
     const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens,
     const std::function<void(size_t, size_t)>& on_hit, ItemStatus* st) {
+  std::vector<ItemStatus> own;
+  if (!st && readback_on_ && t_->pipelined()) {
+    own.assign(items.size(), ItemStatus::kNoRoute);
+    st = own.data();
+  }
   std::vector<bool> hit = BatchGetAutoDirectRouted(items, out_lens, on_hit, st);
-  if (!t_->pipelined()) return hit;
+  if (!t_->pipelined()) return hit;  // the scalar bodies do both passes
+  std::vector<ItemStatus> first;
+  if (st) first.assign(st, st + items.size());
   const std::vector<size_t> again = DrainerOwned(
       items.size(), &hit,
       [&](size_t i) -> const std::string& { return items[i].key; });
-  if (again.empty()) return hit;
-  std::vector<KvGetItem> sub;
-  sub.reserve(again.size());
-  for (size_t i : again) sub.push_back(items[i]);
-  std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
-  std::vector<size_t> sub_lens;
-  std::vector<bool> sub_hit;
-  {
-    DrainPass pass;
-    sub_hit = BatchGetAutoDirectRouted(
-        sub, &sub_lens,
-        on_hit ? std::function<void(size_t, size_t)>(
-                     [&](size_t m, size_t len) { on_hit(again[m], len); })
-               : std::function<void(size_t, size_t)>(),
-        sub_st.data());
+  if (!again.empty()) {
+    std::vector<KvGetItem> sub;
+    sub.reserve(again.size());
+    for (size_t i : again) sub.push_back(items[i]);
+    std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
+    std::vector<size_t> sub_lens;
+    std::vector<bool> sub_hit;
+    {
+      DrainPass pass;
+      sub_hit = BatchGetAutoDirectRouted(
+          sub, &sub_lens,
+          on_hit ? std::function<void(size_t, size_t)>(
+                       [&](size_t m, size_t len) { on_hit(again[m], len); })
+                 : std::function<void(size_t, size_t)>(),
+          sub_st.data());
+    }
+    for (size_t m = 0; m < again.size(); ++m) {
+      CountDrainRead(sub_hit[m]);
+      if (!sub_hit[m]) continue;
+      hit[again[m]] = true;
+      if (st) st[again[m]] = sub_st[m];
+      if (out_lens && again[m] < out_lens->size() && m < sub_lens.size())
+        (*out_lens)[again[m]] = sub_lens[m];
+    }
   }
-  for (size_t m = 0; m < again.size(); ++m) {
-    CountDrainRead(sub_hit[m]);
-    if (!sub_hit[m]) continue;
-    hit[again[m]] = true;
-    if (st) st[again[m]] = sub_st[m];
-    if (out_lens && again[m] < out_lens->size() && m < sub_lens.size())
-      (*out_lens)[again[m]] = sub_lens[m];
+  if (!readback_on_ || t_drain_pass || t_route_to != nullptr || !st) return hit;
+  std::vector<size_t> missed;
+  std::vector<std::string> missed_keys;
+  for (size_t i = 0; i < items.size(); ++i)
+    if (!hit[i] && first[i] == ItemStatus::kNotFound) {
+      missed.push_back(i);
+      missed_keys.push_back(items[i].key);
+    }
+  for (const auto& [prev, pos] : PlanReadBack(missed_keys)) {
+    std::vector<KvGetItem> sub;
+    for (size_t m : pos) sub.push_back(items[missed[m]]);
+    std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
+    std::vector<size_t> sub_lens;
+    std::vector<bool> sub_hit;
+    {
+      RouteTo to(prev);
+      sub_hit = BatchGetAutoDirectRouted(
+          sub, &sub_lens,
+          on_hit ? std::function<void(size_t, size_t)>(
+                       [&](size_t k, size_t len) { on_hit(missed[pos[k]], len); })
+                 : std::function<void(size_t, size_t)>(),
+          sub_st.data());
+    }
+    for (size_t k = 0; k < pos.size(); ++k) {
+      CountReadBack(sub_hit[k]);
+      if (sub_st[k] == ItemStatus::kLengthMismatch)
+        length_mismatch_seen_.store(true, std::memory_order_relaxed);
+      if (!sub_hit[k]) continue;
+      const size_t i = missed[pos[k]];
+      hit[i] = true;
+      st[i] = sub_st[k];
+      if (out_lens && i < out_lens->size() && k < sub_lens.size())
+        (*out_lens)[i] = sub_lens[k];
+    }
   }
   return hit;
 }
@@ -2158,54 +2680,123 @@ std::vector<bool> KVClient::BatchGetAutoDirect(
 std::vector<bool> KVClient::BatchGetAutoSgDirect(
     const std::vector<KvGetItemSg>& items, std::vector<size_t>* out_lens,
     ItemStatus* st) {
+  std::vector<ItemStatus> own;
+  if (!st && readback_on_) {
+    own.assign(items.size(), ItemStatus::kNoRoute);
+    st = own.data();
+  }
   std::vector<bool> hit = BatchGetAutoSgDirectRouted(items, out_lens, st);
+  std::vector<ItemStatus> first;
+  if (st) first.assign(st, st + items.size());
   const std::vector<size_t> again = DrainerOwned(
       items.size(), &hit,
       [&](size_t i) -> const std::string& { return items[i].key; });
-  if (again.empty()) return hit;
-  std::vector<KvGetItemSg> sub;
-  sub.reserve(again.size());
-  for (size_t i : again) sub.push_back(items[i]);
-  std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
-  std::vector<size_t> sub_lens;
-  std::vector<bool> sub_hit;
-  {
-    DrainPass pass;
-    sub_hit = BatchGetAutoSgDirectRouted(sub, &sub_lens, sub_st.data());
+  if (!again.empty()) {
+    std::vector<KvGetItemSg> sub;
+    sub.reserve(again.size());
+    for (size_t i : again) sub.push_back(items[i]);
+    std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
+    std::vector<size_t> sub_lens;
+    std::vector<bool> sub_hit;
+    {
+      DrainPass pass;
+      sub_hit = BatchGetAutoSgDirectRouted(sub, &sub_lens, sub_st.data());
+    }
+    for (size_t m = 0; m < again.size(); ++m) {
+      CountDrainRead(sub_hit[m]);
+      if (!sub_hit[m]) continue;
+      hit[again[m]] = true;
+      if (st) st[again[m]] = sub_st[m];
+      if (out_lens && again[m] < out_lens->size() && m < sub_lens.size())
+        (*out_lens)[again[m]] = sub_lens[m];
+    }
   }
-  for (size_t m = 0; m < again.size(); ++m) {
-    CountDrainRead(sub_hit[m]);
-    if (!sub_hit[m]) continue;
-    hit[again[m]] = true;
-    if (st) st[again[m]] = sub_st[m];
-    if (out_lens && again[m] < out_lens->size() && m < sub_lens.size())
-      (*out_lens)[again[m]] = sub_lens[m];
+  if (!readback_on_ || t_drain_pass || t_route_to != nullptr || !st) return hit;
+  std::vector<size_t> missed;
+  std::vector<std::string> missed_keys;
+  for (size_t i = 0; i < items.size(); ++i)
+    if (!hit[i] && first[i] == ItemStatus::kNotFound) {
+      missed.push_back(i);
+      missed_keys.push_back(items[i].key);
+    }
+  for (const auto& [prev, pos] : PlanReadBack(missed_keys)) {
+    std::vector<KvGetItemSg> sub;
+    for (size_t m : pos) sub.push_back(items[missed[m]]);
+    std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
+    std::vector<size_t> sub_lens;
+    std::vector<bool> sub_hit;
+    {
+      RouteTo to(prev);
+      sub_hit = BatchGetAutoSgDirectRouted(sub, &sub_lens, sub_st.data());
+    }
+    for (size_t k = 0; k < pos.size(); ++k) {
+      CountReadBack(sub_hit[k]);
+      if (sub_st[k] == ItemStatus::kLengthMismatch)
+        length_mismatch_seen_.store(true, std::memory_order_relaxed);
+      if (!sub_hit[k]) continue;
+      const size_t i = missed[pos[k]];
+      hit[i] = true;
+      st[i] = sub_st[k];
+      if (out_lens && i < out_lens->size() && k < sub_lens.size())
+        (*out_lens)[i] = sub_lens[k];
+    }
   }
   return hit;
 }
 
 std::vector<bool> KVClient::BatchExistDirect(
     const std::vector<std::string>& keys, std::vector<Status>* statuses) {
+  std::vector<Status> own;
+  if (!statuses && readback_on_ && t_->pipelined()) statuses = &own;
   std::vector<bool> hit = BatchExistDirectRouted(keys, statuses);
-  if (!t_->pipelined()) return hit;
+  if (!t_->pipelined()) return hit;  // the scalar bodies do both passes
+  std::vector<Status> first;
+  if (statuses) first = *statuses;
   const std::vector<size_t> again = DrainerOwned(
       keys.size(), &hit, [&](size_t i) -> const std::string& { return keys[i]; });
-  if (again.empty()) return hit;
-  std::vector<std::string> sub;
-  sub.reserve(again.size());
-  for (size_t i : again) sub.push_back(keys[i]);
-  std::vector<Status> sub_st;
-  std::vector<bool> sub_hit;
-  {
-    DrainPass pass;
-    sub_hit = BatchExistDirectRouted(sub, statuses ? &sub_st : nullptr);
+  if (!again.empty()) {
+    std::vector<std::string> sub;
+    sub.reserve(again.size());
+    for (size_t i : again) sub.push_back(keys[i]);
+    std::vector<Status> sub_st;
+    std::vector<bool> sub_hit;
+    {
+      DrainPass pass;
+      sub_hit = BatchExistDirectRouted(sub, statuses ? &sub_st : nullptr);
+    }
+    for (size_t m = 0; m < again.size(); ++m) {
+      CountDrainRead(sub_hit[m]);
+      if (!sub_hit[m]) continue;
+      hit[again[m]] = true;
+      if (statuses && again[m] < statuses->size() && m < sub_st.size())
+        (*statuses)[again[m]] = sub_st[m];
+    }
   }
-  for (size_t m = 0; m < again.size(); ++m) {
-    CountDrainRead(sub_hit[m]);
-    if (!sub_hit[m]) continue;
-    hit[again[m]] = true;
-    if (statuses && again[m] < statuses->size() && m < sub_st.size())
-      (*statuses)[again[m]] = sub_st[m];
+  if (!readback_on_ || t_drain_pass || t_route_to != nullptr || !statuses)
+    return hit;
+  std::vector<size_t> missed;
+  std::vector<std::string> missed_keys;
+  for (size_t i = 0; i < keys.size() && i < first.size(); ++i)
+    if (!hit[i] && (first[i] == Status::kNotFound || first[i] == Status::kOk)) {
+      missed.push_back(i);
+      missed_keys.push_back(keys[i]);
+    }
+  for (const auto& [prev, pos] : PlanReadBack(missed_keys)) {
+    std::vector<std::string> sub;
+    for (size_t m : pos) sub.push_back(keys[missed[m]]);
+    std::vector<Status> sub_st;
+    std::vector<bool> sub_hit;
+    {
+      RouteTo to(prev);
+      sub_hit = BatchExistDirectRouted(sub, &sub_st);
+    }
+    for (size_t k = 0; k < pos.size(); ++k) {
+      CountReadBack(sub_hit[k]);
+      if (!sub_hit[k]) continue;
+      const size_t i = missed[pos[k]];
+      hit[i] = true;
+      if (i < statuses->size() && k < sub_st.size()) (*statuses)[i] = sub_st[k];
+    }
   }
   return hit;
 }
@@ -2631,12 +3222,17 @@ std::vector<bool> KVClient::BatchGetDirectRouted(
   std::vector<char> retry(N, 0);
   auto run_pass = [&](const std::vector<size_t>& todo) {
     std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
+    std::vector<std::string> routes = RouteReads(
+        todo.size(),
+        [&](size_t j) -> const std::string& { return items[todo[j]].key; },
+        RouteOp::kGet);
+    size_t j = 0;
     for (size_t i : todo) {
+      std::string node = std::move(routes[j++]);
       if (items[i].key.empty()) {  // as PUT
         if (st) st[i] = ItemStatus::kBadArgument;
         continue;
       }
-      std::string node = RouteFor(items[i].key, RouteOp::kGet);
       if (node.empty()) continue;
       by[{node, items[i].n}].push_back(i);
     }
@@ -2846,12 +3442,17 @@ std::vector<bool> KVClient::BatchGetAutoDirectRouted(
   std::vector<char> retry(N, 0);
   auto run_pass = [&](const std::vector<size_t>& todo) {
   std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
+  std::vector<std::string> routes = RouteReads(
+      todo.size(),
+      [&](size_t j) -> const std::string& { return items[todo[j]].key; },
+      RouteOp::kGet);
+  size_t j = 0;
   for (size_t i : todo) {
+    std::string node = std::move(routes[j++]);
     if (items[i].key.empty()) {  // as PUT
       if (st) st[i] = ItemStatus::kBadArgument;
       continue;
     }
-    std::string node = RouteFor(items[i].key, RouteOp::kGet);
     if (node.empty()) continue;
     by[{node, items[i].n}].push_back(i);
   }
@@ -3325,7 +3926,8 @@ bool KVClient::RetainPrecheck(const std::vector<std::string>& keys,
                               uint8_t min_headroom_pct) {
   std::set<std::string> owners;
   for (const std::string& key : keys) {
-    std::string node = RouteFor(key, RouteOp::kExist);
+    std::string node =
+        RouteForUnchecked(key, RouteOp::kExist, nullptr, nullptr);
     if (node.empty()) return false;
     owners.insert(std::move(node));
   }
@@ -4012,8 +4614,11 @@ std::vector<bool> KVClient::BatchExistDirectRouted(
   std::unique_ptr<PernodeStat> unrouted;
   if (pernode_on) unrouted = std::make_unique<PernodeStat>();
   std::map<std::string, std::vector<size_t>> by_node;
+  std::vector<std::string> routes = RouteReads(
+      N, [&](size_t i) -> const std::string& { return keys[i]; },
+      RouteOp::kExist);
   for (size_t i = 0; i < N; ++i) {
-    std::string node = RouteFor(keys[i], RouteOp::kExist);
+    std::string node = std::move(routes[i]);
     if (node.empty()) {
       if (pernode_on)
         RecordPernodeNonIssued(unrouted.get(),
@@ -4713,7 +5318,13 @@ std::vector<bool> KVClient::BatchGetAutoSgDirectRouted(const std::vector<KvGetIt
   std::vector<char> retry(N, 0);  // see BatchGetDirect
   auto run_pass = [&](const std::vector<size_t>& todo) {
     std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
+    std::vector<std::string> routes = RouteReads(
+        todo.size(),
+        [&](size_t j) -> const std::string& { return items[todo[j]].key; },
+        RouteOp::kGet);
+    size_t j = 0;
     for (size_t i : todo) {
+      std::string node = std::move(routes[j++]);
       if (over[i]) {
         if (st) st[i] = ItemStatus::kBadArgument;
         if (pernode_on)
@@ -4722,7 +5333,6 @@ std::vector<bool> KVClient::BatchGetAutoSgDirectRouted(const std::vector<KvGetIt
               items[i].key);
         continue;
       }
-      std::string node = RouteFor(items[i].key, RouteOp::kGet);
       if (node.empty()) {
         if (pernode_on && !(*nonissued_recorded)[i]) {
           RecordPernodeNonIssued(
