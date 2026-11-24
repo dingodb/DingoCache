@@ -3,6 +3,17 @@
 ## Unreleased
 
 
+- Server: the node's in-memory key tables hash every key field, seeded per
+  process (SRV-01), as the log store's index does since #532: the parked
+  RETAIN SETs, the PUT key stripes and the recent reads of
+  `DFKV_RAM_PROMOTE=second`. Their hash, digest_hi ^ digest_lo * C, put
+  keys whose fields are related into a handful of buckets: measured with
+  100000 keys {id * C + 1, id}, filling the parked-SET table took 28 s
+  instead of 7 ms (one chain of 50000 keys), 8 of the 256 PUT stripes held
+  every key, so PUTs of different keys waited for each other's stripe lock,
+  and two passes of recent reads took 114 s instead of 37 ms. In-memory
+  only: nothing on the wire or on disk changes.
+
 - Client, RDMA: no `getenv` on the data path. Five test-only fault hooks
   (`DFKV_RDMA_TEST_*`) read the environment on every READ, PUT batch and
   attempt, and `DFKV_RDMA_BUSY_POLL` was read for every connection. In a

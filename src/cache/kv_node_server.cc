@@ -179,7 +179,7 @@ void KvNodeServer::EndPut() {
 
 KvNodeServer::PutKeyLock KvNodeServer::LockPutKey(const BlockKey& key) {
   if (!ram_write_back_ || !ram_) return {};
-  PutKeyStripe& stripe = put_keys_[PutKeyHash{}(key) % kPutKeyStripes];
+  PutKeyStripe& stripe = put_keys_[BlockKeyMixHash{}(key) % kPutKeyStripes];
   PutKeySlot* slot = nullptr;
   {
     std::lock_guard<std::mutex> guard(stripe.mu);
@@ -210,7 +210,7 @@ void KvNodeServer::ReleasePutKey(const BlockKey& key,
                                  std::unique_lock<std::mutex>* lock) {
   if (lock->owns_lock()) lock->unlock();
   lock->release();  // the slot may go below
-  PutKeyStripe& stripe = put_keys_[PutKeyHash{}(key) % kPutKeyStripes];
+  PutKeyStripe& stripe = put_keys_[BlockKeyMixHash{}(key) % kPutKeyStripes];
   std::lock_guard<std::mutex> guard(stripe.mu);
   auto it = stripe.keys.find(key);
   if (it != stripe.keys.end() && --it->second->users == 0) {
