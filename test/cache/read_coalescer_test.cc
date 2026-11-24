@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -441,3 +442,91 @@ TEST(ReadCoalescer, AnAbortedFlightReleasesItsThread) {
   registrar.join();
   EXPECT_EQ(c.held_fallbacks(), 0u);
 }
+
+// REQ-20: a leader with no followers reads straight into the caller's buffer.
+// It read into a scratch it allocated (posix_memalign of the whole capacity)
+// and copied it over: measured 597 us extra on a 1 MiB read, 2.5 ms on 4 MiB,
+// for a fill of 49 us and 339 us.
+TEST(ReadCoalescer, ALeaderWithoutFollowersReadsIntoTheCallersBuffer) {
+  ReadCoalescer c;
+  std::string dst(1 << 20, '\0');
+  char* seen = nullptr;
+  size_t n = 0;
+  ASSERT_EQ(c.Read(K(31), 0, dst.size(), &dst[0], dst.size(), &n, nullptr,
+                   [&](char* b, size_t cap, size_t* on, size_t*) {
+                     seen = b;
+                     std::memset(b, 'd', cap);
+                     *on = cap;
+                     return Status::kOk;
+                   }),
+            Status::kOk);
+  EXPECT_EQ(seen, &dst[0]) << "the leader read into a scratch of its own";
+  EXPECT_EQ(n, dst.size());
+  EXPECT_EQ(dst, std::string(dst.size(), 'd'));
+}
+
+// REQ-20: a fill that throws leaves no flight behind. It stayed in the map,
+// and every later identical read waited the full timeout for it.
+TEST(ReadCoalescer, AThrowingFillLeavesNoFlightBehind) {
+  ReadCoalescer c;
+  char buf[4];
+  size_t n = 0;
+  EXPECT_THROW(c.Read(K(32), 0, 4, buf, sizeof(buf), &n, nullptr,
+                      [](char*, size_t, size_t*, size_t*) -> Status {
+                        throw std::runtime_error("fill failed");
+                      }),
+               std::runtime_error);
+  ReadCoalescer::Outcome oc;
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(c.Read(K(32), 0, 4, buf, sizeof(buf), &n, nullptr,
+                   [](char* b, size_t, size_t* on, size_t*) {
+                     std::memcpy(b, "next", 4);
+                     *on = 4;
+                     return Status::kOk;
+                   },
+                   &oc),
+            Status::kOk);
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, 100ms)
+      << "waited for the thrown read's flight";
+  EXPECT_TRUE(oc.leader);
+  EXPECT_EQ(c.timeouts(), 0u);
+}
+
+// REQ-20: a follower that times out takes the flight out of the map, so a
+// read arriving after it does not wait again for a leader that is stuck.
+TEST(ReadCoalescer, ATimedOutFollowerRemovesTheStuckFlight) {
+  ReadCoalescer c;
+  uint64_t t = c.TryRegisterAsync(K(33), 0, 4, false);  // never completed
+  ASSERT_NE(t, 0u);
+  char buf[4];
+  size_t n = 0;
+  const auto own = [](char* b, size_t, size_t* on, size_t*) {
+    std::memcpy(b, "self", 4);
+    *on = 4;
+    return Status::kOk;
+  };
+  std::thread first([&] {  // waits out the timeout, then reads itself
+    char b2[4];
+    size_t n2 = 0;
+    EXPECT_EQ(c.Read(K(33), 0, 4, b2, sizeof(b2), &n2, nullptr, own),
+              Status::kOk);
+  });
+  first.join();
+  ASSERT_EQ(c.timeouts(), 1u);
+  // The next read, on a thread holding no flight (this one holds the async
+  // flight, and would read for itself at once whatever happened).
+  ReadCoalescer::Outcome oc;
+  std::chrono::steady_clock::duration took{};
+  std::thread second([&] {
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(c.Read(K(33), 0, 4, buf, sizeof(buf), &n, nullptr, own, &oc),
+              Status::kOk);
+    took = std::chrono::steady_clock::now() - t0;
+  });
+  second.join();
+  EXPECT_LT(took, 100ms) << "waited again for the stuck flight";
+  EXPECT_TRUE(oc.leader);
+  EXPECT_EQ(c.timeouts(), 1u);
+  (void)t;
+}
+

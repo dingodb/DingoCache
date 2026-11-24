@@ -1544,7 +1544,11 @@ Status KvNodeServer::ProcessRequestForKey(
                       group_.Range(key, offset, length, &tmp, value_len);
                   if (s == Status::kOk) {
                     size_t m = tmp.size() < bcap ? tmp.size() : bcap;
-                    std::memcpy(buf, tmp.data(), m);
+                    // The coalescer hands the caller's own buffer to the
+                    // fill, which is null with cap 0 when the value has no
+                    // bytes at this offset (memcpy of a null pointer is UB
+                    // even for 0 bytes).
+                    if (m) std::memcpy(buf, tmp.data(), m);
                     *on = m;
                   }
                   return s;

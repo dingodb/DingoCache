@@ -7,9 +7,9 @@
  * times. This class collapses the read-side convoy and registers BOTH paths:
  *
  *  - Synchronous (TCP kRange, RangeInto, sync RangeDirect): Read() — the first
- *    arrival ("leader") does the disk read into a shared scratch buffer, every
+ *    arrival ("leader") does the disk read into its own buffer, every
  *    overlapping arrival ("follower") blocks until it completes and memcpy()s
- *    from the scratch.
+ *    from a copy the leader makes for them (only when there are any).
  *  - Asynchronous (the io_uring serve path): TryRegisterAsync() creates the
  *    flight during preparation. Its token is hidden inside the move-only
  *    PreparedRead owner, whose Commit/destructor-abort calls CompleteAsync().
@@ -246,6 +246,8 @@ class ReadCoalescer {
     if (!f->cv.wait_for(fl, std::chrono::milliseconds(WaitMs()),
                         [&] { return f->done; })) {
       timeouts_.fetch_add(1, std::memory_order_relaxed);
+      fl.unlock();
+      DropStuckFlight(k, f);
       return PublishedWait::kFallback;
     }
     return f->st == Status::kOk ? PublishedWait::kReady
@@ -291,38 +293,57 @@ class ReadCoalescer {
       }
     }
     if (leader) {
-      // Aligned scratch: the fill may be an O_DIRECT read straight into it.
-      f->data = AlignedAlloc(dst_cap);
+      // The leader reads straight into the caller's buffer, as without
+      // coalescing; only if followers joined meanwhile does it copy the bytes
+      // into a shared buffer for them. (It used to read into a scratch of
+      // the full capacity and copy that over, followers or not: about 600 us
+      // extra on 1 MiB, the allocation faulting in fresh pages each time.)
+      // The flight is completed and taken out of the map however the fill
+      // ends, a throw included (Finish's destructor): a stale flight made
+      // every later identical read wait out the timeout.
+      struct Finish {
+        ReadCoalescer* self;
+        const Key& key;
+        Flight& flight;
+        bool completed = false;
+        void Complete(Status st, const char* bytes, size_t n,
+                      size_t value_len) {
+          completed = true;
+          {
+            std::lock_guard<std::mutex> lk(self->mu_);
+            auto it = self->map_.find(key);
+            if (it != self->map_.end() && it->second.get() == &flight)
+              self->map_.erase(it);
+          }
+          {
+            std::lock_guard<std::mutex> fl(flight.m);
+            if (st == Status::kOk && n > 0 && bytes &&
+                flight.copy_waiters.load(std::memory_order_acquire) > 0) {
+              flight.data = AlignedAlloc(n);
+              if (flight.data) std::memcpy(flight.data.get(), bytes, n);
+            }
+            flight.st = st;
+            flight.len = n;
+            flight.value_len = value_len;
+            flight.done = true;
+          }
+          flight.cv.notify_all();
+          self->leaders_.fetch_add(1, std::memory_order_relaxed);
+        }
+        ~Finish() {
+          if (!completed) Complete(Status::kIOError, nullptr, 0, 0);
+        }
+      } finish{this, k, *f};
       size_t n = 0;
       size_t value_len = 0;
-      Status st =
-          f->data ? fill(f->data.get(), dst_cap, &n, &value_len)
-                  : fill(dst, dst_cap, &n, &value_len);
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = map_.find(k);
-        if (it != map_.end() && it->second == f) map_.erase(it);
-      }
-      {
-        std::lock_guard<std::mutex> fl(f->m);
-        f->st = st;
-        f->len = n;
-        f->value_len = value_len;
-        f->done = true;
-      }
-      f->cv.notify_all();
-      leaders_.fetch_add(1, std::memory_order_relaxed);
+      const Status st = fill(dst, dst_cap, &n, &value_len);
+      if (n > dst_cap) n = dst_cap;
+      finish.Complete(st, dst, n, value_len);
       if (oc) {
         oc->leader = true;
         oc->had_waiters = f->waiters.load(std::memory_order_acquire) > 0;
       }
-      if (st == Status::kOk && n > 0 && f->data) {
-        std::memcpy(dst, f->data.get(), n < dst_cap ? n : dst_cap);
-        if (out_len) *out_len = n < dst_cap ? n : dst_cap;
-      } else if (st == Status::kOk && out_len && !f->data) {
-        // fill wrote dst directly; `n` is its returned byte count.
-        *out_len = n;
-      }
+      if (st == Status::kOk && out_len) *out_len = n;
       if (st == Status::kOk && out_value_len) *out_value_len = value_len;
       return st;
     }
@@ -346,6 +367,7 @@ class ReadCoalescer {
                           [&] { return f->done; })) {
         timeouts_.fetch_add(1, std::memory_order_relaxed);
         fl.unlock();
+        DropStuckFlight(k, f);
         return fill(dst, dst_cap, out_len, out_value_len);
       }
     }
@@ -377,7 +399,7 @@ class ReadCoalescer {
     Status st = Status::kInvalid;
     size_t len = 0;
     size_t value_len = 0;
-    std::shared_ptr<char> data;  // 4096-aligned scratch (leader's read target)
+    std::shared_ptr<char> data;  // the bytes, copied for followers
     Key key{};
     bool whole = false;
     bool recurrent = false;  // registered while a recurrence tombstone was live
@@ -387,6 +409,16 @@ class ReadCoalescer {
     std::atomic<int> waiters{0};
     std::atomic<int> copy_waiters{0};
   };
+
+  // A waiter that timed out takes the flight out of the map (if it is still
+  // the one there): a read arriving later then starts its own instead of
+  // waiting out the timeout again for a leader that is stuck or gone. The
+  // leader, if it ever completes, only removes its own flight.
+  void DropStuckFlight(const Key& k, const std::shared_ptr<Flight>& f) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = map_.find(k);
+    if (it != map_.end() && it->second == f) map_.erase(it);
+  }
 
   static std::shared_ptr<char> AlignedAlloc(size_t n) {
     void* p = nullptr;
