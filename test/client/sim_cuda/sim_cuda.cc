@@ -151,6 +151,8 @@ SIM_EXPORT int sim_cuda_fail_ctx_synchronize = 0;
 // once; sim_cuda_queued_copies counts the copies held so far.
 SIM_EXPORT int sim_cuda_defer_stream_copies = 0;
 SIM_EXPORT int sim_cuda_queued_copies = 0;
+// Non-zero: cuPointerSetAttribute fails (as for a VMM allocation).
+SIM_EXPORT int sim_cuda_fail_pointer_set_attribute = 0;
 
 // A GPUDirect write: the bytes arrive at the next synchronization call.
 SIM_EXPORT void sim_cuda_gpudirect_write(void* dst, const void* src,
@@ -368,6 +370,7 @@ SIM_EXPORT int cuPointerGetAttribute(void* data, int attribute,
 SIM_EXPORT int cuPointerSetAttribute(const void*, int,
                                      unsigned long long pointer) {
   std::lock_guard<std::mutex> lock(g_mu);
+  if (sim_cuda_fail_pointer_set_attribute) return kInvalidValue;
   return FindLocked(static_cast<uintptr_t>(pointer), 1) ? kOk : kInvalidValue;
 }
 

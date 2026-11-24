@@ -289,6 +289,11 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::Open(const Options& opt) {
   // Claim a registry entry: a free one, one whose owner died, or one whose
   // owner is provably gone although its pid is in use (see Stale).
   const uint32_t mypid = static_cast<uint32_t>(::getpid());
+  // Taken before any claim: nothing between a claim and self_idx_ may throw,
+  // or the entry would stay claimed by this live process (the destructor
+  // releases only an entry recorded in self_idx_).
+  const uint32_t image = ImageNonce();
+  const uint64_t start_ticks = StartTicks(mypid);
   for (uint32_t i = 0; i < kMaxProcs && d->self_idx_ == kMaxProcs; ++i) {
     ProcEntry& e = d->reg_[i];
     uint32_t cur = e.pid.load(std::memory_order_acquire);
@@ -312,19 +317,19 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::Open(const Options& opt) {
       e.ready.store(0, std::memory_order_release);
       d->self_gen_ = g + 1;
     }
+    d->self_idx_ = i;  // claimed: the destructor releases it from here on
     e.alloc_cursor.store(0, std::memory_order_relaxed);
     e.arena_bytes = opt.arena_bytes;
     e.device = cu->CurrentDevice();
     d->self_device_ = e.device;
     std::memcpy(&e.handle, &handle, sizeof(handle));
     e.owner_va = static_cast<uint64_t>(d->arena_base_);
-    e.image = ImageNonce();
-    e.start_ticks = StartTicks(mypid);
+    e.image = image;
+    e.start_ticks = start_ticks;
     // Last, and a release store: whoever sees identity_gen equal to the
     // generation sees the image and start time written for it (Stale).
     __atomic_store_n(&e.identity_gen, d->self_gen_, __ATOMIC_RELEASE);
     e.ready.store(1, std::memory_order_release);
-    d->self_idx_ = i;
   }
   if (d->self_idx_ == kMaxProcs) {
     DFKV_LOG_INFO("gpu-dedup: registry full (" + std::to_string(kMaxProcs) +

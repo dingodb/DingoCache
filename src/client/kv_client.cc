@@ -54,6 +54,24 @@ struct RouteTo {
   RouteTo(const RouteTo&) = delete;
   RouteTo& operator=(const RouteTo&) = delete;
 };
+// Runs a log statement once per process. Not std::call_once: an exception
+// unwinding through it (pthread_once) aborts the process. One that throws
+// (an allocation failing) only loses the line, and it is not tried again.
+struct LogOnce {
+  std::mutex mu;
+  bool done = false;
+};
+template <typename Fn>
+void RunLogOnce(LogOnce& once, Fn fn) noexcept {
+  try {
+    std::lock_guard<std::mutex> lk(once.mu);
+    if (once.done) return;
+    once.done = true;
+    fn();
+  } catch (...) {
+  }
+}
+
 struct DrainPass {
   DrainPass() { t_drain_pass = true; }
   ~DrainPass() { t_drain_pass = false; }
@@ -335,8 +353,8 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
     cd::RecordResolved("DFKV_CLIENT_NODE_DEDUP", dedup_ ? "on" : "off");
   }
   // Log only the namespace digest; raw model/tenant names may be sensitive.
-  static std::once_flag dump_once;
-  std::call_once(dump_once, [this] {
+  static LogOnce dump_once;
+  RunLogOnce(dump_once, [this] {
     namespace cd = dfkv::config_dump;
     cd::Record("key_namespace_digest",
                block_key_("").DigestHex(), cd::Source::kArg);
@@ -369,9 +387,9 @@ bool KVClient::RegisterMemory(void* base, size_t size) {
     // land (observed live as exact-hit loads with degraded generation). Arm
     // SYNC_MEMOPS where the driver accepts it (plain cudaMalloc allocations);
     // VMM/cuMemMap pools commonly reject it and use the load-path fence.
-    static std::once_flag sync_memops_unavailable;
+    static LogOnce sync_memops_unavailable;
     if (!cuda->SetSyncMemops(base)) {
-      std::call_once(sync_memops_unavailable, [] {
+      RunLogOnce(sync_memops_unavailable, [] {
         DFKV_LOG_WARN(
             "dfkv: cuPointerSetAttribute(SYNC_MEMOPS) rejected for a GPU pool "
             "(VMM/cuMemMap allocation); GPUDirect loads rely on the "
@@ -4341,11 +4359,43 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items,
                      std::vector<bool>(ok.begin(), ok.end()), bytes);
 }
 
+// Set up once, on the first all-device batch. Not std::call_once: an
+// exception unwinding through it (pthread_once) aborts the process. A set-up
+// that throws leaves this client without GPU dedup, as one that finds no
+// device does.
 GpuNodeDedup* KVClient::GpuDedup(const void* device_dst_hint) {
-  std::call_once(gpu_dedup_once_, [this, device_dst_hint] {
+  if (gpu_dedup_tried_.load(std::memory_order_acquire))
+    return gpu_dedup_raw_.load(std::memory_order_relaxed);
+  // Callers of the first batches wait here for the one set-up, as they did
+  // in std::call_once; tried_ is published last.
+  std::lock_guard<std::mutex> lk(gpu_dedup_mu_);
+  if (gpu_dedup_tried_.load(std::memory_order_relaxed))
+    return gpu_dedup_.get();
+  const char* failure = nullptr;
+  std::string what;
+  try {
     gpu_dedup_ = GpuNodeDedup::FromEnv(namespace_hash_, device_dst_hint);
-    gpu_dedup_raw_.store(gpu_dedup_.get(), std::memory_order_release);
-  });
+  } catch (const std::exception& e) {
+    gpu_dedup_.reset();
+    failure = "set-up failed";
+    try {
+      what = e.what();
+    } catch (...) {
+    }
+  } catch (...) {
+    gpu_dedup_.reset();
+    failure = "set-up failed";
+  }
+  gpu_dedup_raw_.store(gpu_dedup_.get(), std::memory_order_release);
+  gpu_dedup_tried_.store(true, std::memory_order_release);
+  if (failure != nullptr) {
+    try {
+      DFKV_LOG_WARN(std::string("gpu-dedup: ") + failure +
+                    (what.empty() ? std::string() : " (" + what + ")") +
+                    "; this client runs without GPU dedup");
+    } catch (...) {
+    }
+  }
   return gpu_dedup_.get();
 }
 
