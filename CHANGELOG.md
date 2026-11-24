@@ -45,6 +45,24 @@
   `poll()` system call on its wake pipe on every spin. A signal during a
   completion wait no longer starts its timeout again. Nothing changes on
   the wire.
+- Client, RDMA: a scatter-gather GET into memory that is not registered
+  registers touching segments together (TRN-28). Each destination segment
+  outside registered memory got its own registration for every GET: 16 keys
+  of 61 contiguous 16 KiB segments took 976 registrations and 28-68 ms
+  per call, against 1.6-2.6 ms with the memory registered. Segments that
+  overlap or touch now share one registration (the same pages, so nothing
+  else of the caller's is pinned or, with fork support, kept from a child):
+  16 registrations and 2.2-2.9 ms. Scattered segments still take one each
+  (30-32 ms); registering the buffers once with `dfkv_register_memory` is the fix
+  there, and a rate-limited WARN says so. A merged range the device refuses
+  is registered segment by segment. The registrations now last the whole
+  GET rather than one READ round; where the locked-memory limit refuses
+  that (ENOMEM, EAGAIN), the GET registers round by round as before; in a
+  batch window, a key whose round the limit refuses waits for the next one. New
+  `dfkv_rdma_client_unregistered_dest_registrations_total`,
+  `dfkv_rdma_client_unregistered_dest_span_fallbacks_total`,
+  `dfkv_rdma_client_unregistered_dest_memlock_fallbacks_total`.
+
 
 - Server, RAM tier: a value a flush gives up on is counted before it is
   dropped (REQ-25). The drop takes the value out of the dirty count, and

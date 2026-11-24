@@ -12194,3 +12194,104 @@ TEST(RdmaBatchGet, AStalePooledConnectionIsRetriedOnce) {
                 retries_before,
             1);
 }
+
+// A scatter-gather GET into memory that is not registered registers it per
+// GET, but segments that touch share one registration: 16 keys of 61
+// contiguous 16 KiB segments take 16 registrations, not 976. Segments in
+// registered memory use that registration; scattered ones still take one
+// each; a merged range the device refuses is registered segment by segment,
+// counted. Every byte lands where it belongs in each case.
+TEST(RdmaSgRead, TouchingUnregisteredSegmentsShareARegistration) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string first =
+      devs ? std::string(devs).substr(0, std::string(devs).find(',')) : "";
+  constexpr size_t kKeys = 16, kSegs = 61, kSeg = 16384;
+  RdmaNode node("sg-coalesce", 1u << 20);
+  ScopedEnv block("DFKV_RDMA_MAX_BLOCK_BYTES", "1048576");
+  std::vector<BlockKey> keys;
+  std::vector<std::string> values;
+  {
+    RdmaTransport writer(1u << 20, first);
+    for (size_t k = 0; k < kKeys; ++k) {
+      values.push_back(PatternValue(kSegs * kSeg, 60 + k));
+      keys.push_back(ToBlockKey(SelfHdr(), "coalesce-" + std::to_string(k)));
+      ASSERT_EQ(writer.Cache(node.addr, keys[k], values[k].data(),
+                             values[k].size()),
+                Status::kOk);
+    }
+  }
+  enum Layout {
+    kContiguous, kScattered, kHalfRegistered, kSpanRefused, kMemlock
+  };
+  for (const Layout layout :
+       {kContiguous, kScattered, kHalfRegistered, kSpanRefused, kMemlock}) {
+    SCOPED_TRACE(static_cast<int>(layout));
+    RdmaTransport rt(1u << 20, first);
+    std::vector<char> pool(kKeys * kSegs * kSeg + 4096, 'G');
+    std::vector<std::unique_ptr<char[]>> owned;
+    std::vector<char> registered(kKeys * kSegs * kSeg, 'G');
+    if (layout == kHalfRegistered)
+      ASSERT_TRUE(rt.RegisterMemory(registered.data(), registered.size()));
+    std::vector<RangeDstMulti> dsts(kKeys);
+    size_t expected = 0;
+    for (size_t k = 0; k < kKeys; ++k) {
+      for (size_t s = 0; s < kSegs; ++s) {
+        char* at = pool.data() + (k * kSegs + s) * kSeg;
+        if (layout == kScattered) {
+          owned.emplace_back(new char[kSeg + 128]);
+          at = owned.back().get() + 64;
+        } else if (layout == kHalfRegistered && s % 2 == 0) {
+          at = registered.data() + (k * kSegs + s) * kSeg;
+        }
+        dsts[k].payloads.emplace_back(at, kSeg);
+      }
+      // Registrations expected for this key.
+      expected += layout == kContiguous ? 1
+                  : layout == kHalfRegistered ? kSegs / 2  // odd ones, apart
+                                              : kSegs;
+    }
+    if (layout == kSpanRefused)
+      rdma::RcEndpoint::SetTransientRegistrationSeamForTest(
+          [](void*, size_t len) { return len <= kSeg; });
+    // A locked-memory limit: no merged range, and at most 40 one-shot
+    // registrations alive at a time (ENOMEM past it). A READ round needs at
+    // most ReadSge (<= 30) of them.
+    if (layout == kMemlock)
+      rdma::RcEndpoint::SetTransientRegistrationSeamForTest(
+          [](void*, size_t len) {
+            return len <= kSeg &&
+                   rdma::RcEndpoint::TransientUserMrActive() < 40;
+          });
+    const std::string before = rt.MetricsText();
+    std::vector<size_t> lens;
+    const auto statuses = rt.RangeIntoMulti(node.addr, keys, dsts, &lens);
+    rdma::RcEndpoint::SetTransientRegistrationSeamForTest(nullptr);
+    const std::string after = rt.MetricsText();
+    for (size_t k = 0; k < kKeys; ++k) {
+      ASSERT_EQ(statuses[k], Status::kOk) << k;
+      size_t offset = 0;
+      for (const auto& segment : dsts[k].payloads) {
+        ASSERT_EQ(std::memcmp(segment.first, values[k].data() + offset, kSeg),
+                  0)
+            << "key " << k << " offset " << offset;
+        offset += kSeg;
+      }
+    }
+    EXPECT_EQ(pool.back(), 'G') << "past the last destination";
+    const auto delta = [&](const char* name) {
+      return CounterVal(after, name) - CounterVal(before, name);
+    };
+    if (layout != kMemlock)
+      EXPECT_EQ(
+          delta("dfkv_rdma_client_unregistered_dest_registrations_total"),
+          static_cast<long>(expected));
+    EXPECT_EQ(delta("dfkv_rdma_client_unregistered_dest_span_fallbacks_total"),
+              layout == kSpanRefused || layout == kMemlock
+                  ? static_cast<long>(kKeys) : 0);
+    EXPECT_EQ(
+        delta("dfkv_rdma_client_unregistered_dest_memlock_fallbacks_total"),
+        layout == kMemlock ? static_cast<long>(kKeys) : 0);
+    EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), 0u);
+  }
+}

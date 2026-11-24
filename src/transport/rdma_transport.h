@@ -631,6 +631,12 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> pull_read_bytes_{0};
   std::atomic<uint64_t> pull_read_wrs_{0};  // READ work requests posted
   std::atomic<uint64_t> test_pull_reads_{0};  // DFKV_RDMA_TEST_PULL_READ_FAILURE=@N
+  // GET destinations outside registered memory: registrations made, merged
+  // ranges refused and registered per segment, pulls (rate-limits the WARN).
+  std::atomic<uint64_t> dest_registrations_{0};
+  std::atomic<uint64_t> dest_span_fallbacks_{0};
+  std::atomic<uint64_t> dest_memlock_fallbacks_{0};
+  LogThrottle dest_log_;
   std::atomic<uint64_t> pull_failures_{0};
   std::atomic<uint64_t> pull_releases_{0};
   std::atomic<uint64_t> pull_release_failures_{0};
