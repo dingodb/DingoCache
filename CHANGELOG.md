@@ -3,6 +3,13 @@
 ## Unreleased
 
 
+- Server, RAM tier: a value a flush gives up on is counted before it is
+  dropped (REQ-25). The drop takes the value out of the dirty count, and
+  the counters (`dfkv_ram_flush_dropped_total`, `_refused_total`,
+  `_no_room_dropped_total`) and the health came after it, so a reader that
+  saw the tier drained (the stop sequence's drain wait, a scrape) could
+  still see the drop uncounted. Seen once as a flaky unit test.
+
 - Server: the node's in-memory key tables hash every key field, seeded per
   process (SRV-01), as the log store's index does since #532: the parked
   RETAIN SETs, the PUT key stripes and the recent reads of

@@ -61,6 +61,11 @@ class RamTierTestPeer {
     return n;
   }
   static const char* ArenaBase(const RamTier& tier) { return tier.arena_; }
+  // Set before the first PUT: called right after a flush that gave up
+  // dropped its value.
+  static void AfterDrop(RamTier& tier, std::function<void()> hook) {
+    tier.after_drop_for_test_ = std::move(hook);
+  }
   // One reclaimer pass over every shard, as the background thread runs it.
   static void ReclaimTick(RamTier& tier) {
     for (size_t i = 0; i < tier.shards_.size(); ++i)
@@ -2455,6 +2460,59 @@ TEST(RamTierFlushFailure, SecondWriterOfAnAcknowledgedValueDoesNotWait) {
   EXPECT_EQ(rt.PostAckFlushFailures(), 1u);
   // Once it is gone, a PUT of the key is a new value, not a duplicate.
   EXPECT_FALSE(rt.Contains(K(1)));
+}
+
+// REQ-25: a flush that gives up counts its drop before it drops the value.
+// The drop takes the value out of the dirty count; a WaitForDrain that saw
+// the tier drained then read FlushDropped() == 0 (flaked once in CI). A hook
+// right after the drop sees what any reader of the drained tier would.
+TEST(RamTierFlushFailure, ADroppedValueIsCountedBeforeItLeavesTheDirtyCount) {
+  FailingSink sink;
+  RamTier rt(RetryOpts(3, 2000), sink.fn());
+  std::atomic<uint64_t> dropped{0}, acked_lost{0}, dirty{1};
+  std::atomic<bool> healthy{true}, ran{false};
+  RamTierTestPeer::AfterDrop(rt, [&] {
+    dropped = rt.FlushDropped();
+    acked_lost = rt.PostAckFlushFailures();
+    dirty = rt.DirtyObjects();
+    healthy = rt.healthy();
+    ran = true;
+  });
+  const std::string value(500, 'c');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(rt.WaitForDrain(10s));
+  ASSERT_TRUE(WaitFor([&] { return ran.load(); }));
+  EXPECT_EQ(dirty.load(), 0u);
+  EXPECT_EQ(dropped.load(), 1u);
+  EXPECT_EQ(acked_lost.load(), 1u);
+  EXPECT_FALSE(healthy.load());
+  EXPECT_EQ(rt.FlushDropped(), 1u);
+}
+
+// The same for a value the disk refuses for good and one it has no room for.
+TEST(RamTierFlushFailure, ARefusedOrRoomlessValueIsCountedBeforeItsDrop) {
+  for (const Status answer : {Status::kInvalid, Status::kCacheFull}) {
+    SCOPED_TRACE(static_cast<int>(answer));
+    RamTier::Options options = RetryOpts(3, 10);
+    options.flush_no_room_hold_ms = 30;
+    RamTier rt(options, [answer](const BlockKey&, char*, size_t, size_t) {
+      return answer;
+    });
+    std::atomic<uint64_t> seen{0};
+    std::atomic<bool> ran{false};
+    RamTierTestPeer::AfterDrop(rt, [&] {
+      seen = answer == Status::kInvalid ? rt.FlushRefused()
+                                        : rt.FlushNoRoomDropped();
+      ran = true;
+    });
+    const std::string value(500, 'r');
+    ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+              Status::kOk);
+    ASSERT_TRUE(rt.WaitForDrain(10s));
+    ASSERT_TRUE(WaitFor([&] { return ran.load(); }));
+    EXPECT_EQ(seen.load(), 1u);
+  }
 }
 
 // A disk that answers kCacheFull has no slot for the value now; it has not
