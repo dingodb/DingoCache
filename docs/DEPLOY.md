@@ -153,9 +153,10 @@ journalctl -u dfkv_mds -n 5 --no-pager   # 应见 "dfkv_mds listening on 9400, e
 > 上），失败时在同一次心跳里立即依次试其他端点（建连超时 2s），失败的端点 30s 内
 > 不再先选。任一 MDS 都续记录上挂的那个租约，所以换 MDS
 > 不再重新授予租约、重写记录。
-> MDS 对 member list 的回答复用 `DFKV_MDS_LIST_CACHE_MS`（默认 500 ms；`0`=每次
+> MDS 对 member list 的回答复用 `DFKV_MDS_LIST_CACHE_MS`（默认 500 ms，上限 10000；`0`=每次
 > 轮询都读 etcd，2.42 及之前的行为），同一 group 并发的轮询只读一次 etcd；本 MDS
-> 写入的记录立即可见，其他 MDS 写入的最多晚这么久。
+> 写入的记录立即可见，其他 MDS 写入的最多晚这么久。client list（`dfkvctl clients`、
+> 冷却改道的登记门）用同一个值，但最多 1000 ms（低于客户端的轮询间隔）。
 > **摘除节点**：没有 fencing 时要三步（改环、停进程、`systemctl disable`，否则
 > 进程或 systemd 拉起后 10s 内又注册回来）。同一 group 的全部 MDS 设
 > `DFKV_MDS_FENCING=1` 后一步即可：`dfkvctl member fence <id> --mds <eps> --group
@@ -922,7 +923,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_MDS_IO_TIMEOUT_S` | `60` | MDS 控制面帧读写超时（MDS 进程该） |
 | `DFKV_MDS_ETCD_PROBE_MS` | `30000` | MDS 与 etcd 存活探测窗（MDS 进程该） |
 | `DFKV_MDS_STATS_PUT_MS` | `60000` | 仅统计（STA1）变化时重写 member 记录的最短间隔（`0`=每次心跳都重写，上限 600000）；放置相关的变化（ip、端口、权重、健康）立即写 |
-| `DFKV_MDS_LIST_CACHE_MS` | `500` | member list 回答的复用时长（`0`=每次读 etcd，上限 10000）；本 MDS 的写入会立即作废它 |
+| `DFKV_MDS_LIST_CACHE_MS` | `500` | member list 回答的复用时长（`0`=每次读 etcd，上限 10000）；client list 用同一个值但最多 1000（低于客户端的轮询间隔，冷却改道的登记门要求）；本 MDS 的写入会立即作废它 |
 | `DFKV_MDS_FENCING` | 关 | member fencing：`dfkvctl member fence <id>` 一步把节点移出环并保持移出（无租约的 `/dfkv/v1/groups/<g>/fenced/<id>` 记录；其注册和心跳被拒，记录被删除，list 不再列出），`unfence` 恢复。改变 etcd 布局并多一次读，**同一 group 的全部 MDS 都要开启**（没开的 MDS 会让被 fence 的节点写回记录，list 仍会过滤掉它） |
 | `DFKV_DRAIN` | `0` | 允许本节点排空（`dfkvctl drain`、停止前排空），需要 `--mds`；见 [§4c-1](#4c-drain) |
 | `DFKV_STOP_DRAIN_MS` | `0` | `DFKV_DRAIN=1` 时，SIGTERM 后先排空并继续服务这么久再停止（`0`=不排空，上限 600000）；第二个 SIGTERM 结束等待；须小于 `terminationGracePeriodSeconds` 减去停止时间 |
@@ -1132,6 +1133,59 @@ RETAIN 保护两份（排空节点那份还在服务读），哪边有 key 就�
 - 指标：`dfkv_client_ring_absent_members`、`dfkv_client_ring_absent_dropped_total{reason}`、
   `dfkv_client_ring_absent_removes_{unconfirmed,retried,dropped}_total`；对缺席成员的 REMOVE、
   RETAIN 计入 `dfkv_client_drain_requests_total`。
+
+### 4c-3. 冷却改道（cooldown reroute，`DFKV_RING_COOLDOWN_REROUTE`，默认 0=关）<a name="4c-reroute"></a>
+
+客户端开关，只对 MDS 动态发现生效。设计见
+[ring-unavailable-owner.md](design/ring-unavailable-owner.md) §3.2。
+
+- **作用：** 本客户端的 PeerHealth 让某个 key 的 owner 处于回避期（它刚连不上）时，这个 key 的
+  PUT、GET、EXIST、RETAIN 改走一个替补节点：在本客户端近期所有环（下面）合起来的顺时针顺序里，
+  前 `DFKV_RING_REMOVE_FANOUT`（默认 3）个成员中第一个“稳定”（在近期每个环里都有）且不在回避期的。
+  前几个都不能用时照旧（跳过 owner：读未命中、写失败），计入
+  `dfkv_client_cooldown_reroutes_total{op="none"}`。替补上未命中就是未命中，不去问 owner。
+  回避期满（不触发试探的检查）就回到 owner，第一个请求照常当试探。
+- **近期环：** 客户端在最近 S 里采用过或轮询看到过（不管 #497 的保护是否放行）的每个视图的写环。
+  S = 11 × `poll_max`，`poll_max` 是本客户端和登记表里各客户端轮询间隔中最大的那个。
+  有更慢的客户端登记、S 变大时，改道先停，等环的历史够新的 S 再开（`reason="s_growing"`）；
+  S 变小时旧值再用一个旧 S。
+- **REMOVE 扇出：** 开关打开时，REMOVE 发给 key 在每个近期环上的后继，直到第
+  `DFKV_RING_REMOVE_FANOUT` 个稳定成员（含），再加排空节点和缺席成员，每个只发一次。
+  **只有每个目标都在这次调用里确认才算成功**：哪个目标在本客户端回避期内，或失败了，REMOVE 就
+  返回失败（`dfkv_client_remove_unconfirmed_total{reason="cooling"|"failed"}`）。回避期内那个目标
+  的那份记入清理队列，回避期满后从客户端每秒一次的检查里补发，只为清理，不作为成功的依据。
+  缺席成员照旧走 4c-2 的队列。**代价：** 一个节点在回避期内时，约 (`DFKV_RING_REMOVE_FANOUT`+1)/N
+  的 key 的 REMOVE 失败（关闭时是 1/N），持续回避期那么久；调用方看到失败可以重试。要降低这个比例就把
+  `DFKV_RING_REMOVE_FANOUT` 调小（能绕过的回避节点也随之变少）。一个离开视图的成员在 S 内仍是
+  REMOVE 目标；它若是死了才离开的，它附近的 key 的 REMOVE 在每次删除之后的 S 内都失败。这是正确性
+  所需：别的客户端的近期环里可能还有它，拿它当了替补。
+- **一次回避期结束时清理替补：** 客户端记下自己写到替补上的 key（PUT 和 RETAIN SET，按 owner 和
+  回避期：试探失败开始的新回避期是新的一次），记着的和等待清理的合计上限 `DFKV_RING_REROUTE_KEYS`
+  （默认 65536），满了以后改道的写被拒绝（未命中，计入 `dfkv_client_reroute_refused_total`），不会有
+  不记账的替补写入。一次回避期结束（owner 回避期满、开始了新的一次，或登记门关上）时，客户端把那次的
+  key 从替补上 REMOVE 掉；没确认的留在清理队列里每秒重发，除了关闭时从不放弃，确认之前改道的读不读
+  那一份。扇出 REMOVE 里回避期内目标的那份另有一个同样大小的上限，超出的放弃并计数。正常关闭
+  （`dfkv_close`，重启也走它）先做同样的清理，最多 `DFKV_RING_REROUTE_CLOSE_MS`（默认 2000，0=不清理），
+  没发出去的计入 `dfkv_client_reroute_cleanup_total{result="abandoned"}` 并打日志。开关关闭时 close 不变。
+- **登记门：** 只有 MDS 客户端登记表里本 group 的每个客户端都带着扇出标记时改道才生效。本版本的库在
+  开关打开时往自己的登记信息里加 `dfkv-remove-fanout=1;poll_ms=<轮询间隔>`。登记表里有不带标记的
+  客户端（旧版本，包括只读的连接器，或者没开这个开关的）、标记里没有 `poll_ms`、登记表的回答超过两个
+  轮询间隔没更新、本客户端没有开 MDS 发现或没有登记，或者轮询间隔小于 1000 ms，改道都关闭（扇出仍然
+  打开）。门的状态看 `dfkv_client_registry_gate_open`，没带标记的客户端数看
+  `dfkv_client_registry_unmarked_clients`，每次由开到关按原因计入
+  `dfkv_client_registry_gate_failures_total{reason}`。
+- **上线方式：** 要用改道，group 里每个登记的客户端都要打开本开关（读客户端也要：门分不清谁会删除）。
+  打开了本开关、但没有开 MDS 发现就登记的客户端不带标记（标记里的轮询间隔来自发现），算作没带标记，
+  让所有客户端的门都关着（安全的一侧）；C API 总是先开发现再登记。
+  不登记的客户端看不见，不在保护范围内：只在所有会删除的客户端都登记的 group 里打开。一个本版本、
+  开关关闭的客户端打开后马上 REMOVE，在门看到它的登记之前（约一次登记加一次轮询加 MDS list 缓存的
+  时长）它的 REMOVE 只到 owner，和今天任何客户端一样。
+- **已知边界：** 一个只存在不到一个轮询间隔的视图，若是唯一给出替补 T 的视图，扇出可能漏掉 T。
+  正常关闭前被杀掉（或关闭超时）的客户端，它写到替补上的副本留到替补把它们淘汰为止。
+- **代价：** 每个 REMOVE 最多 `DFKV_RING_REMOVE_FANOUT`+2 次往返（并行），视图变化时更多；每个写到替补的
+  key 回避期结束时多一次 REMOVE；客户端每次轮询多一次 `kListClients`（MDS 用 list 缓存回答）。
+- 指标：上面各项，加 `dfkv_client_remove_fanout_total{result}`、
+  `dfkv_client_cooldown_reroutes_total{op}`、`dfkv_client_reroute_cleanup_total{result}`。
 
 ### 4d. 成员漂移 / split-brain 巡检
 

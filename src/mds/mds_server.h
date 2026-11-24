@@ -288,6 +288,15 @@ class MdsServer {
   static constexpr uint64_t kStatsPutMs = 60000;
   // Default DFKV_MDS_LIST_CACHE_MS.
   static constexpr uint64_t kListCacheMs = 500;
+  // The client-list cache keeps answers at most this long, whatever
+  // DFKV_MDS_LIST_CACHE_MS says: below the clients' poll interval, which the
+  // cooldown-reroute gate (it reads the client list) requires to be at least
+  // 1000 ms.
+  static constexpr uint64_t kMaxClientListCacheMs = 1000;
+  // DFKV_MDS_LIST_CACHE_MS as resolved (at most 10000) for member lists, and
+  // the client lists' TTL derived from it.
+  static uint64_t ListCacheMs();
+  static uint64_t ClientListCacheMs();
   // Default DFKV_MDS_UNWRITTEN_HOLD_MS: four lease TTLs, the margin the local
   // lease shortcut already gives a registrar rotating over several MDS.
   static constexpr uint64_t kUnwrittenHoldMs =
@@ -326,6 +335,7 @@ class MdsServer {
   // port or stats; it is pure identity ("who is using dfkv").
   Status UpsertClient(const std::string& group, const MemberInfo& m);
   Status ListClients(const std::string& group, std::string* out);
+  Status ListClientsFromEtcd(const std::string& group, std::string* out);
   // Shared by Upsert/UpsertClient. The local cache is only a bounded shortcut
   // over etcd truth; all blocking etcd operations happen outside its mutex.
   // *wrote: the record was written to etcd (not only its lease renewed).
@@ -359,6 +369,7 @@ class MdsServer {
   LocalLeaseMap client_leases_;
   uint64_t stats_put_ms_;  // DFKV_MDS_STATS_PUT_MS, resolved in the ctor
   ListCache list_cache_;   // DFKV_MDS_LIST_CACHE_MS, resolved in the ctor
+  ListCache client_list_cache_;  // ClientListCacheMs(), for ListClients
   bool fencing_;           // DFKV_MDS_FENCING, resolved in the ctor
   // Fenced ids per group, read at most once a second for the heartbeat path
   // (a list reads them afresh). A fence or unfence here drops the group's.

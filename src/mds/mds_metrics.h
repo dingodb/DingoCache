@@ -28,6 +28,7 @@ struct MdsMetrics {
   std::atomic<uint64_t> fenced_refusals{0};
   // Member lists answered from ListCache instead of etcd.
   std::atomic<uint64_t> list_cache_hits{0};
+  std::atomic<uint64_t> client_list_cache_hits{0};
   std::atomic<uint64_t> etcd_errors{0};
   std::atomic<uint64_t> members_last_list{0};  // members returned by the last ListMembers
   // Client (consumer) registration — mirrors the member counters above. Lets the
@@ -82,6 +83,7 @@ struct MdsMetrics {
     m("dfkv_mds_client_register_requests_total", "counter", "Client register ops received", ld(client_register_requests));
     m("dfkv_mds_client_keepalives_total", "counter", "Client heartbeat ops received", ld(client_keepalives));
     m("dfkv_mds_client_list_requests_total", "counter", "ListClients ops served", ld(client_list_requests));
+    m("dfkv_mds_client_list_cache_hits_total", "counter", "Client lists answered from the cache instead of etcd", ld(client_list_cache_hits));
     m("dfkv_mds_clients", "gauge", "Clients returned by the last ListClients", ld(clients_last_list));
     m("dfkv_mds_local_member_leases", "gauge", "Member lease shortcuts currently cached in this MDS process", ld(local_member_leases));
     m("dfkv_mds_local_client_leases", "gauge", "Client lease shortcuts currently cached in this MDS process", ld(local_client_leases));

@@ -57,6 +57,17 @@ class ScriptedTopologyMds {
     members_ = std::move(members);
   }
 
+  // The client registry kListClients answers with (empty by default), and
+  // the payloads of the client registrations received.
+  void SetClients(std::vector<MemberInfo> clients) {
+    std::lock_guard<std::mutex> lock(mu_);
+    clients_ = std::move(clients);
+  }
+  std::vector<std::string> ClientRegistrations() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return registrations_;
+  }
+
   // Answer every request with this status and no member list (an MDS that
   // withholds its list); kOk resumes normal answers.
   void SetStatus(Status status) {
@@ -88,9 +99,16 @@ class ScriptedTopologyMds {
       ReqFields request{};
       bool ok = net::ReadAll(fd, prefix, sizeof(prefix)) &&
                 DecodeReq(prefix, &request);
+      std::string payload;
       if (ok && request.payload_len != 0) {
-        std::string payload(request.payload_len, '\0');
+        payload.assign(request.payload_len, '\0');
         ok = net::ReadAll(fd, &payload[0], payload.size());
+      }
+      if (ok && (request.op == static_cast<uint8_t>(WireOp::kClientRegister) ||
+                 request.op ==
+                     static_cast<uint8_t>(WireOp::kClientHeartbeat))) {
+        std::lock_guard<std::mutex> lock(mu_);
+        registrations_.push_back(payload);
       }
       if (ok) {
         if (request.op != static_cast<uint8_t>(WireOp::kListTopology))
@@ -99,7 +117,9 @@ class ScriptedTopologyMds {
         Status status = Status::kOk;
         {
           std::lock_guard<std::mutex> lock(mu_);
-          members = members_;
+          members = request.op == static_cast<uint8_t>(WireOp::kListClients)
+                        ? clients_
+                        : members_;
           status = status_;
         }
         const std::string data =
@@ -125,6 +145,8 @@ class ScriptedTopologyMds {
   mutable std::mutex mu_;
   std::condition_variable cv_;
   std::vector<MemberInfo> members_;
+  std::vector<MemberInfo> clients_;
+  std::vector<std::string> registrations_;
   Status status_ = Status::kOk;
   size_t answered_ = 0;
   std::atomic<bool> only_topology_requests_{true};

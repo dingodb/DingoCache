@@ -1,6 +1,6 @@
 # Unavailable owners: absent grace, cooldown reroute, recent-REMOVE memory, read-back
 
-Status: design, revision 8 (stage C reviewed). Stage A is
+Status: design, revision 8 (stage C reviewed). Stages A and C are
 implemented; the rest is design. Each
 mechanism sits behind its own switch, off by default; none changes a released
 binary. A and C are client-side only. The recent-REMOVE memory (M) adds one
@@ -184,13 +184,19 @@ in cooldown, chosen by the rule below. A miss at the substitute is a miss
   substituted; V1 adds N before T; much later a REMOVE under V1 walks to
   its third stable member and misses T; V2 drops N; a new episode
   substitutes T and serves K. So each client records the keys it wrote (PUT
-  or RETAIN SET) to a substitute, per (owner, episode), at most
-  `DFKV_RING_REROUTE_KEYS` in total (default 65536). At the cap, further
-  rerouted PUTs are refused (a miss for the caller, counted); nothing is
-  written to a substitute untracked. When the episode ends (the owner's
-  cooldown expires, or the gate closes), the client REMOVEs those keys from
-  their substitutes; a failure goes to stage A's per-member queue (sent from
-  the tick, cleanup only). A substitute copy therefore lives at most one
+  or RETAIN SET) to a substitute, per (owner, episode); an episode is one
+  cooldown, named by PeerHealth's cooldown end, so a failed trial that starts
+  the next cooldown starts a new episode. When an episode ends (it is not
+  the owner's running cooldown any more, or the gate closed), the client
+  REMOVEs its keys from their substitutes; they stay in an episode-cleanup
+  queue by node until each REMOVE is confirmed (sent from the tick once the
+  node does not cool), no read finds them meanwhile, and they are given up
+  only at close. Tracked and queued keys together are at most
+  `DFKV_RING_REROUTE_KEYS` (default 65536); at the cap, further rerouted
+  PUTs are refused (a miss for the caller, counted), so nothing is written
+  to a substitute that could not be cleaned up. The cooling parts of
+  fan-out REMOVEs (below) go to a separate queue with a bound of the same
+  size, past which they are given up and counted. A substitute copy therefore lives at most one
   episode plus its cleanup, and no later episode finds it. Cost: one REMOVE
   per key written to a substitute. A clean close (`dfkv_close`, which a
   restart goes through) runs the same cleanup for every open episode first,
@@ -205,8 +211,8 @@ in cooldown, chosen by the rule below. A miss at the substitute is a miss
   drainer and every fan-out target (counted as above). A target that cools in
   this client, or that fails, makes the REMOVE not ok; the owner included
   (today a REMOVE to a cooling owner already fails at once, without a
-  dial). A cooling target's part is still queued (stage A's queue, by
-  member) and sent from the poll thread's tick once its cooldown has
+  dial). A cooling target's part is still queued (the fan-out cleanup
+  queue, by node) and sent from the poll thread's tick once its cooldown has
   expired, for cleanup only: it is never grounds for ok. The one exception
   is the absent owner (§3.1): its part goes to its queue entry and does not
   decide the result, since no reader asks an absent member until B, and B
@@ -243,13 +249,13 @@ in cooldown, chosen by the rule below. A miss at the substitute is a miss
     every poll. A registry answer older than two poll intervals fails the
     gate (C and B off until a fresh one passes); so does a client that
     cannot see the registry (no MDS discovery, or registration off).
-  - **Cost and staleness.** The MDS answers `kListClients` from the
-    per-group list cache that serves `kListMembers` (`DFKV_MDS_LIST_CACHE_MS`),
-    invalidated by a client register or deregister on that MDS; the wire is
-    unchanged. The cache TTL is capped below the member-poll interval: the
-    MDS clamps `DFKV_MDS_LIST_CACHE_MS` to at most 1000 ms (with a WARNING),
-    and C and B stay off (with a WARNING) on a client polling faster than
-    every 1000 ms. With several MDS
+  - **Cost and staleness.** The MDS answers `kListClients` from a
+    per-group client-list cache like the one that serves `kListMembers`,
+    invalidated by a client record this MDS writes; the wire is unchanged.
+    Its TTL is `DFKV_MDS_LIST_CACHE_MS`, at most 1000 ms (below the
+    member-poll interval; the member-list cache keeps its own range, at most
+    10000 ms), and C and B stay off (with a WARNING) on a client polling
+    faster than every 1000 ms. With several MDS
     instances an invalidation is local to the one that handled it, so another
     may serve a list up to the TTL old; the unsafe direction is a new
     unmarked client hidden from the gate, which extends the window below by
@@ -428,8 +434,9 @@ current owner may ask the previous owner once.
 - **Wire and disk.** A and C: unchanged. M: one new op (§3.3); servers
   without it answer `kInvalid`, which disables B (fail closed). The MDS
   protocol is unchanged (C reads the existing client registry; the marker
-  rides its existing info string). The MDS serves `kListClients` from its
-  list cache, whose TTL is capped at 1000 ms (§3.2).
+  rides its existing info string). The MDS serves `kListClients` from a
+  client-list cache whose TTL is at most 1000 ms (§3.2); member lists are
+  cached as before.
 - **Older clients** route by the plain ring and see no difference. With
   C-enabled clients present they read a cooling owner's rerouted keys as
   misses, as today. Their REMOVEs do not fan out, which is why C is gated on
@@ -584,9 +591,13 @@ removed afterwards.
   follows the largest marked poller (one `poll_max` for B and C; when S
   grows, C and B wait until the history spans it, and a shrink waits one old
   S); a clean close runs the episode-end cleanup, bounded and counted; the MDS serves the client registry from its
-  list cache with the TTL capped at 1000 ms and the gate's window states
+  client-list cache with its TTL capped at 1000 ms and the gate's window states
   it; rollout needs C or B on every registered client (no fan-out-only
-  switch); eight more measurement cases.
+  switch); eight more measurement cases. With stage C's code: an episode is
+  one cooldown (named by its end), so a failed trial ends the episode
+  before it; episode cleanups wait in their own queue, never given up
+  outside close and bounded together with the tracked keys; cooling
+  fan-out parts have a separate queue; the cleanup queues are by node.
 - Revision 7 (stage A's measurement): A does not read an absent member after
   a miss (a fresh remover's REMOVE does not reach it); that read moves to B
   under its rules. A REMOVE an absent member missed is sent when it returns,

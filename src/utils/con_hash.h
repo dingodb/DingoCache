@@ -4,6 +4,7 @@
 #ifndef DFKV_CON_HASH_H_
 #define DFKV_CON_HASH_H_
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -21,7 +22,15 @@ class ConHash {
   // example outside a lock).
   static uint32_t KeyHash(const std::string& key);
   bool LookupHash(uint32_t hash, std::string* node) const;
+  // The distinct nodes clockwise from `hash`, the owner first: `visit` is
+  // called for each until it returns false or every node was visited.
+  template <typename Visit>
+  void Walk(uint32_t hash, Visit visit) const;
   size_t NodeCount() const { return nodes_.size(); }
+  // The nodes as added: (name, weight).
+  const std::vector<std::pair<std::string, int>>& Nodes() const {
+    return nodes_;
+  }
   size_t RingSize() const { return points_.size(); }
   // Points two vnodes hashed to: the node added later owns them (so the
   // order members are added in decides those points).
@@ -37,6 +46,27 @@ class ConHash {
   std::vector<std::pair<uint32_t, uint32_t>> points_;
   size_t collisions_ = 0;
 };
+
+template <typename Visit>
+void ConHash::Walk(uint32_t hash, Visit visit) const {
+  if (points_.empty()) return;
+  size_t at = static_cast<size_t>(
+      std::lower_bound(points_.begin(), points_.end(), hash,
+                       [](const std::pair<uint32_t, uint32_t>& point,
+                          uint32_t value) { return point.first < value; }) -
+      points_.begin());
+  std::vector<bool> seen(nodes_.size(), false);
+  size_t distinct = 0;
+  for (size_t step = 0; step < points_.size() && distinct < nodes_.size();
+       ++step, ++at) {
+    if (at == points_.size()) at = 0;
+    const uint32_t index = points_[at].second;
+    if (seen[index]) continue;
+    seen[index] = true;
+    ++distinct;
+    if (!visit(nodes_[index].first)) return;
+  }
+}
 
 }  // namespace dfkv
 

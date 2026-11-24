@@ -75,12 +75,8 @@ uint64_t MdsMemberPoller::NowMs() const {
       .count();
 }
 
-bool MdsMemberPoller::Query(std::vector<MemberInfo>* out, uint64_t* epoch) {
-  const uint64_t now = NowMs();
-  const std::string ep = eps_.Pick(now);
-  if (ep.empty()) return false;
-
-  auto request = [&](WireOp op, Status* status, std::string* data) {
+bool MdsMemberPoller::Request(const std::string& ep, WireOp op,
+                              Status* status, std::string* data) {
     const int fd = net::Dial(ep, io_ms_, io_ms_);
     if (fd < 0) return false;
 
@@ -103,6 +99,41 @@ bool MdsMemberPoller::Query(std::vector<MemberInfo>* out, uint64_t* epoch) {
     }
     ::close(fd);
     return ok;
+}
+
+bool MdsMemberPoller::QueryClients(std::vector<MemberInfo>* out) {
+  const uint64_t now = NowMs();
+  const std::string ep = eps_.Pick(now);
+  if (ep.empty()) return false;
+  Status status = Status::kInvalid;
+  std::string data;
+  uint64_t epoch = 0;
+  if (!Request(ep, WireOp::kListClients, &status, &data) ||
+      status != Status::kOk ||
+      !DecodeMembers(data.data(), data.size(), out, &epoch)) {
+    eps_.MarkFailed(ep, now);
+    return false;
+  }
+  eps_.MarkOk(ep);
+  return true;
+}
+
+void MdsMemberPoller::SetRegistry(OnRegistry cb) { registry_cb_ = std::move(cb); }
+
+void MdsMemberPoller::PollRegistry() {
+  if (!registry_cb_) return;
+  std::vector<MemberInfo> clients;
+  const bool ok = QueryClients(&clients);
+  registry_cb_(ok, clients);
+}
+
+bool MdsMemberPoller::Query(std::vector<MemberInfo>* out, uint64_t* epoch) {
+  const uint64_t now = NowMs();
+  const std::string ep = eps_.Pick(now);
+  if (ep.empty()) return false;
+
+  auto request = [&](WireOp op, Status* status, std::string* data) {
+    return Request(ep, op, status, data);
   };
 
   Status status = Status::kInvalid;
@@ -229,12 +260,14 @@ void MdsMemberPoller::Loop() {
   if (!tick_) {
     while (running_.load()) {
       ReportHealth(PollOnce());
+      PollRegistry();
       if (WaitMs(poll_ms_)) return;
     }
     return;
   }
   while (running_.load()) {
     ReportHealth(PollOnce());
+    PollRegistry();
     const uint64_t next_poll = NowMs() + static_cast<uint64_t>(poll_ms_);
     for (;;) {
       tick_();

@@ -234,6 +234,53 @@ TEST(MdsEtcdWrites, MemberListsShareOneRangePerInterval) {
   mds.Stop();
 }
 
+// The client registry (kListClients, read by the cooldown-reroute gate at
+// every client poll) is served from the same cache; a client registration
+// written here is in the next answer.
+TEST(MdsEtcdWrites, ClientListsShareOneRangePerInterval) {
+  ScopedEnv cache("DFKV_MDS_LIST_CACHE_MS", "1000");
+  FakeEtcd etcd;
+  MdsServer mds(etcd.ep());
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  auto clients = [&] {
+    Status st = Status::kInvalid;
+    std::string data;
+    std::set<std::string> ids;
+    EXPECT_TRUE(DoReq(mds.port(), WireOp::kListClients, "g", &st, &data));
+    std::vector<MemberInfo> members;
+    uint64_t epoch = 0;
+    if (st == Status::kOk &&
+        DecodeMembers(data.data(), data.size(), &members, &epoch))
+      for (const auto& m : members) ids.insert(m.id);
+    return ids;
+  };
+  const MemberInfo c1{"c1", "0.0.0.0", 0, 0}, c2{"c2", "0.0.0.0", 0, 0};
+  ASSERT_EQ(Beat(mds, WireOp::kClientRegister, "g", c1), Status::kOk);
+  const double ranges = EtcdOps(mds, "range");
+  for (int i = 0; i < 4; ++i)
+    EXPECT_EQ(clients(), (std::set<std::string>{"c1"}));
+  EXPECT_EQ(EtcdOps(mds, "range"), ranges + 1);
+  EXPECT_EQ(Metric(mds, "dfkv_mds_client_list_cache_hits_total"), 3);
+  ASSERT_EQ(Beat(mds, WireOp::kClientRegister, "g", c2), Status::kOk);
+  EXPECT_EQ(clients(), (std::set<std::string>{"c1", "c2"}))
+      << "a client registered here waited for the cache";
+  mds.Stop();
+}
+
+// Member lists keep DFKV_MDS_LIST_CACHE_MS as before (at most 10000 ms);
+// client lists use it at most 1000 ms, below the clients' poll interval.
+TEST(MdsEtcdWrites, OnlyTheClientListCacheIsCappedAtOneSecond) {
+  ScopedEnv cache("DFKV_MDS_LIST_CACHE_MS", "5000");
+  EXPECT_EQ(MdsServer::ListCacheMs(), 5000u);
+  EXPECT_EQ(MdsServer::ClientListCacheMs(), 1000u);
+  ScopedEnv cache2("DFKV_MDS_LIST_CACHE_MS", "20000");
+  EXPECT_EQ(MdsServer::ListCacheMs(), 10000u);
+  EXPECT_EQ(MdsServer::ClientListCacheMs(), 1000u);
+  ScopedEnv cache3("DFKV_MDS_LIST_CACHE_MS", "700");
+  EXPECT_EQ(MdsServer::ListCacheMs(), 700u);
+  EXPECT_EQ(MdsServer::ClientListCacheMs(), 700u);
+}
+
 // MDS-04: a change of drain alone is a record change, written at once
 // (not held for DFKV_MDS_STATS_PUT_MS like stats), and both it and a
 // kDeregister are in the next list despite the list cache.
