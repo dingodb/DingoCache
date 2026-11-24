@@ -415,6 +415,9 @@ Status RdmaServer::Start(int port) {
     initialized_stats.push_back(std::make_unique<RailStats>());
   anchors_ = std::move(initialized_anchors);
   rail_stats_ = std::move(initialized_stats);
+  rail_retry_peers_.clear();
+  for (size_t i = 0; i < anchor_devs_.size(); ++i)
+    rail_retry_peers_.push_back(std::make_unique<PeerWindow>());
   recv_segment_registered_rails_ = anchors_.size();
   LogTopologySummary(requested_devices.size(), anchors_.size(),
                      discovery.devices);
@@ -2016,6 +2019,12 @@ void RdmaServer::Serve(
     rail_stats.completion_errors.fetch_add(1, std::memory_order_relaxed);
     rail_stats.wc_errors[rdma::WcStatusSlot(wc.status)].fetch_add(
         1, std::memory_order_relaxed);
+    // Retries ran out toward this peer: its IP address, once, for the
+    // per-rail count of distinct addresses (many on one rail point at the
+    // rail's path, one at that peer; pods of one host count separately).
+    if (wc.status == IBV_WC_RETRY_EXC_ERR ||
+        wc.status == IBV_WC_RNR_RETRY_EXC_ERR)
+      rail_retry_peers_[rail_index]->Note(PeerHost(peer_addr), SteadyUs() / 1000);
     DFKV_LOG_WARN(
         "rdma server CQ failure loop=" + std::string(loop) +
         " status=" + std::to_string(wc.status) +
@@ -2767,6 +2776,17 @@ std::string RdmaServer::MetricsText() const {
               [](const RailStats& r) {
                 return r.completion_errors.load(std::memory_order_relaxed);
               });
+  {
+    const uint64_t now_ms = SteadyUs() / 1000;
+    s += "# HELP dfkv_rdma_rail_retry_exhausted_peers Distinct peer addresses whose "
+         "connection on this device ended with RETRY_EXC or RNR_RETRY_EXC in "
+         "the last 30 s\n";
+    s += "# TYPE dfkv_rdma_rail_retry_exhausted_peers gauge\n";
+    for (size_t i = 0; i < rail_retry_peers_.size(); ++i)
+      s += "dfkv_rdma_rail_retry_exhausted_peers{dev=\"" +
+           PromLabelEscape(anchor_devs_[i]) + "\"} " +
+           std::to_string(rail_retry_peers_[i]->Count(now_ms)) + "\n";
+  }
   // Lazily populated: a series appears with its first failure, so the label
   // set stays at (devices x statuses that actually occurred).
   s += "# HELP dfkv_rdma_rail_wc_errors_total RDMA error completions on each "

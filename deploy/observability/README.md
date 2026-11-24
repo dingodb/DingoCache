@@ -99,7 +99,8 @@ Rules are visible under Prometheus **Alerts** and as the `ALERTS` series. This
 local stack intentionally does not embed an Alertmanager destination; production
 deployments must route Prometheus alerts to their existing Alertmanager/on-call
 system. `promtool check config` validates both `prometheus.yml` and `alerts.yml`
-in CI.
+in CI, and `promtool test rules alerts_test.yml` evaluates rules against
+sample series there.
 
 
 ## Dashboards

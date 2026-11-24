@@ -111,6 +111,19 @@ groups:
         annotations:
           summary: "dfkv server RDMA completion errors"
           description: "{{ $labels.instance }} has failing RDMA completions."
+      # Retries running out toward several peer addresses on one device,
+      # while it is a single one when the cause is that peer (a killed or
+      # hung client): the device's path is suspect. The gauge covers 30 s and
+      # clients stop using the device soon after a burst, so the rule looks
+      # at its maximum over 5 minutes rather than waiting for it to hold.
+      # Observation only: placement is not changed by it.
+      - alert: DfkvRdmaRailRetriesExhaustedForManyPeers
+        expr: max_over_time(dfkv_rdma_rail_retry_exhausted_peers[5m]) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv RDMA retries exhausted toward several peers on one device"
+          description: "{{ $labels.instance }} device {{ $labels.dev }}: connections from up to {{ $value }} distinct peer IP addresses within 30 s (in the last 5 minutes) ended with RETRY_EXC or RNR_RETRY_EXC. Addresses, not hosts: clients in separate pods of one host count separately. One address is usually that client; several on one device while the node's other devices stay clean point at that device's port, cable or switch path. Compare dfkv_rdma_rail_wc_errors_total{dev} across devices and the server log lines 'rdma server CQ failure ... dev=... peer=...'."
       - alert: DfkvRdmaReceiveSegmentLow
         expr: ((dfkv_rdma_recv_segment_max_bytes - dfkv_rdma_recv_segment_used_bytes) / dfkv_rdma_recv_segment_max_bytes) < 0.1 and dfkv_rdma_recv_segment_max_bytes > 0
         for: 2m

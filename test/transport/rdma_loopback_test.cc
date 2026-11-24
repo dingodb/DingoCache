@@ -7676,6 +7676,49 @@ static void ExerciseServerFailedCompletionAttribution(bool use_uring) {
       << logs;
 }
 
+// A connection ending in RETRY_EXC counts its peer host on its device's
+// retry-exhausted gauge, once however many of its connections fail that
+// way, and for no other device.
+TEST(RdmaLoopback, RetryExhaustedConnectionsCountTheirPeerHostOnce) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "500");
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  std::atomic<int> rewritten{0};
+  RdmaNode node("retry-peers", kMaxMsg, false, false, {},
+                [&](ibv_wc* batch, int* count, size_t) {
+                  if (*count <= 0 || rewritten.load() >= 3) return;
+                  rewritten.fetch_add(1);
+                  batch[0].status = IBV_WC_RETRY_EXC_ERR;
+                });
+  RdmaTransport rt(kMaxMsg, rail);
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+  for (int attempt = 0; attempt < 20 && node.rsrv->CompletionErrors() < 3;
+       ++attempt) {
+    const uint64_t before = node.rsrv->CompletionErrors();
+    (void)rt.ExistMany(node.addr, keys, &exists);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (node.rsrv->CompletionErrors() == before &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_GE(node.rsrv->CompletionErrors(), 3u);
+  const std::string metrics = node.rsrv->MetricsText();
+  for (const auto& dev : node.rsrv->DeviceNames()) {
+    const std::string line =
+        "dfkv_rdma_rail_retry_exhausted_peers{dev=\"" + dev + "\"} ";
+    const size_t at = metrics.find(line);
+    ASSERT_NE(at, std::string::npos) << dev;
+    EXPECT_EQ(std::stol(metrics.substr(at + line.size())), dev == rail ? 1 : 0)
+        << "three failed connections from one host count it once: " << dev;
+  }
+}
+
 TEST(RdmaLoopback, ServerFailedCompletionNamesPeerDeviceAndStatusSync) {
   ExerciseServerFailedCompletionAttribution(false);
 }

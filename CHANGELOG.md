@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Server, RDMA: `dfkv_rdma_rail_retry_exhausted_peers{dev}`, the distinct
+  peer IP addresses whose connection on a device ended with RETRY_EXC or
+  RNR_RETRY_EXC in the last 30 s (addresses, not QPs, so clients in
+  separate pods of one host count separately; at most 64 a device), and
+  the alert `DfkvRdmaRailRetriesExhaustedForManyPeers` (a maximum of 3 or
+  more within 5 minutes: clients stop using the device soon after a burst).
+  One address is usually that client; several on one device while the
+  node's others stay clean point at that device's path, which a port check
+  (ACTIVE) does not see. Observation only: placement is unchanged.
+
 
 - Client: `GetAuto` into a `std::string` (used by `dfkvctl get`) no longer
   zero-fills its whole bound (64 MiB by default) before each read; that cost

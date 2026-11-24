@@ -122,6 +122,11 @@ jobs:
             dfkv-ci/prometheus:ci \
             check config /etc/prometheus/prometheus.yml
           docker run --rm \
+            -v "$PWD/deploy/observability:/etc/prometheus:ro" \
+            --entrypoint promtool \
+            dfkv-ci/prometheus:ci \
+            test rules /etc/prometheus/alerts_test.yml
+          docker run --rm \
             -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
             dfkv-ci/otel-collector:ci \
             validate --config=/etc/dfkv-observability/otel-collector-config.yaml

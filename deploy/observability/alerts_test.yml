@@ -1,0 +1,31 @@
+# promtool test rules alerts_test.yml (run in CI next to `promtool check`).
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 15s
+
+tests:
+  # One 30 s burst: three peer addresses on one device, then the clients
+  # stop using it and the gauge falls back to 0. The alert must still fire.
+  - interval: 15s
+    input_series:
+      - series: 'dfkv_rdma_rail_retry_exhausted_peers{instance="node-a:9100",dev="rail-0"}'
+        values: '0 0 3 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      # One peer address only (a killed client): no alert.
+      - series: 'dfkv_rdma_rail_retry_exhausted_peers{instance="node-a:9100",dev="rail-1"}'
+        values: '0 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: DfkvRdmaRailRetriesExhaustedForManyPeers
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: node-a:9100
+              dev: rail-0
+            exp_annotations:
+              summary: "dfkv RDMA retries exhausted toward several peers on one device"
+              description: "node-a:9100 device rail-0: connections from up to 3 distinct peer IP addresses within 30 s (in the last 5 minutes) ended with RETRY_EXC or RNR_RETRY_EXC. Addresses, not hosts: clients in separate pods of one host count separately. One address is usually that client; several on one device while the node's other devices stay clean point at that device's port, cable or switch path. Compare dfkv_rdma_rail_wc_errors_total{dev} across devices and the server log lines 'rdma server CQ failure ... dev=... peer=...'."
+      # Over five minutes after the burst: resolved.
+      - eval_time: 8m
+        alertname: DfkvRdmaRailRetriesExhaustedForManyPeers
+        exp_alerts: []

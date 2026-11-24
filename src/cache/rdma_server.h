@@ -28,6 +28,7 @@
 #include "cache/uring_reader.h"
 #endif
 #include "cache/ram_tier.h"
+#include "cache/rail_peer_window.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -365,6 +366,11 @@ class RdmaServer {
   std::mutex stop_mu_;  // serializes Quiesce() and the release in Stop()
   std::vector<std::string> anchor_devs_;  // fixed resolved rail names
   std::vector<std::unique_ptr<RailStats>> rail_stats_;  // indexed with anchor_devs_
+  // Per rail: peer IP addresses whose connection ended in RETRY_EXC or
+  // RNR_RETRY_EXC in the last 30 s (dfkv_rdma_rail_retry_exhausted_peers).
+  // Observation only; a design question is whether many of them on one rail
+  // should take it out of placement.
+  std::vector<std::unique_ptr<PeerWindow>> rail_retry_peers_;
   // Narrow hardware-free startup seams, private and reachable only through the
   // test peer. Production always calls verbs discovery and materializes real
   // anchors.
