@@ -597,6 +597,14 @@ Status KVStore::Remove(const BlockKey& key) {
   return Status::kOk;
 }
 
+bool KVStore::SyncRemovals() {
+  const int fd =
+      ::open(opt_.cache_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  const bool ok = fd >= 0 && ::syncfs(fd) == 0;
+  if (fd >= 0) ::close(fd);
+  return ok;
+}
+
 Status KVStore::CacheDirect(const BlockKey& key, char* data, size_t len,
                             size_t cap) {
   if (!healthy_) return Status::kIOError;

@@ -1311,6 +1311,7 @@ struct RestartableGroup {
   std::vector<std::string> spelled;
   std::function<bool(const std::string&)> record_location;
   std::function<Status(size_t, const BlockKey&)> misplaced_remove;
+  std::function<bool(size_t)> sync_removals;
 
   void Open() {
     const std::vector<std::string> names = spelled.empty() ? dirs : spelled;
@@ -1321,6 +1322,7 @@ struct RestartableGroup {
     DiskCacheGroup::Options options{names, dirs.size() * (64ull << 20), "slab"};
     options.record_location_for_test = record_location;
     options.misplaced_remove_for_test = misplaced_remove;
+    options.sync_removals_for_test = sync_removals;
     options.engine_factory =
         [this, names](const std::string& dir,
                       uint64_t capacity) -> std::unique_ptr<StoreEngine> {
@@ -1593,6 +1595,68 @@ TEST_F(DiskGroupTest, ADiskThatKeptAStaleTakeoverValueTakesNoKeysThisRun) {
   EXPECT_EQ(g.Get(key), 0);
   g.group.reset();
   EXPECT_TRUE(fs::exists(dirs_record(g.dirs[3 - holder]))) << "kept";
+}
+
+// Disks excluded from takeover do not count toward DFKV_DEGRADED_MIN_DISKS:
+// with every healthy disk excluded, a failed disk's keys would fail while the
+// node looked healthy. It leaves placement instead.
+TEST_F(DiskGroupTest, DisksExcludedFromTakeoverDoNotCountTowardTheMinimum) {
+  RestartableGroup g{RestartableGroup::kSlab, Dirs(3)};
+  ASSERT_NO_FATAL_FAILURE(g.Open());
+  std::vector<BlockKey> homed_on_0;
+  for (uint64_t id = 1; homed_on_0.size() < 64; ++id)
+    if (g.group->DiskIndexOf(BlockKey{id, 0}) == 0)
+      homed_on_0.push_back(BlockKey{id, 0});
+  ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+  std::vector<int> held(3, 0);  // disk 0's keys each other disk took over
+  for (const BlockKey& key : homed_on_0) {
+    ASSERT_EQ(g.Put(key, '2'), Status::kOk);
+    ++held[g.group->DiskIndexOf(key)];
+  }
+  ASSERT_GT(held[1], 0);
+  ASSERT_GT(held[2], 0);
+  g.group.reset();
+  g.misplaced_remove = [](size_t, const BlockKey&) { return Status::kIOError; };
+  ASSERT_NO_FATAL_FAILURE(g.Open());
+  ASSERT_TRUE(g.group->TakesNoOtherDisksKeys(1));
+  ASSERT_TRUE(g.group->TakesNoOtherDisksKeys(2));
+  EXPECT_TRUE(g.group->Healthy()) << "each disk serves its own keys";
+  ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+  EXPECT_FALSE(g.group->Healthy())
+      << "two healthy disks, but none takes the failed disk's keys";
+  EXPECT_EQ(g.group->DiskIndexOf(homed_on_0[0]), 0u);
+  EXPECT_NE(g.Put(homed_on_0[0], '3'), Status::kOk);
+  g.group.reset();
+  g.misplaced_remove = nullptr;
+}
+
+// The keys the start after a failed run drops from a disk that is not their
+// home stay dropped after a power loss only once the engine synced the
+// removal (the file engine's REMOVE renames without a directory sync). Until
+// it did, the record stays: a clean close does not clear it.
+TEST_F(DiskGroupTest, AnUnsyncedNotHomeRemovalKeepsTheRecord) {
+  for (const bool synced : {true, false}) {
+    SCOPED_TRACE(synced ? "synced" : "not synced");
+    fs::remove_all(base_);
+    RestartableGroup g{RestartableGroup::kSlab, Dirs(2)};
+    ASSERT_NO_FATAL_FAILURE(g.Open());
+    const BlockKey key = g.HomedOn(0);
+    ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+    ASSERT_EQ(g.Put(key, '2'), Status::kOk);  // on disk 1
+    g.group.reset();
+    std::vector<int> syncs(2, 0);
+    g.sync_removals = [&](size_t disk) {
+      ++syncs[disk];
+      return synced;
+    };
+    ASSERT_NO_FATAL_FAILURE(g.Open());
+    EXPECT_EQ(g.group->OpenMisplacedKeys(), 1u);
+    EXPECT_EQ(syncs, (std::vector<int>{0, 1})) << "the disk that dropped a key";
+    EXPECT_EQ(g.Get(key), 0);
+    g.group.reset();  // a clean close, no disk failed in this run
+    EXPECT_EQ(fs::exists(dirs_record(g.dirs[1])), !synced);
+    g.sync_removals = nullptr;
+  }
 }
 
 // Ids are canonical: the same directories spelled with a trailing slash in

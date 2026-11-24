@@ -541,6 +541,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   reset_.assign(disks_.size(), false);
   no_takeover_.assign(disks_.size(), false);
   misplaced_remove_for_test_ = opt.misplaced_remove_for_test;
+  sync_removals_for_test_ = opt.sync_removals_for_test;
   record_location_for_test_ = opt.record_location_for_test;
   if (disks_.size() > 1) {
     auto points = ring_.NodePointCounts();
@@ -623,8 +624,17 @@ std::vector<DiskCacheGroup::CloseReport> DiskCacheGroup::Close() {
 }
 
 bool DiskCacheGroup::Healthy() const {
-  return healthy_ && !record_failed_.load(std::memory_order_acquire) &&
-         disks_.size() - FailedDisks() >= min_healthy_disks_;
+  if (!healthy_ || record_failed_.load(std::memory_order_acquire)) return false;
+  const size_t failed = FailedDisks();
+  if (failed == 0) return disks_.size() >= min_healthy_disks_;
+  // A failed disk's keys go to the healthy disks that take other disks' keys:
+  // one excluded from takeover (DropMisplacedKeys) serves only its own, so it
+  // does not count. Otherwise those keys would fail while the node looks
+  // healthy.
+  size_t takers = 0;
+  for (size_t i = 0; i < disks_.size(); ++i)
+    takers += disks_[i]->Healthy() && !no_takeover_[i] ? 1 : 0;
+  return takers >= min_healthy_disks_;
 }
 
 size_t DiskCacheGroup::FailedDisks() const {
@@ -872,6 +882,7 @@ void DiskCacheGroup::DropMisplacedKeys() {
   const auto started = std::chrono::steady_clock::now();
   const size_t n = disks_.size();
   std::vector<uint64_t> misplaced(n, 0), refused(n, 0);
+  std::vector<bool> unsynced(n, false);
   auto drop_one = [&](size_t i) {
     if (reset_[i]) return;
     std::vector<BlockKey> keys;
@@ -885,6 +896,12 @@ void DiskCacheGroup::DropMisplacedKeys() {
       if (st != Status::kOk && st != Status::kNotFound) ++refused[i];
       else ++misplaced[i];
     }
+    // The record is cleared at a clean close of this run: by then a power
+    // loss must not bring these keys back (the file engine's REMOVE is not
+    // durable by itself).
+    if (misplaced[i] != 0)
+      unsynced[i] = !(sync_removals_for_test_ ? sync_removals_for_test_(i)
+                                              : disks_[i]->SyncRemovals());
   };
   std::vector<std::thread> helpers;
   for (size_t i = 1; i < n; ++i) {
@@ -908,8 +925,15 @@ void DiskCacheGroup::DropMisplacedKeys() {
                     "other disks could not be removed; it takes no other "
                     "disk's keys in this run");
     }
+    // Removed for this run, but a power loss could bring them back: the
+    // record stays for the next start.
+    if (unsynced[i]) {
+      open_drop_incomplete_ = true;
+      DFKV_LOG_WARN(ids_[i] + ": the removal of keys of other disks could "
+                    "not be synced; the records are kept for the next start");
+    }
   }
-  open_drop_incomplete_ = refused_total != 0;
+  if (refused_total != 0) open_drop_incomplete_ = true;
   char text[64];
   std::snprintf(text, sizeof(text), " in %.1f ms",
                 std::chrono::duration<double, std::milli>(

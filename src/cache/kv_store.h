@@ -86,6 +86,8 @@ class KVStore : public StoreEngine {
   // (dfkv_remove / DfkvL2Adapter.delete); distinct from capacity eviction so
   // it does NOT touch the eviction counters.
   Status Remove(const BlockKey& key) override;
+  // A REMOVE renames the file away without syncing a directory: syncfs.
+  bool SyncRemovals() override;
 
   uint64_t UsedBytes() const override;
   uint64_t TenantUsedBytes(uint64_t tenant_hash) const override;

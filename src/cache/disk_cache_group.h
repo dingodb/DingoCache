@@ -57,6 +57,8 @@ class DiskCacheGroup {
     // its home, at the start after a run with failed disks.
     std::function<Status(size_t disk, const BlockKey&)>
         misplaced_remove_for_test{};
+    // Test seam: replaces the SyncRemovals of a disk after those Removes.
+    std::function<bool(size_t disk)> sync_removals_for_test{};
   };
 
   explicit DiskCacheGroup(Options opt);
@@ -79,7 +81,8 @@ class DiskCacheGroup {
   // (and the group unhealthy) if a disk could not be activated.
   bool Activate();
   // Started, and at least DFKV_DEGRADED_MIN_DISKS (default 1) disks have
-  // not failed. A disk store that fails for good while serving (it refuses
+  // not failed; once one has, only those that take other disks' keys count
+  // (see TakesNoOtherDisksKeys). A disk store that fails for good while serving (it refuses
   // every write until the process is restarted) loses its keys: while the
   // group is healthy they are routed to the healthy disks, where they miss
   // until they are written again. Keys of healthy disks never move.
@@ -274,6 +277,7 @@ class DiskCacheGroup {
   // disk's keys in this run.
   std::vector<bool> no_takeover_;
   std::function<Status(size_t, const BlockKey&)> misplaced_remove_for_test_;
+  std::function<bool(size_t)> sync_removals_for_test_;
   std::function<bool(const std::string&)> record_location_for_test_;
   uint64_t open_emptied_keys_ = 0;
   uint64_t open_misplaced_keys_ = 0;
