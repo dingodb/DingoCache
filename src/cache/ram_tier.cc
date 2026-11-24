@@ -1751,8 +1751,10 @@ void RamTier::FlushLoop(Shard& s) {
               entry.flush_pin = false;
             }
             if (opt_.flush_given_up) opt_.flush_given_up(item.key);
-            DropLocked(s, item.key);
+            // Counted before the drop: the drop is what a WaitForDrain sees.
             flush_no_room_dropped_.fetch_add(1, std::memory_order_relaxed);
+            DropLocked(s, item.key);
+            if (after_drop_for_test_) after_drop_for_test_();
             CompletePut(completion, FlushOutcome::kNoRoom);
           }
         } else if (Refused(result[i])) {
@@ -1766,8 +1768,9 @@ void RamTier::FlushLoop(Shard& s) {
             entry.flush_pin = false;
           }
           if (opt_.flush_given_up) opt_.flush_given_up(batch[i].key);
-          DropLocked(s, batch[i].key);
           flush_refused_.fetch_add(1, std::memory_order_relaxed);
+          DropLocked(s, batch[i].key);
+          if (after_drop_for_test_) after_drop_for_test_();
           CompletePut(completion, FlushOutcome::kRefused, result[i]);
         } else if (!target_failed[i] &&
                    ++batch[i].tries < opt_.flush_retries) {
@@ -1798,9 +1801,13 @@ void RamTier::FlushLoop(Shard& s) {
           if (client_acked)
             post_ack_flush_failures_.fetch_add(1, std::memory_order_relaxed);
           if (opt_.flush_given_up) opt_.flush_given_up(batch[i].key);
-          DropLocked(s, batch[i].key);
-          NoteDrop();
+          // Every count and the health before the drop: the drop takes the
+          // value out of the dirty count, and a WaitForDrain that sees the
+          // tier drained must see the drop counted.
           flush_dropped_.fetch_add(1, std::memory_order_relaxed);
+          NoteDrop();
+          DropLocked(s, batch[i].key);
+          if (after_drop_for_test_) after_drop_for_test_();
           dropped_now = true;
           dropped_target_failed = dropped_target_failed || target_failed[i];
           // Publish every terminal side effect before waking PutCommitted()
@@ -1946,7 +1953,9 @@ void RamTier::AddDirty(uint32_t lane, uint64_t bytes) {
 
 void RamTier::SubDirty(uint32_t lane, uint64_t bytes) {
   dirty_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
-  dirty_objects_.fetch_sub(1, std::memory_order_relaxed);
+  // Release: what was published before (a drop's counters) is seen by the
+  // reader that sees the object leave the count (DirtyObjects, acquire).
+  dirty_objects_.fetch_sub(1, std::memory_order_release);
   lane_dirty_[lane].fetch_sub(bytes, std::memory_order_relaxed);
 }
 

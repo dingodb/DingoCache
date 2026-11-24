@@ -498,7 +498,7 @@ class RamTier {
     return dirty_bytes_.load(std::memory_order_relaxed);
   }
   uint64_t DirtyObjects() const {
-    return dirty_objects_.load(std::memory_order_relaxed);
+    return dirty_objects_.load(std::memory_order_acquire);
   }
   uint64_t OldestDirtyAgeSeconds() const;
   uint64_t RamAcks() const {
@@ -667,6 +667,9 @@ class RamTier {
 
   friend class KvNodeServer;
   friend class RamTierTestPeer;
+  // Tests: called with the shard lock held right after a flush that gave up
+  // dropped its value.
+  std::function<void()> after_drop_for_test_;
   void ReleaseToken(uint64_t token);
   bool TryReserve(uint64_t bytes);
   bool TryReserveLarge(uint64_t bytes);
