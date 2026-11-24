@@ -110,6 +110,21 @@
   recent REMOVEs (one new op); and a miss read back once from the previous
   owner, allowed only when that memory confirms the key was not removed.
 
+- Server, RAM tier: promotion on a key's second read (REQ-12), off by
+  default. With `DFKV_RAM_PROMOTE=second` a whole cold read is installed in
+  RAM only when the key was read within `DFKV_RAM_PROMOTE_WINDOW_MS`
+  (default 30000) before; a first read only remembers the key (a
+  fingerprint, at most 262144 keys) and reserves nothing in RAM. A one-time
+  scan then no longer pushes out values that are read again. Measured by
+  replay on a 64 MiB tier with 256 KiB values, a hot set re-read while a
+  scan streams past: 15.0% and 18.8% of hot reads hit RAM in two runs with
+  first-read promotion, 100% in both with second-read. The cost is one
+  more disk read per key: keys read exactly three times hit on reads 2 and
+  3 (200 of 200) with first, on read 3 only (100 of 200) with second.
+  `DFKV_RAM_PROMOTE=first`, the default, is promotion as before. DEPLOY.md
+  says how to choose the window; new `dfkv_ram_promote_deferred_total` and
+  `dfkv_ram_recent_reads`, only with `second`.
+
 - Server, RDMA with io_uring: a request that arrives while a disk read is in
   flight is taken at once (RDS-11). The serve loop waited on the ring alone
   for up to 1 ms at a time and saw the request only then; measured, the
