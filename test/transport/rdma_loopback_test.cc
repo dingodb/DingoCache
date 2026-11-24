@@ -10455,7 +10455,10 @@ double TimedExistAfterReclaim(bool session, long* reaps) {
   ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
   ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "60000");
   RdmaNode node(session ? "session-reclaim-on" : "session-reclaim-off");
-  RdmaTransport rt(kMaxMsg);
+  // One rail: on two, the operation after the reclaim may pick the other
+  // rail, which has no pooled connection to reap, and the test measures
+  // nothing (it then saw no reap and failed, though the op took 5 ms).
+  RdmaTransport rt(kMaxMsg, SingleTestRail());
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
   const std::string v(4096, 's');
   EXPECT_TRUE(c.Put("session", v.data(), v.size()));
