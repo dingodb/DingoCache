@@ -73,6 +73,9 @@ class CompletionDeadline {
 class RdmaTransport : public Transport {
  public:
   static bool Available();  // true if at least one ACTIVE RDMA port is present
+  // Test binaries only: honour the DFKV_RDMA_TEST_* fault hooks. Without
+  // this call they are never read.
+  static void EnableTestHooks();
 
   // dev_name empty => env DFKV_RDMA_DEV. A comma-separated explicit value is a
   // whitelist and opts into multi-rail. With neither, use the first ACTIVE local
@@ -179,13 +182,23 @@ class RdmaTransport : public Transport {
     // Until when the operation may wait for rail credits, all its Acquires
     // together; set by the first one (0 = not yet).
     uint64_t admission_deadline_us = 0;
+    // The operation's own deadline (0 = none): connection setup, every wait
+    // and a retry get only what is left of it. A batch sets it per attempt,
+    // for the attempt's connection; its windows keep their own timeouts.
+    uint64_t deadline_us = 0;
   };
+  // A deadline timeout_ms from now, or 0 (none) for a timeout below 1.
+  static uint64_t DeadlineIn(int timeout_ms);
+  // What is left of the operation's deadline, at most cap_ms (cap_ms < 0: no
+  // cap). Without a deadline, cap_ms.
+  static int RemainingMs(const OpState* op, int cap_ms);
   struct AcquireOptions {
     bool force_new = false;
     OpState* op = nullptr;
     // A dial that only checks whether the peer refuses a rail's device
     // (ConfirmRefusal): its close is not counted as the peer being busy.
-    // It also waits at most kRefusalCheckMs to connect and for each reply
+    // It also waits at most kRefusalCheckMs (and no longer than the
+    // operation has left) to connect and for each reply
     // (a timeout confirms nothing), and charges no remote rail whatever
     // happens: only ChargeRefusal does.
     bool refusal_check = false;
@@ -246,7 +259,7 @@ class RdmaTransport : public Transport {
   // operation's budget (rail_backpressure_us_ from its first Acquire).
   uint64_t AdmissionWait(const AcquireOptions& options) const;
   void ConfirmRefusal(const std::string& node, const std::string& health_id,
-                      size_t rail);
+                      size_t rail, uint64_t deadline_us);
   // Cools `rail` of the peer for a confirmed refusal unless it is the
   // peer's last usable rail. True if charged.
   bool ChargeRefusal(const std::string& node, const std::string& health_id,
@@ -358,7 +371,7 @@ class RdmaTransport : public Transport {
   };
   ProbeResult ProbeV2(const std::string& node,
                       bool* leased_put_supported = nullptr,
-                      int timeout_ms = 0,  // 0: connect_ms_, io_ms_
+                      int connect_ms = 0, int io_ms = 0,  // 0: defaults
                       bool* session_fd_supported = nullptr,
                       bool* read_depth_supported = nullptr) const;
   // A buffer of the caller could not be registered on `c`. Marks the
@@ -465,6 +478,7 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> pipelined_read_conns_{0};
   // True if conn's session channel says the server has ended it.
   static bool SessionClosed(const Conn& conn);
+  bool busy_poll_ = false;  // DFKV_RDMA_BUSY_POLL
   int port_check_ms_ = 1000;  // DFKV_RDMA_PORT_CHECK_MS; 0 = off
   std::unique_ptr<rdma::PortWatcher> port_watcher_;
   std::vector<uint8_t> port_active_;  // keepalive thread only
@@ -553,6 +567,8 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> peer_unreachable_{0};
   std::atomic<uint64_t> peer_busy_{0};
   std::atomic<uint64_t> rail_refusals_{0};  // see NoteConnected
+  // Operations that ran out of their deadline before a connection was ready.
+  std::atomic<uint64_t> op_deadline_expired_{0};
   std::mutex refusal_mu_;
   // (peer, rail) pairs with a confirming dial in flight: one at a time.
   std::set<std::pair<std::string, size_t>> refusal_checks_;

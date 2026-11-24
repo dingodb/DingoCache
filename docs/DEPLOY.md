@@ -819,7 +819,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `--rdma-depth` / `DFKV_RDMA_DEPTH` | `4` | server ceiling；client scalar=1，batch按实际window选择depth class后再协商取min |
 | `--rdma-numa` / `DFKV_RDMA_NUMA` | `0` | NUMA-aware rail choice（off/1） |
 | `--rdma-idle-ms` / `DFKV_RDMA_IDLE_MS` | — | idle connection reaper tick |
-| `--rdma-op-timeout-ms` / `DFKV_RDMA_OP_TIMEOUT_MS` | `5000` | per-op RDMA deadline |
+| `--rdma-op-timeout-ms` / `DFKV_RDMA_OP_TIMEOUT_MS` | `5000` | client：单个操作的整体期限，从操作开始算：建连（准入、budget 等待、能力探测、拨号与 bootstrap 读）、GET 的请求、READ 和释放、以及重试都只用剩下的时间。批量操作（`DFKV_RDMA_BATCH_OP_TIMEOUT_MS`）每次尝试的建连受它约束，各窗口仍各有自己的期限。在被期限截短的时限上超时的建连不记对端不可达（被拒绝的仍然记），被期限截短而超时的 bootstrap 读和 GET 释放不冷却 rail（server 的 receive pool 紧张时 bootstrap 回复可能等 5 s），所以按默认值（操作期限 5 s 小于 `DFKV_RDMA_IO_MS` 的 10 s）bootstrap 上的沉默从不冷却 rail：操作照样失败，由节点级健康（peer cooldown）计入，计入 `dfkv_rdma_client_op_deadline_expired_total`；拒绝确认拨号也不超出期限 |
 | `--server-uring` / `DFKV_SERVER_URING` | `0` | io_uring async-GET（编须 `-DDFKV_WITH_URING`） |
 | `--server-uring-depth` / `DFKV_SERVER_URING_DEPTH` | — | uring SQ 深度 |
 | `--ram-flush-threads` / `DFKV_RAM_FLUSH_THREADS` | 默认 4×盘数， 钳至 shard 数上限 16；至少 shard 数，多盘时至少 2×shard 数 | RAM tier flush 线程 |
@@ -841,8 +841,8 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_RDMA_RECV_HUGEPAGES` | `on` | receive pool 的 chunk（≥2 MiB 时）申请透明大页，和 RAM 层 arena 一样（每个 chunk 一段单独的 `mmap` 加 `madvise(MADV_HUGEPAGE)`）：`/sys/kernel/mm/transparent_hugepage/enabled` 为 `madvise` 或 `always` 时生效，为 `never` 时不起作用、chunk 仍是 4K 页。从盘读的 GET 和 leased PUT 每次都要为本次操作注册一段 chunk 内存，大页上注册和注销快得多：实测 4 MiB 约 0.05 ms 对 0.3 ms，64 MiB 约 0.4 ms 对 2.4 ms；64 KiB 以下差别不大（每次约 20–40 µs 的系统调用本身） |
 | `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | `256 KiB` | client adaptive data-QP 最小 class；实际对象向上取 power-of-two |
 | `DFKV_RDMA_INLINE_PUT_MAX_BYTES` | `4 MiB` | client 超阈 PUT 使用操作级 lease；`0`/空值禁用，不改变业务对象上限 |
-| `DFKV_RDMA_CONNECT_MS` | `3000` | client TCP bootstrap **建连**超时（毫秒），不覆盖整个 QP 初始化或后续读写 |
-| `DFKV_RDMA_IO_MS` | `10000` | client TCP bootstrap 帧读写超时（毫秒）；RDMA completion 另由 `DFKV_RDMA_OP_TIMEOUT_MS` 限定 |
+| `DFKV_RDMA_CONNECT_MS` | `3000` | client TCP bootstrap **建连**超时（毫秒），不覆盖整个 QP 初始化或后续读写；同时不超过操作剩下的期限 |
+| `DFKV_RDMA_IO_MS` | `10000` | client TCP bootstrap 帧读写超时（毫秒），同时不超过操作剩下的期限（`DFKV_RDMA_OP_TIMEOUT_MS`）；RDMA completion 另由后者限定 |
 | `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | client：multi-item Cache/Range/Exist、SG 窗口总期限 |
 | `DFKV_RDMA_POOL_MAX` | 未设：常驻基线 `8`、data 突发上限 `64` | client：scalar/SG 共用 data pool；超过基线的空闲连接在最后一次应用使用 60 秒后退休，keepalive 不续期。显式正整数同时固定基线与上限；control 仍取基线，全部受进程资源预算约束 |
 | `DFKV_RDMA_RAIL_CREDITS` | 默认 `64`, 硬上限 4096 | client：每 rail outstanding request credits |

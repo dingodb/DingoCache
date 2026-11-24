@@ -1352,6 +1352,9 @@ void RdmaServer::Serve(
   // Responder resources only: a client that asks for one READ at a time is
   // served as before.
   ep.set_responder_read_depth(rdma::kV2ReadDepth);
+  if (const int delay_ms = bootstrap_reply_delay_ms_for_test_.load(
+          std::memory_order_relaxed))
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
   if (!net::WriteAll(boot_fd, mine, rdma::kQpInfoBytes) ||
       !ep.Connect(peer_info)) {
     close_boot();
