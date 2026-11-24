@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <future>
@@ -1922,6 +1923,135 @@ TEST(GpuDedupClient, AThrowAfterADeferredHitLeavesNoCopyQueued) {
   }
   EXPECT_TRUE(completed);
   EXPECT_GT(throws_after_a_copy, 0) << "no throw came after a hit's copy";
+}
+
+// CLI-32: the lazy set-ups of a client never abort the process when an
+// allocation fails in them (std::call_once does: an exception unwinding
+// through pthread_once). Each allocation of a fresh client's first
+// GPU-dedup batch fails in turn: the batch throws or completes, and the
+// client stays usable (without GPU dedup if its set-up failed).
+TEST(GpuDedupClient, AFailingSetUpLeavesTheClientUsable) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  TwoClients c("setup-throw");
+  c.Store("k", Val(25, 40000));
+  DevBuf d0(20000), d1(20000);
+  using Members = std::vector<std::pair<std::string, std::string>>;
+  int throws = 0;
+  bool completed = false;
+  for (long n = 1; n < 100000 && !completed; ++n) {
+    dfkv::KVClient client(Members{{"n", "127.0.0.1:1"}}, c.key_namespace,
+                          &c.transport);
+    size_t len = 0;
+    g_fail_in = n;
+    try {
+      c.Get(&client, "k", &d0, &d1, &len);
+      completed = true;
+    } catch (const std::bad_alloc&) {
+      ++throws;
+    }
+    g_fail_in = 0;
+    EXPECT_TRUE(c.Get(&client, "k", &d0, &d1, &len)) << "allocation " << n;
+  }
+  EXPECT_TRUE(completed);
+  EXPECT_GT(throws, 0);
+}
+
+// Two threads running a client's first GPU batches at once both use the
+// rendezvous: the second waits for the set-up the first runs instead of
+// finding it marked done before it is.
+TEST(GpuDedupClient, ConcurrentFirstBatchesBothUseTheRendezvous) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  TwoClients c("setup-race");
+  const std::string v1 = Val(26, 40000), v2 = Val(27, 40000);
+  c.Store("k1", v1);
+  c.Store("k2", v2);
+  DevBuf l0(20000), l1(20000);
+  size_t len = 0;
+  ASSERT_TRUE(c.Get(c.leader.get(), "k1", &l0, &l1, &len));
+  ASSERT_TRUE(c.Get(c.leader.get(), "k2", &l0, &l1, &len));
+  const int reads = c.transport.reads;
+  for (int round = 0; round < 8; ++round) {
+    using Members = std::vector<std::pair<std::string, std::string>>;
+    dfkv::KVClient client(Members{{"n", "127.0.0.1:1"}}, c.key_namespace,
+                          &c.transport);
+    DevBuf a0(20000), a1(20000), b0(20000), b1(20000);
+    std::atomic<int> ready{0};
+    bool got_a = false, got_b = false;
+    auto first_batch = [&](const char* key, DevBuf* d0, DevBuf* d1,
+                           bool* got) {
+      EnsureCudaCtx();
+      ready.fetch_add(1);
+      while (ready.load() < 2) {
+      }
+      size_t n = 0;
+      *got = c.Get(&client, key, d0, d1, &n);
+    };
+    std::thread ta(first_batch, "k1", &a0, &a1, &got_a);
+    std::thread tb(first_batch, "k2", &b0, &b1, &got_b);
+    ta.join();
+    tb.join();
+    EXPECT_TRUE(got_a);
+    EXPECT_TRUE(got_b);
+    EXPECT_EQ(c.transport.reads, reads)
+        << "round " << round << ": a first batch fetched instead of using "
+        << "the rendezvous";
+    EXPECT_EQ(ClientCounter(client, "dfkv_client_gpu_dedup_hits_total"), 2u);
+  }
+}
+
+// The once-per-process log lines (the client's configuration dump, the
+// SYNC_MEMOPS warning): a failing allocation only skips the line. Each runs
+// in a fresh process, where the line has not been logged yet; it exits 0
+// once a client was built (or a pool registered) under the sweep.
+[[noreturn]] void ConfigDumpSweep() {
+  DeviceWritingTransport transport;
+  using Members = std::vector<std::pair<std::string, std::string>>;
+  bool built = false;
+  for (long n = 1; n < 100000 && !built; ++n) {
+    g_fail_in = n;
+    try {
+      dfkv::KVClient client(Members{{"n", "127.0.0.1:1"}}, "dump/test",
+                            &transport);
+      built = true;
+    } catch (const std::bad_alloc&) {
+    }
+    g_fail_in = 0;
+  }
+  std::exit(built ? 0 : 1);
+}
+
+[[noreturn]] void SyncMemopsSweep() {
+  EnsureCudaCtx();
+  *SimSymbol<int>("sim_cuda_fail_pointer_set_attribute") = 1;
+  DeviceWritingTransport transport;
+  using Members = std::vector<std::pair<std::string, std::string>>;
+  dfkv::KVClient client(Members{{"n", "127.0.0.1:1"}}, "memops/test",
+                        &transport);
+  DevBuf pool(1 << 20);
+  bool registered = false;
+  for (long n = 1; n < 100000 && !registered; ++n) {
+    g_fail_in = n;
+    try {
+      registered =
+          client.RegisterMemory(reinterpret_cast<void*>(pool.p), 1 << 20);
+    } catch (const std::bad_alloc&) {
+    }
+    g_fail_in = 0;
+  }
+  std::exit(registered ? 0 : 1);
+}
+
+TEST(GpuDedupClientDeathTest, AFailingConfigDumpOnlySkipsTheLine) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(ConfigDumpSweep(), ::testing::ExitedWithCode(0), "");
+}
+
+TEST(GpuDedupClientDeathTest, AFailingSyncMemopsWarningOnlySkipsTheLine) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  if (!SimSymbol<int>("sim_cuda_fail_pointer_set_attribute"))
+    GTEST_SKIP() << "needs the simulated driver to refuse SYNC_MEMOPS";
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(SyncMemopsSweep(), ::testing::ExitedWithCode(0), "");
 }
 
 #ifdef DFKV_GPU_TEST_SIMULATED

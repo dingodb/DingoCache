@@ -3,6 +3,13 @@
 ## Unreleased
 
 
+- Client: an allocation that fails in a client's one-time set-ups no longer
+  aborts the process. The GPU dedup rendezvous of a client's first
+  all-device batch, the configuration dump of the first client and the
+  SYNC_MEMOPS warning ran under `std::call_once`, through which an exception
+  aborts (SIGABRT). Now a failed GPU dedup set-up leaves that client without
+  GPU dedup (with a WARNING), and a failed log line is skipped.
+
 - Client: cooldown reroute (CLI-02 stage C), behind
   `DFKV_RING_COOLDOWN_REROUTE` (default 0 = off; MDS discovery only). A key
   whose owner this client's PeerHealth has in cooldown goes to a substitute

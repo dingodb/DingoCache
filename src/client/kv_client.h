@@ -623,7 +623,8 @@ class KVClient {
   std::unique_ptr<NodeDedup> dedup_;
   // Same-host GET rendezvous for GPU destinations (phase 2b; vLLM SG path).
   // Lazy-init via GpuDedup(); raw pointer published for lock-free metrics.
-  std::once_flag gpu_dedup_once_;
+  std::mutex gpu_dedup_mu_;  // serializes the lazy set-up below
+  std::atomic<bool> gpu_dedup_tried_{false};
   std::unique_ptr<GpuNodeDedup> gpu_dedup_;
   std::atomic<GpuNodeDedup*> gpu_dedup_raw_{nullptr};
   std::unique_ptr<MdsRegistrar> client_registrar_;  // consumer identity lease (best-effort)
