@@ -135,6 +135,7 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     "dfkv_rdma_client_peer_unreachable_skips_total": (),
     "dfkv_rdma_client_peer_busy_total": (),
     "dfkv_rdma_client_rail_refusals_total": (),
+    "dfkv_rdma_client_op_deadline_expired_total": (),
     "dfkv_rdma_client_port_down_events_total": (),
     "dfkv_rdma_client_rail_background_probes_total": (),
     "dfkv_rdma_client_peer_topology_updates_total": (),

@@ -88,8 +88,15 @@ uint64_t EnvU64(const char* name, uint64_t dflt) {
 }
 
 
+// The DFKV_RDMA_TEST_* fault hooks below read the environment only once a
+// test binary has turned them on (RdmaTransport::EnableTestHooks). A process
+// that never does, every production one, makes no getenv call on the data
+// path, which would race a host that calls setenv (Python, for one).
+std::atomic<bool> g_test_hooks{false};
+bool TestHooks() { return g_test_hooks.load(std::memory_order_relaxed); }
+
 bool AbortMultiWrWindow(size_t one_based_window, size_t window_count) {
-  if (window_count <= 1) return false;
+  if (window_count <= 1 || !TestHooks()) return false;
   const char* value = std::getenv("DFKV_RDMA_TEST_ABORT_MULTIWR_WINDOW");
   if (!value || !*value) return false;
   errno = 0;
@@ -101,6 +108,7 @@ bool AbortMultiWrWindow(size_t one_based_window, size_t window_count) {
 
 
 bool InjectLocalRailFailure(int zero_based_attempt) {
+  if (!TestHooks()) return false;
   const char* value =
       std::getenv("DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS");
   if (!value || !*value) return false;
@@ -121,6 +129,7 @@ bool InjectLocalRailFailure(int zero_based_attempt) {
 }
 
 bool InjectPullReadFailure() {
+  if (!TestHooks()) return false;
   const char* value = std::getenv("DFKV_RDMA_TEST_PULL_READ_FAILURE");
   return value && std::strcmp(value, "1") == 0;
 }
@@ -185,7 +194,7 @@ class CompletionFaultOperation {
  public:
   explicit CompletionFaultOperation(std::atomic<uint64_t>* calls,
                                     bool enabled = true) {
-    if (!enabled) return;
+    if (!enabled || !TestHooks()) return;
     const char* cursor =
         std::getenv("DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT");
     if (cursor && *cursor) {
@@ -701,6 +710,13 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   config_dump::RecordResolved(
       "DFKV_RDMA_RAIL_ERROR_PENALTY_US",
       std::to_string(rail_config.error_penalty_us));
+  {
+    // Read once here, not per connection: no getenv off the constructor.
+    const char* bp = std::getenv("DFKV_RDMA_BUSY_POLL");
+    busy_poll_ = bp && *bp && *bp != '0';
+    envparse::ReportSwitch("DFKV_RDMA_BUSY_POLL", busy_poll_,
+                           "only a value starting with 0 is off");
+  }
   connect_ms_ = EnvInt("DFKV_RDMA_CONNECT_MS", 3000);
   io_ms_ = EnvInt("DFKV_RDMA_IO_MS", 10000);
   // An explicit zero disables the single-op datapath completion deadline.
@@ -1495,16 +1511,30 @@ bool RdmaTransport::SessionClosed(const Conn& conn) {
          got > 0;
 }
 
+uint64_t RdmaTransport::DeadlineIn(int timeout_ms) {
+  return timeout_ms > 0 ? rdma::RailPolicy::NowMicros() +
+                              static_cast<uint64_t>(timeout_ms) * 1000
+                        : 0;
+}
+
+int RdmaTransport::RemainingMs(const OpState* op, int cap_ms) {
+  if (!op || op->deadline_us == 0) return cap_ms;
+  const uint64_t now = rdma::RailPolicy::NowMicros();
+  const uint64_t left_us = op->deadline_us > now ? op->deadline_us - now : 0;
+  const int left_ms = static_cast<int>(std::min<uint64_t>(
+      (left_us + 999) / 1000, std::numeric_limits<int>::max()));
+  return cap_ms < 0 ? left_ms : std::min(cap_ms, left_ms);
+}
+
 RdmaTransport::ProbeResult RdmaTransport::ProbeV2(
-    const std::string& node, bool* leased_put_supported,
-    int timeout_ms, bool* session_fd_supported,
-    bool* read_depth_supported) const {
+    const std::string& node, bool* leased_put_supported, int connect_ms,
+    int io_ms, bool* session_fd_supported, bool* read_depth_supported) const {
   v2_probe_attempts_.fetch_add(1, std::memory_order_relaxed);
   if (leased_put_supported) *leased_put_supported = false;
   if (session_fd_supported) *session_fd_supported = false;
   if (read_depth_supported) *read_depth_supported = false;
-  int fd = DialNode(node, timeout_ms > 0 ? timeout_ms : connect_ms_,
-                     timeout_ms > 0 ? timeout_ms : io_ms_);
+  int fd = DialNode(node, connect_ms > 0 ? connect_ms : connect_ms_,
+                    io_ms > 0 ? io_ms : io_ms_);
   if (fd < 0) {
     v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
     return ProbeResult::kUnreachable;
@@ -1565,6 +1595,10 @@ bool RdmaTransport::RecentlyUnreachable(const std::string& node) {
   return false;
 }
 
+void RdmaTransport::EnableTestHooks() {
+  g_test_hooks.store(true, std::memory_order_relaxed);
+}
+
 int RdmaTransport::DialNode(const std::string& node, int connect_ms,
                             int io_ms) const {
   for (int left = fail_dials_for_test_.load(); left > 0;
@@ -1623,9 +1657,10 @@ uint64_t RdmaTransport::AdmissionWait(const AcquireOptions& options) const {
   const uint64_t now = rdma::RailPolicy::NowMicros();
   if (options.op->admission_deadline_us == 0)
     options.op->admission_deadline_us = now + rail_backpressure_us_;
-  return options.op->admission_deadline_us > now
-             ? options.op->admission_deadline_us - now
-             : 0;
+  uint64_t until = options.op->admission_deadline_us;
+  if (options.op->deadline_us != 0)
+    until = std::min(until, options.op->deadline_us);
+  return until > now ? until - now : 0;
 }
 
 void RdmaTransport::NoteConnected(const AcquireOptions& options,
@@ -1646,7 +1681,9 @@ void RdmaTransport::NoteConnected(const AcquireOptions& options,
   if (!options.op || !options.op->busy_closed_rail) return;
   const size_t closed = *options.op->busy_closed_rail;
   options.op->busy_closed_rail.reset();
-  if (closed != rail) ConfirmRefusal(node, health_id, closed);
+  // Without time left the confirmation is skipped, not counted as expired.
+  if (closed != rail && RemainingMs(options.op, -1) != 0)
+    ConfirmRefusal(node, health_id, closed, options.op->deadline_us);
 }
 
 // The peer closed `rail`'s bootstrap before replying and then took one on
@@ -1657,8 +1694,8 @@ void RdmaTransport::NoteConnected(const AcquireOptions& options,
 // recovery probe later, instead of every operation trying it and waiting
 // out the busy pause. A peer's last usable rail is never cooled this way.
 void RdmaTransport::ConfirmRefusal(const std::string& node,
-                                   const std::string& health_id,
-                                   size_t rail) {
+                                   const std::string& health_id, size_t rail,
+                                   uint64_t deadline_us) {
   const auto key = std::make_pair(health_id, rail);
   {
     std::lock_guard<std::mutex> lock(refusal_mu_);
@@ -1669,6 +1706,11 @@ void RdmaTransport::ConfirmRefusal(const std::string& node,
   options.excluded[rail] = 0;
   options.refusal_check = true;
   options.backpressure_us = 0;
+  // Within the operation's deadline: each step waits at most
+  // kRefusalCheckMs, and all of them together no longer than what is left.
+  OpState confirm;
+  confirm.deadline_us = deadline_us;
+  options.op = &confirm;
   AcquireResult dialed = Acquire(node, Lane::kControl, options);
   bool refused = false;
   if (dialed.conn) {
@@ -1717,6 +1759,14 @@ bool RdmaTransport::ChargeRefusal(const std::string& node,
 RdmaTransport::AcquireResult RdmaTransport::Acquire(
     const std::string& node, Lane lane, const AcquireOptions& options) {
   AcquireResult result;
+  // Out of the operation's deadline: nothing is dialed or waited for, and
+  // neither the peer nor a rail is charged; the operation times out.
+  if (RemainingMs(options.op, -1) == 0) {
+    op_deadline_expired_.fetch_add(1, std::memory_order_relaxed);
+    result.failure = AcquireFailure::kAdmission;
+    result.status = Status::kIOError;
+    return result;
+  }
   const auto peer_snapshot =
       options.peer ? options.peer : peer_topologies_->Snapshot(node);
   if (!peer_snapshot || !rdma::HasRail(peer_snapshot->peer_healthy)) {
@@ -2035,14 +2085,38 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       result.failure = AcquireFailure::kPeerUnreachable;
       return result;
     }
+    // A dial cut short by the operation's deadline, or a confirming dial
+    // with its short limit (ConfirmRefusal), says nothing about the node:
+    // no unreachable hold and no charge from it.
+    const int probe_connect_ms = options.refusal_check
+                                     ? RemainingMs(options.op, kRefusalCheckMs)
+                                     : RemainingMs(options.op, connect_ms_);
+    const int probe_io_ms = options.refusal_check
+                                ? RemainingMs(options.op, kRefusalCheckMs)
+                                : RemainingMs(options.op, io_ms_);
+    const bool probe_connect_cut =
+        options.refusal_check || probe_connect_ms < connect_ms_;
+    const bool probe_cut = probe_connect_cut || probe_io_ms < io_ms_;
+    errno = 0;
     const ProbeResult probed = ProbeV2(
-        node, &leased_put_supported,
-        options.refusal_check ? kRefusalCheckMs : 0, &session_fd_supported,
+        node, &leased_put_supported, std::max(1, probe_connect_ms),
+        std::max(1, probe_io_ms), &session_fd_supported,
         &read_depth_supported);
+    const int probe_errno = errno;
+    if (probed != ProbeResult::kSupported && probe_cut &&
+        !options.refusal_check && RemainingMs(options.op, -1) == 0) {
+      op_deadline_expired_.fetch_add(1, std::memory_order_relaxed);
+      complete_unowned_lease(rdma::RailCompletion::kAdmission);
+      result.failure = AcquireFailure::kAdmission;
+      result.status = Status::kIOError;
+      return result;
+    }
     if (probed == ProbeResult::kUnreachable) {
-      // A confirming dial's short limit says nothing about the node: no
-      // unreachable hold from it (ConfirmRefusal).
-      if (!options.refusal_check) NoteUnreachable(node);
+      // A refused or timed-out connect, unless it timed out at a limit the
+      // deadline cut short (a refusal is a refusal at any limit).
+      if (!options.refusal_check &&
+          !(probe_connect_cut && probe_errno == ETIMEDOUT))
+        NoteUnreachable(node);
       complete_unowned_lease(rdma::RailCompletion::kAdmission);
       result.failure = AcquireFailure::kPeerUnreachable;
       return result;
@@ -2082,7 +2156,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     budget_acquired = resource_budget_->TryAcquire(budget_request);
   if (!budget_acquired)
     budget_acquired = resource_budget_->Acquire(
-        budget_request, std::chrono::milliseconds(resource_acquire_ms_));
+        budget_request,
+        std::chrono::milliseconds(RemainingMs(options.op, resource_acquire_ms_)));
   if (!budget_acquired) {
     // Budget starvation is a LOCAL condition: the peer was never dialed. The
     // silent variant of this path cost days of diagnosis (0812-002/004), so
@@ -2112,10 +2187,19 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
 
   const std::string& dev = devs_[ridx];
   const bool held = RecentlyUnreachable(node);
-  const int dial_ms = options.refusal_check ? kRefusalCheckMs : 0;
+  const int dial_connect_ms = options.refusal_check
+                                  ? RemainingMs(options.op, kRefusalCheckMs)
+                                  : RemainingMs(options.op, connect_ms_);
+  const int dial_io_ms = options.refusal_check
+                             ? RemainingMs(options.op, kRefusalCheckMs)
+                             : RemainingMs(options.op, io_ms_);
+  // Cut short by the operation's deadline: a connect that times out then
+  // says nothing about the node.
+  const bool dial_connect_cut =
+      !options.refusal_check && dial_connect_ms < connect_ms_;
   int fd = held ? -1
-                : DialNode(node, dial_ms ? dial_ms : connect_ms_,
-                            dial_ms ? dial_ms : io_ms_);
+                : DialNode(node, std::max(1, dial_connect_ms),
+                           std::max(1, dial_io_ms));
   const int dial_errno = errno;
   if (fd < 0 && !held && (dial_errno == EMFILE || dial_errno == ENFILE)) {
     // socket() itself failed: nothing reached the peer.
@@ -2132,7 +2216,9 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     // The bootstrap address is the node's, the same for every rail. A
     // refusal is not a connect that failed: it starts nothing and is not
     // recorded as one (see TakeUnreachableRefusal).
-    if (!held && !options.refusal_check) NoteUnreachable(node);
+    if (!held && !options.refusal_check &&
+        !(dial_connect_cut && dial_errno == ETIMEDOUT))
+      NoteUnreachable(node);
     complete_unowned_lease(rdma::RailCompletion::kAdmission);
     resource_budget_->Release(budget_request);
     result.failure = AcquireFailure::kPeerUnreachable;
@@ -2188,14 +2274,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     result.failure = AcquireFailure::kLocalRail;
     return result;
   }
-  {
-    // Read for every connection that is opened; ReportSwitch warns once.
-    const char* bp = std::getenv("DFKV_RDMA_BUSY_POLL");
-    const bool busy_poll = bp && *bp && *bp != '0';
-    envparse::ReportSwitch("DFKV_RDMA_BUSY_POLL", busy_poll,
-                           "only a value starting with 0 is off");
-    if (busy_poll) conn->ep.set_busy_poll(true);
-  }
+  if (busy_poll_) conn->ep.set_busy_poll(true);
 
   char devbuf[rdma::kDevNameBytes];
   // Probe requires the dynamic-only contract before a QP bootstrap. There is
@@ -2220,11 +2299,37 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   my.depth = static_cast<uint16_t>(std::min<size_t>(conn_depth, 256));
   my.protocol_version = rdma::kDevProtoV2;
   rdma::SerializeQpInfo(my, mine);
+  // Each bootstrap read gets one deadline for all its bytes: what is left of
+  // the operation, at most DFKV_RDMA_IO_MS (a confirming dial: its own short
+  // limit). A read that times out at a limit the operation's deadline cut
+  // short says nothing about the peer: nothing is charged for it.
+  bool read_cut = false;
+  bool read_timed_out = false;
+  const auto read_phase = [&](void* buffer, size_t bytes) {
+    const int limit_ms = options.refusal_check
+                             ? RemainingMs(options.op, kRefusalCheckMs)
+                             : RemainingMs(options.op, io_ms_);
+    read_cut = !options.refusal_check && limit_ms < io_ms_;
+    const auto until = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(std::max(1, limit_ms));
+    errno = 0;
+    const bool ok = net::ReadAllWithin(fd, buffer, bytes, timeval{0, 0}, until);
+    read_timed_out = !ok && (SocketTimedOut(errno) ||
+                             std::chrono::steady_clock::now() >= until);
+    return ok;
+  };
+  const auto deadline_expired = [&]() {
+    op_deadline_expired_.fetch_add(1, std::memory_order_relaxed);
+    Destroy(conn, rdma::RailCompletion::kAdmission);
+    result.failure = AcquireFailure::kAdmission;
+    result.status = Status::kIOError;
+    return result;
+  };
   errno = 0;
   if (!net::WriteAll(fd, devbuf, rdma::kDevNameBytes) ||
       !net::WriteAll(fd, mine, rdma::kQpInfoBytes) ||
-      !net::ReadAll(fd, remote_qp_bytes, rdma::kQpInfoBytes)) {
-    const bool closed = !SocketTimedOut(errno);
+      !read_phase(remote_qp_bytes, rdma::kQpInfoBytes)) {
+    const bool closed = !read_timed_out && !SocketTimedOut(errno);
     ::close(fd);
     if (closed && first_attempt) {
       // Closed before the peer sent anything. A server at its limit of
@@ -2247,6 +2352,10 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       result.failure = AcquireFailure::kPeerBusy;
       return result;
     }
+    // The operation ran out of time; a server under receive-pool pressure
+    // may hold its reply for up to 5 s, so this is no evidence against the
+    // rail. A read that waited the full DFKV_RDMA_IO_MS is.
+    if (!closed && read_cut) return deadline_expired();
     Destroy(conn, rdma::RailCompletion::kEndpointFailure);
     result.failure = AcquireFailure::kEndpoint;
     return result;
@@ -2296,10 +2405,18 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
 
   char readiness[rdma::kV2DynamicOnlyReadinessBytes];
+  if (!read_phase(readiness, sizeof(readiness))) {
+    ::close(fd);
+    if (read_timed_out && read_cut) return deadline_expired();
+    DFKV_LOG_ERROR("rdma: peer " + node +
+                   " did not send its v2 readiness");
+    Destroy(conn, rdma::RailCompletion::kEndpointFailure);
+    result.failure = AcquireFailure::kEndpoint;
+    return result;
+  }
   bool session_kept = false;
   bool read_depth_acked = false;
-  if (!net::ReadAll(fd, readiness, sizeof(readiness)) ||
-      !rdma::DecodeV2DynamicOnlyReadiness(
+  if (!rdma::DecodeV2DynamicOnlyReadiness(
           readiness, sizeof(readiness), &conn->recv_segment,
           want_session ? &session_kept : nullptr,
           want_read_depth ? &read_depth_acked : nullptr)) {
@@ -3030,6 +3147,10 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_rails_port_down gauge\n";
   s += "dfkv_rdma_client_rails_port_down " +
        std::to_string(rails_port_down_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_op_deadline_expired_total Operations whose deadline (DFKV_RDMA_OP_TIMEOUT_MS, or the batch timeout per attempt) ran out while their connection was being set up; nothing was charged\n";
+  s += "# TYPE dfkv_rdma_client_op_deadline_expired_total counter\n";
+  s += "dfkv_rdma_client_op_deadline_expired_total " +
+       std::to_string(op_deadline_expired_.load(std::memory_order_relaxed)) + "\n";
   s += "# HELP dfkv_rdma_client_rail_refusals_total Peer rails charged as failed because the peer closed a bootstrap on them, took one on another rail, and closed a confirming dial on them again (it does not serve that device)\n";
   s += "# TYPE dfkv_rdma_client_rail_refusals_total counter\n";
   s += "dfkv_rdma_client_rail_refusals_total " +
@@ -3237,6 +3358,7 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
   const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   OpState op_state;
+  op_state.deadline_us = DeadlineIn(op_timeout_ms_);
   bool cross_rail_retry = false;
   CompletionFaultOperation completion_fault(
       &test_completion_fault_calls_, op == WireOp::kCache);
@@ -3329,7 +3451,8 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     if (ok) {
       ibv_wc_status wc_status = IBV_WC_SUCCESS;
       bool had_wcs = false;
-      ok = ReapWindow(ep, 1, &reply_bytes, op_timeout_ms_, &timed_out,
+      ok = ReapWindow(ep, 1, &reply_bytes,
+                      RemainingMs(&op_state, op_timeout_ms_), &timed_out,
                       &wc_status, &had_wcs, &completion_fault);
       if (!ok) completion = rdma::ClassifyCompletion(wc_status, had_wcs);
     }
@@ -3397,6 +3520,10 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     if (PrepareRetry(attempt, acquired.from_pool, failed_rail, failure,
                      replay_safety, request_posted && !stale_pooled, peer, node,
                      &excluded, &cross_rail_retry)) {
+      // A stale pooled connection reached no server: its retry gets the
+      // whole timeout again (it may have used all of it waiting for a
+      // retry-exceeded completion). Any other retry gets what is left.
+      if (stale_pooled) op_state.deadline_us = DeadlineIn(op_timeout_ms_);
       continue;
     }
     if (cross_rail_retry)
@@ -3524,6 +3651,8 @@ std::vector<Status> RdmaTransport::CacheMany(
     options.requested_credits = std::min(valid_count, depth_);
     options.excluded = excluded;
     options.op = &op_state;
+    // Bounds this attempt's connection; the windows keep their own timeouts.
+    op_state.deadline_us = DeadlineIn(BatchTimeout());
     options.peer = peer;
     AcquireResult acquired = Acquire(node, Lane::kData, options);
     if (!acquired.conn) {
@@ -3852,6 +3981,8 @@ std::vector<Status> RdmaTransport::RangeMany(
     options.requested_credits = std::min(count, depth_);
     options.excluded = excluded;
     options.op = &op_state;
+    // Bounds this attempt's connection; the windows keep their own timeouts.
+    op_state.deadline_us = DeadlineIn(BatchTimeout());
     options.peer = peer;
     AcquireResult acquired = Acquire(node, Lane::kData, options);
     if (!acquired.conn) {
@@ -3965,6 +4096,8 @@ std::vector<Status> RdmaTransport::ExistMany(
     options.requested_credits = std::min(count, depth_);
     options.excluded = excluded;
     options.op = &op_state;
+    // Bounds this attempt's connection; the windows keep their own timeouts.
+    op_state.deadline_us = DeadlineIn(BatchTimeout());
     options.peer = peer;
     AcquireResult acquired = Acquire(node, Lane::kControl, options);
     if (!acquired.conn) {
@@ -4063,6 +4196,8 @@ bool RdmaTransport::PullWindow(
     rdma::RailCompletion* failure) {
   rdma::RcEndpoint& ep = conn->ep;
   *failure = rdma::RailCompletion::kRailFailure;
+  // One deadline for the window's request, READs and release together.
+  const CompletionDeadline window_deadline(timeout_ms);
   struct ReadState {
     rdma::DynamicPullReady ready{};
     size_t copied = 0;
@@ -4075,18 +4210,23 @@ bool RdmaTransport::PullWindow(
   std::vector<ReadState> batch_states(width > 1 ? width : 0);
   ReadState* states = width == 1 ? &single_state : batch_states.data();
   std::vector<uint32_t> replies;
+  bool exchange_timed_out = false;  // the last exchange ran out of time
   const auto exchange = [&](size_t count, size_t request_bytes) {
     bool timed_out = false;
+    exchange_timed_out = false;
     ibv_wc_status wc_status = IBV_WC_SUCCESS;
     bool had_wcs = false;
     for (size_t slot = 0; slot < count; ++slot) {
       if (!ep.PostRecv(slot) || !ep.PostSend(slot, request_bytes))
         return false;
     }
-    const bool ok = ReapWindow(ep, count, &replies, timeout_ms, &timed_out,
-                               &wc_status, &had_wcs);
-    if (timed_out)
+    const bool ok =
+        ReapWindow(ep, count, &replies, window_deadline.Remaining(),
+                   &timed_out, &wc_status, &had_wcs);
+    if (timed_out) {
       completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
+      exchange_timed_out = true;
+    }
     if (!ok) *failure = rdma::ClassifyCompletion(wc_status, had_wcs);
     return ok;
   };
@@ -4147,7 +4287,7 @@ bool RdmaTransport::PullWindow(
   const size_t read_sge = ep.ReadSge();
   std::vector<ibv_sge> sges;
   sges.reserve(read_sge);
-  CompletionDeadline deadline(timeout_ms);
+  const CompletionDeadline& deadline = window_deadline;
   for (;;) {
     size_t posted = 0;
     for (size_t slot = 0; slot < width; ++slot) {
@@ -4235,6 +4375,11 @@ bool RdmaTransport::PullWindow(
   if (releases == 0) return true;
   if (!exchange(releases, kReqPrefix)) {
     pull_release_failures_.fetch_add(1, std::memory_order_relaxed);
+    // The data is in; only the release reply missed what was left of the
+    // window's deadline. A peer answering a little late is not charged
+    // for that.
+    if (exchange_timed_out && window_deadline.Remaining() == 0)
+      *failure = rdma::RailCompletion::kAdmission;
     return false;
   }
   for (size_t slot = 0; slot < releases; ++slot) {
@@ -4261,6 +4406,8 @@ Status RdmaTransport::PullInto(
   const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   OpState op_state;
+  op_state.deadline_us = DeadlineIn(
+      mode == PullMode::kSlice ? op_timeout_ms_ : BatchTimeout());
   bool cross_rail_retry = false;
   // String slices retain their former bounded replay-safe recovery. A whole
   // object read into the caller's destination is tried once more only when
@@ -4308,7 +4455,9 @@ Status RdmaTransport::PullInto(
     rdma::RailCompletion failure = rdma::RailCompletion::kRailFailure;
     if ((mode == PullMode::kSlice && InjectLocalRailFailure(attempt)) ||
         !PullWindow(conn, &request, 1,
-                    mode == PullMode::kSlice ? op_timeout_ms_ : BatchTimeout(),
+                    RemainingMs(&op_state, mode == PullMode::kSlice
+                                               ? op_timeout_ms_
+                                               : BatchTimeout()),
                     &failure)) {
       pull_failures_.fetch_add(1, std::memory_order_relaxed);
       const size_t failed_rail = conn->rail_index;
@@ -4327,8 +4476,14 @@ Status RdmaTransport::PullInto(
                            ? AcquireFailure::kLocalRail
                            : AcquireFailure::kEndpoint,
                        ReplaySafety::kReplaySafe, false, peer, node, &excluded,
-                       &cross_rail_retry))
+                       &cross_rail_retry)) {
+        // As in RoundTrip: the retry after a stale pooled connection gets
+        // the whole timeout again; any other retry gets what is left.
+        if (stale_pooled)
+          op_state.deadline_us = DeadlineIn(
+              mode == PullMode::kSlice ? op_timeout_ms_ : BatchTimeout());
         continue;
+      }
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
       return Status::kIOError;
@@ -4452,6 +4607,8 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
     options.requested_credits = 1;
     options.excluded = excluded;
     options.op = &op_state;
+    // Bounds this attempt's connection; the windows keep their own timeouts.
+    op_state.deadline_us = DeadlineIn(BatchTimeout());
     options.peer = peer;
     AcquireResult acquired = Acquire(node, Lane::kSgData, options);
     if (!acquired.conn) {

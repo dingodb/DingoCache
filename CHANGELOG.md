@@ -3,6 +3,33 @@
 ## Unreleased
 
 
+- Client, RDMA: no `getenv` on the data path. Five test-only fault hooks
+  (`DFKV_RDMA_TEST_*`) read the environment on every READ, PUT batch and
+  attempt, and `DFKV_RDMA_BUSY_POLL` was read for every connection. In a
+  host that calls `setenv` meanwhile (Python does), that is a data race.
+  The hooks are now read only in test binaries that turn them on, and
+  `DFKV_RDMA_BUSY_POLL` once, when the transport is built.
+
+- Client, RDMA: an operation keeps to its timeout. `DFKV_RDMA_OP_TIMEOUT_MS`
+  bounded each completion wait, but not the connection setup before it:
+  the capability probe and the bootstrap read waited `DFKV_RDMA_IO_MS`
+  (10 s) on their own, so a GET to a node that accepts TCP and never
+  answers failed after 10.2-10.5 s with the default 5 s timeout. An
+  operation now has one deadline from its start: admission, the budget
+  wait, the probe, the dial, the bootstrap reads, the GET's request, READs
+  and release, and a retry get only what is left of it (5.0-5.3 s in the
+  same case), except the one retry after a stale pooled connection, which
+  gets the full timeout again (that attempt reached no server); such an
+  operation can take up to two timeouts, as before. A batch bounds each attempt's connection setup by its batch
+  timeout; its windows keep their own. A connect that times out at a limit
+  the deadline cut short marks nothing unreachable (a refused one still
+  does), and a bootstrap read or a release that runs out of the operation's
+  time charges no rail: a server under receive-pool pressure holds its
+  bootstrap reply for up to 5 s. The confirming dial of a refused rail
+  (2.42) also stays within the deadline. An endpoint's completion wait no
+  longer starts its full timeout again after a wake-up that brought no
+  completion. New `dfkv_rdma_client_op_deadline_expired_total`.
+
 - Server: one failed disk no longer takes the node out of placement
   (STO-16). A disk store that fails for good while serving used to make the
   whole node report itself out of the ring, so its healthy disks got no

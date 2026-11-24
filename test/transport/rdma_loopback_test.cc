@@ -28,6 +28,8 @@
 #include <poll.h>
 #include <sys/mman.h>  // shm_unlink (node-dedup test)
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/wait.h>
 #include <signal.h>
 
@@ -171,6 +173,9 @@ class RdmaServerTestPeer {
   }
   static uint64_t DynamicGetActive(const RdmaServer& server) {
     return server.dynamic_get_active_.load(std::memory_order_relaxed);
+  }
+  static void SetBootstrapReplyDelayMs(RdmaServer& server, int ms) {
+    server.bootstrap_reply_delay_ms_for_test_.store(ms);
   }
   static void SetAfterReplyPost(RdmaServer& server, std::function<void()> hook) {
     server.after_reply_post_for_test_ = std::move(hook);
@@ -423,6 +428,9 @@ namespace {
 // Small per-buffer cap so the test stays well under a modest RLIMIT_MEMLOCK
 // (RDMA pins registered memory); the test values are a few KB.
 constexpr size_t kMaxMsg = 256 * 1024;
+
+// The DFKV_RDMA_TEST_* fault hooks are read only in a process that asks.
+[[maybe_unused]] const bool kRdmaTestHooks = (dfkv::RdmaTransport::EnableTestHooks(), true);
 
 class ScopedEnv {
  public:
@@ -6828,6 +6836,55 @@ TEST(RdmaLoopback, DirectReadsOnAConnectionTheServerReclaimedSucceed) {
       CounterVal(metrics, "dfkv_rdma_client_remote_rail_cooldowns_total"), 0);
 }
 
+// The retry after a stale pooled connection gets the whole timeout again.
+// With the QP's transport retry slowed down, no retry-exceeded completion
+// comes before the operation's timeout (as on Soft-RoCE), so the first
+// attempt's wait uses all of it. A PUT and a whole-object read on a
+// connection the server reclaimed are still made again on a new one and
+// succeed, in about one timeout plus the retry.
+TEST(RdmaLoopback, AStalePoolRetryGetsTheWholeTimeoutAgain) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ReclaimingServerEnv env;
+  // Each test runs in its own process: read when the first QP is set up.
+  ScopedEnv qp_timeout("DFKV_RDMA_QP_TIMEOUT", "20");  // ~4 s per try
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "2000");
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode node("stale-full-timeout");
+  RdmaTransport rt(kMaxMsg, rail);
+  rt.OnPeerTopology(PublishedPeer(node.addr, "stale-full-timeout-peer"));
+  const std::string value = PatternValue(64 * 1024 + 7, 9);
+  const auto key = [](const std::string& name) {
+    return ToBlockKey(SelfHdr(), name);
+  };
+  ASSERT_EQ(rt.Cache(node.addr, key("warm"), value.data(), value.size()),
+            Status::kOk);
+
+  ASSERT_TRUE(ServerHasNoConnections(node));
+  auto started = std::chrono::steady_clock::now();
+  EXPECT_EQ(rt.Cache(node.addr, key("put"), value.data(), value.size()),
+            Status::kOk);
+  auto took = std::chrono::steady_clock::now() - started;
+  EXPECT_GE(took, std::chrono::milliseconds(1900)) << "the first wait ended early";
+  EXPECT_EQ(node.CacheDirectCalls(key("put")), 1u);
+
+  ASSERT_TRUE(ServerHasNoConnections(node));
+  std::string out(value.size(), '\0');
+  started = std::chrono::steady_clock::now();
+  std::vector<uint64_t> value_lens;
+  EXPECT_EQ(rt.RangeInto(node.addr, {key("put")}, {{out.data(), out.size()}},
+                         &value_lens),
+            std::vector<Status>{Status::kOk});
+  took = std::chrono::steady_clock::now() - started;
+  EXPECT_GE(took, std::chrono::milliseconds(1900)) << "the first wait ended early";
+  EXPECT_EQ(out, value);
+
+  EXPECT_EQ(CounterVal(rt.MetricsText(),
+                       "dfkv_rdma_client_stale_pool_retries_total"),
+            2);
+}
+
 // The other half of the rule above: a PUT posted on a pooled connection on
 // which something has succeeded since it left the pool is not sent again,
 // whatever fails afterwards. Here every completion of the request arrives
@@ -11483,3 +11540,117 @@ TEST(RdmaServerPorts, AOnePollFlapKeepsTheRailsConnections) {
   down_polls = 0;
 }
 
+namespace {
+// A listener that never accepts: the kernel completes TCP handshakes into its
+// backlog and nothing ever answers (a half-dead server).
+struct SilentTcp {
+  int fd = -1;
+  std::string addr;
+  SilentTcp() {
+    fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 ||
+        ::listen(fd, 64) != 0)
+      return;
+    socklen_t len = sizeof(a);
+    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+    addr = "127.0.0.1:" + std::to_string(ntohs(a.sin_port));
+  }
+  ~SilentTcp() { ::close(fd); }
+};
+}  // namespace
+
+// A node that takes the TCP connection and never answers fails an operation
+// within its timeout. The capability probe's read used to wait its own 10 s
+// (DFKV_RDMA_IO_MS) whatever the operation timeout: 10.2 s for a GET with
+// the default 5 s. The node is not held unreachable for a dial the deadline
+// cut short, so nothing is charged.
+TEST(RdmaOpDeadline, ASilentNodeFailsWithinTheOperationTimeout) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "1000");
+  for (const bool named : {false, true}) {
+    SCOPED_TRACE(named ? "named" : "static");
+    SilentTcp silent;
+    ASSERT_FALSE(silent.addr.empty());
+    RdmaTransport rt(kMaxMsg);
+    if (named) rt.OnPeerTopology(PublishedPeer(silent.addr, "silent-peer"));
+    KVClient c({{"n", silent.addr}}, SelfHdr(), &rt);
+    std::string out(4096, 0);
+    auto t0 = std::chrono::steady_clock::now();
+    EXPECT_FALSE(c.Get("silent", &out[0], out.size()));
+    double seconds = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t0).count();
+    EXPECT_LT(seconds, 2.5) << "the GET outlived its 1 s timeout";
+    const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "silent")};
+    std::vector<char> exists;
+    t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(rt.ExistMany(silent.addr, keys, &exists)[0], Status::kIOError);
+    seconds = std::chrono::duration<double>(
+                  std::chrono::steady_clock::now() - t0).count();
+    EXPECT_LT(seconds, 2.5) << "the EXIST outlived its 1 s timeout";
+    const std::string text = rt.MetricsText();
+    EXPECT_GE(CounterVal(text, "dfkv_rdma_client_op_deadline_expired_total"), 1);
+    EXPECT_EQ(CounterVal(text, "dfkv_rdma_client_peer_unreachable_total"), 0);
+  }
+}
+
+// A server under receive-pool pressure holds a new connection's bootstrap
+// reply for up to 5 s. An operation whose deadline runs out meanwhile fails
+// on time, and that wait is not taken as evidence against the peer's rail:
+// nothing is charged or cooled (the read was cut short, not a full
+// DFKV_RDMA_IO_MS of silence).
+TEST(RdmaOpDeadline, ABootstrapCutShortByTheDeadlineChargesNothing) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("deadline-pressure", kMaxMsg);
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "1000");
+  RdmaTransport rt(kMaxMsg);
+  rt.OnPeerTopology(PublishedPeer(node.addr, "pressured-peer"));
+  const BlockKey key = ToBlockKey(SelfHdr(), "pressured");
+  // The capabilities are learned on a first, quick connection.
+  const std::vector<BlockKey> keys = {key};
+  std::vector<char> exists;
+  ASSERT_NE(rt.ExistMany(node.addr, keys, &exists)[0], Status::kIOError);
+  RdmaServerTestPeer::SetBootstrapReplyDelayMs(*node.rsrv, 3000);
+  std::vector<char> out(4096);
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto statuses = rt.RangeInto(
+      node.addr, {key}, {RangeDst{out.data(), out.size()}}, nullptr);
+  const double seconds = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0).count();
+  RdmaServerTestPeer::SetBootstrapReplyDelayMs(*node.rsrv, 0);
+  EXPECT_NE(statuses[0], Status::kOk);
+  EXPECT_LT(seconds, 2.5);
+  const std::string text = rt.MetricsText();
+  EXPECT_GE(CounterVal(text, "dfkv_rdma_client_op_deadline_expired_total"), 1);
+  EXPECT_EQ(CounterVal(text, "dfkv_rdma_client_remote_rail_failures_total"), 0)
+      << "a bootstrap the deadline cut short was charged to the rail";
+  EXPECT_EQ(CounterVal(text, "dfkv_rdma_client_remote_rail_cooldowns_total"), 0);
+}
+
+// A confirming dial that is refused outright (ECONNREFUSED, as a backlog
+// overflowing in a handshake storm can answer) does not hold the node
+// unreachable either.
+TEST(RdmaPeerRailDown, ARefusedRefusalCheckDoesNotHoldTheNode) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  // Bound, never listening: a connect to it is refused at once.
+  const int dead = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(dead, 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t length = sizeof(address);
+  ASSERT_EQ(::bind(dead, reinterpret_cast<sockaddr*>(&address),
+                   sizeof(address)), 0);
+  ASSERT_EQ(::getsockname(dead, reinterpret_cast<sockaddr*>(&address),
+                          &length), 0);
+  const std::string dead_addr =
+      "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+  RdmaTransport rt(kMaxMsg);
+  EXPECT_EQ(RdmaTransportTestPeer::AcquireRefusalCheck(&rt, dead_addr, 0),
+            nullptr);
+  EXPECT_EQ(CounterVal(rt.MetricsText(),
+                       "dfkv_rdma_client_peer_unreachable_total"), 0);
+  ::close(dead);
+}

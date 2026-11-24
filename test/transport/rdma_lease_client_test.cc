@@ -40,6 +40,9 @@ class RdmaTransportTestPeer {
 
 namespace {
 
+// The DFKV_RDMA_TEST_* fault hooks are read only in a process that asks.
+[[maybe_unused]] const bool kRdmaTestHooks = (dfkv::RdmaTransport::EnableTestHooks(), true);
+
 class ScopedEnv {
  public:
   ScopedEnv(const char* name, const char* value) : name_(name) {

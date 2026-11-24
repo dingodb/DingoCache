@@ -448,6 +448,9 @@ class RdmaServer {
   // Runs after a capability probe's reply is written, before its thread
   // closes the socket and returns.
   std::function<void()> after_probe_reply_for_test_;
+  // Test-only: hold each bootstrap's QpInfo reply this long, as a receive
+  // pool under pressure does (up to 5 s).
+  std::atomic<int> bootstrap_reply_delay_ms_for_test_{0};
   // Test-only CQ filter: may withhold and later replay actual polled CQEs, or
   // rewrite the status of one. It never fabricates completions; production
   // leaves this empty.
