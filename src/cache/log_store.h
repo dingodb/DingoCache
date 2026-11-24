@@ -32,6 +32,7 @@
 #include "cache/lse_format.h"
 #include "cache/lse_io.h"
 #include "cache/store_engine.h"
+#include "common/block_key_hash.h"
 
 namespace dfkv {
 
@@ -223,22 +224,10 @@ class LogStore : public StoreEngine {
   // Every field mixed, seeded per process as slab's index is: keys whose
   // fields are related (digest_hi a multiple of digest_lo, as a client's
   // counters can be) must not collide, and chosen keys cannot either.
-  struct KeyHash {
-    static uint64_t Mix(uint64_t h) {
-      h ^= h >> 33;
-      h *= 0xFF51AFD7ED558CCDull;
-      h ^= h >> 33;
-      h *= 0xC4CEB9FE1A85EC53ull;
-      h ^= h >> 33;
-      return h;
-    }
-    static uint64_t Seed();
-    size_t operator()(const BlockKey& k) const {
-      static const uint64_t seed = Seed();
-      return static_cast<size_t>(
-          Mix(Mix(Mix(k.digest_lo ^ seed) ^ k.digest_hi) ^ k.tenant_hash));
-    }
-  };
+  // BlockKeyMixHash: its seed falls back to the clock, an address and the
+  // pid where std::random_device throws (no entropy source in a restricted
+  // container), instead of ending the process inside the noexcept hash.
+  using KeyHash = BlockKeyMixHash;
   // Where a record is: its segment, the incarnation it was written in, and
   // its offset in 4 KiB blocks.
   struct Location {

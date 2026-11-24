@@ -28,8 +28,10 @@
 #include <mutex>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "cache/disk_slab_store.h"
@@ -2011,6 +2013,7 @@ namespace dfkv {
 class LogStoreTestPeer {
  public:
   static size_t Hash(const BlockKey& k) { return LogStore::KeyHash()(k); }
+  using KeyHash = LogStore::KeyHash;
 };
 }  // namespace dfkv
 
@@ -2018,6 +2021,22 @@ class LogStoreTestPeer {
 // hash, digest_hi ^ digest_lo * C, put every key {id * C + 1, id} into a
 // handful of buckets, so each 1-byte PUT spent ~0.4 ms in hash chains under
 // the store's mutex (p99 168 ms with 8 writers).
+// The index's seed is taken inside the noexcept hash, on the first PUT:
+// where std::random_device throws (no entropy source) it falls back instead
+// of ending the process.
+uint64_t NoEntropySource() { throw std::runtime_error("no entropy source"); }
+
+TEST(LogStore, TheIndexSeedSurvivesNoEntropySource) {
+  static_assert(std::is_same_v<dfkv::LogStoreTestPeer::KeyHash, dfkv::BlockKeyMixHash>,
+                "the index uses the hash whose seed falls back");
+  const uint64_t a = dfkv::BlockKeyMixHash::MakeSeed(&NoEntropySource);
+  EXPECT_NE(a, 0u);
+  uint64_t b = a;
+  for (int i = 0; i < 1000 && b == a; ++i)
+    b = dfkv::BlockKeyMixHash::MakeSeed(&NoEntropySource);
+  EXPECT_NE(a, b) << "the fallback is a constant";
+}
+
 TEST(LogStore, RelatedKeysSpreadOverTheIndex) {
   constexpr uint64_t kKeys = 100000;
   std::set<size_t> buckets;
