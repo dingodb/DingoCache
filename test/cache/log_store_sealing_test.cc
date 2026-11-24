@@ -87,16 +87,21 @@ TEST(LogStoreSealing, AKillLeavesOnlyTheUnsealedSegmentsToWalk) {
     ASSERT_TRUE(ok) << s.StartupError();
     const auto r = s.GetRecoveryStats();
     EXPECT_GE(r.segments_walked, 1u);
-    EXPECT_LE(r.segments_walked, 4u) << "open + relocation + sealer queue";
+    EXPECT_LE(r.segments_walked, 5u)
+        << "open + relocation + sealer queue + the pre-opened segment";
     EXPECT_GE(r.summaries_loaded, 2u);
     EXPECT_EQ(s.Count(), kCount);
     for (uint64_t id = 0; id < kCount; id += 5) EXPECT_TRUE(Has(s, id, kLen)) << id;
   }
   // The open above sealed the walked segments; a process that opens and is
-  // killed at once leaves at most its own empty open segment to walk.
+  // killed at once leaves at most its own empty open segment to walk. Without
+  // pre-opening: the sealer may otherwise have pre-opened one more segment by
+  // the kill, which is walked too (it has a header and no trailer).
   ASSERT_EQ(InChild([&]() -> int {
+              auto o = Opts(dir, 64ull << 20);
+              o.preopen = false;
               bool ok = false;
-              LogStore s(Opts(dir, 64ull << 20), &ok);
+              LogStore s(o, &ok);
               Kill(ok ? 0 : 2);
             }),
             0);

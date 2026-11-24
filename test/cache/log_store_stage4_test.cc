@@ -111,7 +111,8 @@ TEST(LogStoreStage4, SeveralOpenSegmentsTakeConcurrentWrites) {
 }
 
 // After a kill, the open segments are among the walked ones: K of them, the
-// relocation segment and the sealer queue at most (§8.4).
+// relocation segment, the sealer queue and the pre-opened segment at most
+// (§8.4).
 TEST(LogStoreStage4, AKillWalksAtMostTheOpenSegmentsAndTheQueue) {
   const fs::path dir = TestDir("kopenkill");
   constexpr size_t kLen = 300000;
@@ -131,7 +132,7 @@ TEST(LogStoreStage4, AKillWalksAtMostTheOpenSegmentsAndTheQueue) {
   bool ok = false;
   LogStore s(Quiet(dir, 64ull << 20), &ok);
   ASSERT_TRUE(ok) << s.StartupError();
-  EXPECT_LE(s.GetRecoveryStats().segments_walked, 3u + 1u + 2u);
+  EXPECT_LE(s.GetRecoveryStats().segments_walked, 3u + 1u + 2u + 1u);
   EXPECT_EQ(s.Count(), 100u);
   for (uint64_t id = 0; id < 100; id += 3) EXPECT_TRUE(Has(s, id, kLen)) << id;
   fs::remove_all(dir);
