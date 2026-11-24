@@ -1,6 +1,6 @@
 # Unavailable owners: absent grace, cooldown reroute, recent-REMOVE memory, read-back
 
-Status: design, revision 9 (stage M). Stages A, C and M are
+Status: design, revision 11 (stage B's code). Stages A, C and M are
 implemented; the rest is design. Each
 mechanism sits behind its own switch, off by default; none changes a released
 binary. A and C are client-side only. The recent-REMOVE memory (M) adds one
@@ -196,8 +196,65 @@ in cooldown, chosen by the rule below. A miss at the substitute is a miss
   PUTs are refused (a miss for the caller, counted), so nothing is written
   to a substitute that could not be cleaned up. The cooling parts of
   fan-out REMOVEs (below) go to a separate queue with a bound of the same
-  size, past which they are given up and counted. A substitute copy therefore lives at most one
-  episode plus its cleanup, and no later episode finds it. Cost: one REMOVE
+  size, past which they are given up and counted. A substitute copy
+  therefore lives at most one episode plus its cleanup, and no later
+  episode finds it unchecked (the deferral below excepted).
+- **Deferred cleanup with B (revision 11).** An empty return of the owner
+  is the case B reads the episode's keys back for (§3.4), so with B on the
+  episode-end REMOVEs of an episode's keys wait until B's window after the
+  episode has passed. The deferral holds only while every registered
+  client reads substitutes safely, i.e. the gate's last registry answer
+  shows every registered client with B configured (marker field
+  `readback=1`); otherwise the episode end removes the keys at once, as
+  above. The condition is re-checked at every tick and at every registry
+  answer, not only at the episode end. It fails when the last answer no
+  longer shows every registered client with `readback=1` (one registered
+  without it, or one dropped it), when the answer is stale (older than two
+  polls), or when the gate is closed; every deferred key is then due at
+  once and cleaned up as above, and a due key is never deferred again.
+  Residual: a client without `readback=1` that registers during a deferral
+  is unseen for at most one registry poll plus the list cache's TTL (at
+  most 1000 ms) plus one tick, the same class and size as the gate's window
+  for an unmarked client (below). A client of this release with C but not
+  B never reads a deferred copy in that window: while its last registry
+  answer shows any client with `readback=1`, it treats a substitute read of
+  a key outside its own current episode as a miss. Only older releases
+  remain in it; once seen, one without the fan-out marker closes the gate,
+  and one with it (C of revision 8) ends the deferral. While deferred:
+  - the keys are in this client's cleanup queue from the episode end: its
+    own plain reads skip them, and only its read-back reads them, after
+    asking M (§3.4);
+  - the pending-cleanup check is local to the client that wrote the copy.
+    Another client W in its own episode for the same owner may pick the
+    same substitute S and would read K plainly, reopening the five-step
+    sequence above for up to the window. So a client with B configured
+    treats every substitute read of a key that is not among its own
+    current episode's tracked writes as a read-back: it asks M at K's ask
+    set without O (§3.4) and reads S only if every answer is 0. Reads of
+    its own current-episode writes stay plain. A read here is every op whose
+    answer reports on S's copy: GET, EXIST, and RETAIN, REFRESH (the
+    connectors' existence probe) and SET alike (a SET's answer reports
+    the copy present; "own" is decided before the SET tracks the key).
+    Cost: one M round trip per such op on another episode's key, only while
+    an owner cools;
+  - an ownership change during the deferral that makes S K's owner is the
+    ordinary new-owner case (S's copy is a plain owner's copy, as for any
+    key whose owner changed);
+  - the writer re-writing K to S in a new episode while the deferred
+    cleanup is pending: its read of K at S is refused by its own check (a
+    miss), its re-PUT is tracked in the new episode, and the deferred
+    REMOVE may then delete the new copy: a miss, never a stale value;
+  - a clean close sends the deferred REMOVEs at once, ignoring their
+    not-before time (bounded as above). A client killed during the
+    deferral leaves the copies as for a client killed mid-episode (the
+    residual above), now for up to an episode plus the window; other B
+    clients' reads of them go through M (the second rule above);
+  - deferred keys count toward `DFKV_RING_REROUTE_KEYS`: with B the cap
+    fills at about the rerouted write rate × (episode + window), after
+    which rerouted PUTs are refused (a miss, the safe direction, counted).
+    DEPLOY states the sizing.
+  A substitute copy therefore lives at most one episode, B's window when
+  deferred, and its cleanup. Cost: one REMOVE
   per key written to a substitute. A clean close (`dfkv_close`, which a
   restart goes through) runs the same cleanup for every open episode first,
   bounded by `DFKV_RING_REROUTE_CLOSE_MS` (default 2000); what it could not
@@ -240,7 +297,8 @@ in cooldown, chosen by the rule below. A miss at the substitute is a miss
   - The registry holds a free-form info string per client (today the
     caller's `client_info`); the native library of this release appends a
     capability marker (`dfkv-remove-fanout=1;poll_ms=<n>`, its member-poll
-    interval) whenever fan-out is on. A registered client without the
+    interval) whenever fan-out is on, with `;readback=1` added when B is
+    configured (used only by the deferral of revision 11). A registered client without the
     marker (an older release, or fan-out off) counts as not fanning out, and
     turns C and B off at the next poll (logged once, counted); so does a
     marked client without the `poll_ms` field. The largest `poll_ms` sets S
@@ -272,7 +330,10 @@ in cooldown, chosen by the rule below. A miss at the substitute is a miss
     about one registration attempt plus one registry poll plus the MDS list
     cache's TTL (at most 1000 ms). In that interval
     such a REMOVE reaches the owner only, as a REMOVE by any client does
-    today.
+    today. The deferral of revision 11 has a window of the same class and
+    size: a client without `readback=1` that registers during a deferral
+    is unseen for at most one registry poll plus the list cache's TTL
+    (at most 1000 ms) plus one tick (below).
   - REMOVE fan-out itself is on whenever C or B is configured, even while the
     gate keeps them off, so a mixed group converges. There is no switch for
     fan-out alone: the marker means "C or B is configured here".
@@ -345,7 +406,10 @@ current owner may ask the previous owner once.
 
 - **Absent owners.** With A on, a miss whose full-ring owner is absent asks
   the absent member under the same rules (M asked, gate passing), as a
-  previous owner.
+  previous owner. Absent-owner read-back: not in this stage (stage B's code
+  reads back only from the held ring's owner and an ended episode's
+  substitute; an absence that starts or ends is a write-ring change like
+  any other).
 - **Owner changes.** Every write-ring change this client adopts (a member
   added or removed, a drain or an absence starting or ending) keeps the write
   ring before it for the window; a C episode is a per-member change (keys of
@@ -379,23 +443,69 @@ current owner may ask the previous owner once.
   `F`, so a remover acting on it did so no earlier than `F − poll_max ≥
   adoption − settle`, and a read inside the window, at most
   `DFKV_RING_READBACK_MS` after adoption, asks about an age that covers it.
+- **When a read is a read-back candidate.** All of these hold, or the miss
+  stands as today:
+  - a GET (any form, batched or not) or EXIST of K was answered *not found*
+    by K's current owner O itself (never on a hit, never on *length
+    mismatch*, never on an I/O error or a skipped cooling owner: those are
+    not evidence the key is absent; and never when the *not found* came from
+    a substitute because O cools in this client, §3.2: the substitute is not
+    O);
+  - K has a previous owner P ≠ O: its owner on the write ring held for an
+    open window (the window of the last adopted change, not held, §above;
+    or a C episode that ended within the window), or its absent owner (A;
+    not in this stage);
+  - the registry gate is open (§3.2), and S is not growing;
+  - the namespace has counted no length mismatch (§2);
+  - P is not in cooldown in this client (asking a cooling P is skipped,
+    and counted `refused_cooling`).
 - **The read-back rule.** Key K, missed (*not found*) at current owner O,
   previous owner P:
-  1. Ask M (`kRemovedWithin`, age H) at K's first `DFKV_RING_REMOVE_FANOUT`
-     successors on the union of the current and the previous full ring.
-     With the gate passing, every remover fans out to the first successors
-     of its own ring, so for a ring that differs from this client's by fewer
-     than that many member changes the asked successors include a node that
-     received the REMOVE.
-  2. Read back from P only if every asked node answered *not removed*. Any
-     *removed* or *unknown* (no M, coverage shorter than H, node
-     unreachable) and there is no read-back: the miss stands. B fails
-     closed.
+  1. Ask M (`KVClient::RemovedWithin`, `kRemovedWithin`, age H) at the ask
+     set of K: the union, over this client's recent rings (§3.2) and the
+     write ring held for the window, of each ring's first F members in K's
+     successor order (F = `DFKV_RING_REMOVE_FANOUT`), plus K's drainer and
+     its absent owner; each node once, **except O**, the current owner that
+     has just answered *not found* for K. O is left out because a restarted
+     O (the empty return B exists for) answers *unknown* for its first H,
+     which would refuse every read-back B is for; its *not found* is already
+     its answer. P is always in the set (it is the first member of the held
+     ring).
+     **Why the set holds a node that saw the REMOVE.** A remover's targets
+     (§3.2) contain at least the first F members of each of its recent
+     rings, and a REMOVE is ok only if every target confirmed it (each then
+     recorded it in its M before the reply). Let c be the number of member
+     changes between the remover's ring and the nearest ring of the
+     reader's set. Then the two lists of K's first F successors share at
+     least F − c members (F with a shared ring), and after leaving out O at
+     least F − c − 1. O can be the only shared member only when c = F − 1,
+     which is outside the rule. The rule is safe when c ≤ F − 2: c ≤ 1 at the default
+     F = 3, which covers the single change behind every read-back window.
+     Hence **B requires F ≥ 3**: a client configured with B and a smaller
+     `DFKV_RING_REMOVE_FANOUT` refuses B at configuration (B off, a
+     WARNING). (With F = 1 every read-back, which always follows a change,
+     would rest on no overlap at all.)
+  2. Read back from P only if every asked node answered 0 (*not removed*).
+     Any 1 (*removed*) or 2 (*unknown*) and there is no read-back: the miss
+     stands. *Unknown* covers: a node without M (`kInvalid`, and for 60 s
+     after it), a node whose coverage is shorter than H (started less than H
+     ago, a short `DFKV_REMOVE_MEMORY_MS`, or dropped records for room), a
+     node that could not be asked (cooling, I/O error), and every key of a
+     request that failed as a whole (a chunk's failure makes all its keys
+     2, never 0). B fails closed: a 2 is never read as "not removed". Counted as
+     `dfkv_client_readback_reads_total{result="refused_removed"}` or
+     `{result="refused_unknown"}`.
   3. The read-back value must pass the read's own length check (§2); a
      namespace with a counted length mismatch does not read back.
   4. A hit at the owner always wins; read-back happens only on *not found*,
      never on *length mismatch*.
 - **M must cover H.** The nodes need `DFKV_REMOVE_MEMORY_MS ≥ H`. A node
+  that does not cover it refuses read-backs (safe), and is made visible: the
+  `kRemovedWithin` reply carries `covered_ms`, and a node whose answers have
+  stayed below H for longer than H (so not a recent start) is counted in
+  `dfkv_client_readback_memory_short_total{reason="window"}`, with one
+  WARNING per node. The server cannot know H; the switch documentation
+  states the rule. A node
   whose coverage is shorter (a short setting, a capacity drop, or the first
   H after its start) answers *unknown*, so B fails closed there and reads
   nothing back. At configuration time the client clamps
@@ -405,8 +515,9 @@ current owner may ask the previous owner once.
   The server documentation states the rule: M at least the clients'
   read-back window plus ten of the group's longest poll intervals.
 - **What remains.** A REMOVE older than H, or one that went to a node outside
-  the asked successors (a remover whose ring differs from the reader's by
-  `DFKV_RING_REMOVE_FANOUT` or more member changes). A change given a
+  the asked successors (a remover whose ring differs from the nearest ring
+  of the reader's set by more than F − 2 member changes: 2 or more at the
+  default F = 3). A change given a
   window rules out a REMOVE older than H by a remover acting on the views
   this reader saw, but not one made on a view the reader never saw: a
   REMOVE made on a shrink view that was served for less than one reader
@@ -421,9 +532,21 @@ current owner may ask the previous owner once.
   refuses read-back while more than one change is held in the window (a
   second change inside the window clears the previous ring instead of
   chaining it).
+- **Batches.** The candidates of a batch read are collected after the
+  batch's own reads; each node of their ask sets gets one `kRemovedWithin`
+  with all its candidates (1024 keys per request), and the candidates whose
+  every answer is 0 are read back at their P in one more batch per node.
+  A batch therefore costs at most one more round trip to M and one to the
+  previous owners, in parallel per node, and nothing when nothing missed.
 - **No write-back** of a read-back value (a later option, measured
   separately). **Cost:** for each read-back candidate one batched M query to
-  up to 3 nodes and one read at P; nothing for a hit at the owner.
+  up to `DFKV_RING_REMOVE_FANOUT` × (recent rings + 1) + 2 nodes (3 in the
+  usual case of no view change in S) and one read at P; nothing for a hit
+  at the owner.
+- **Before B is ever default-on:** M's table costs about 106 B per entry
+  (§3.3, measured); a compact table (a ring buffer and an open-addressing
+  index, about 48 B) is a prerequisite, as is a per-node memory figure at
+  the group's REMOVE rate × H.
 
 ## 4. Retention, tenants, debounce
 
@@ -480,7 +603,8 @@ current owner may ask the previous owner once.
 | `dfkv_client_reroute_cleanup_total{result}` | counter | episode-end REMOVEs of keys written to substitutes: ok, queued (failed, sent from the tick), abandoned (not sent before a close's bound) |
 | `dfkv_client_reroute_refused_total` | counter | rerouted PUTs refused because `DFKV_RING_REROUTE_KEYS` keys are tracked |
 | `dfkv_client_remove_unconfirmed_total{reason}` | counter | REMOVEs answered not ok because a target did not confirm in the call: cooling (in this client), failed |
-| `dfkv_client_readback_reads_total{result}` | counter | read-back attempts: hit, miss, refused_removed, refused_unknown, refused_length, refused_gate |
+| `dfkv_client_readback_reads_total{result}` | counter | read-back attempts: hit, miss, refused_removed, refused_unknown, refused_length, refused_gate, refused_cooling |
+| `dfkv_client_readback_memory_short_total{reason}` | counter | nodes whose M stayed shorter than H for longer than H (`window`: `DFKV_REMOVE_MEMORY_MS` below H); one WARNING per node |
 | `dfkv_client_readback_changes_refused_total{reason}` | counter | adopted changes given no read-back window: held (guard held the change longer than `settle − poll_max`) |
 | `dfkv_client_readback_window_active` | gauge | 1 while a previous ring or a C episode is held |
 
@@ -495,6 +619,35 @@ against the same code with its switches off:
 3. flap 3 s, empty return: base vs C vs C+M+B;
 4. member record deleted 40 s, node alive: base vs A vs A+M+B;
 5. kill 90 s, empty return: base vs A+M+B.
+
+**Acceptance for stage B** (cases 3 and 5, with the churn below; the switches
+of every variant set on every client and, for M, every server):
+
+- case 3 (flap 3 s, empty return), C+M+B against C: the full-prefix hit
+  rate in the 30 s after the return at least the prototype's (§1 table: the
+  keys written to the substitute during the episode are read back from it,
+  their previous owner); 0 violations;
+- case 5 (kill 90 s, empty return), A+M+B against base and A: the hit rate
+  in the 30 s after the return at least 90 % of base's own rate 30-60 s
+  after the return in the same run (the churned steady rate: the second
+  remover starts inside the event and lowers the steady rate below the
+  pre-kill rate; the prototype's 100 % had no churn); 0 violations. Under
+  churn B refuses keys removed and written again within H (M records the
+  REMOVE, not the later PUT; counted `refused_removed`), which is what keeps
+  the first seconds below the steady rate;
+- case 5 with the returned node as O: during its first H (its M empty,
+  answering 2) read-backs still succeed, since O is not asked, with 0
+  violations;
+- a 2 from any other asked node refuses the read-back (`refused_unknown`),
+  0 violations: checked with a second node restarted empty during the
+  window;
+- F = 2 with B configured: B refuses to start (a WARNING, B off), and the
+  results equal the variant without B;
+- a server with M off in an M+B variant (one node): every read-back whose
+  ask set contains it is refused (`refused_unknown`), 0 violations;
+- with B off, no `kRemovedWithin` is sent (the servers'
+  `dfkv_removed_within_queries_total` stays 0) and the results equal the
+  variant without B.
 
 **Correctness under churn**, in every variant: removers REMOVE a sample of
 present keys throughout (and PUT some again); every reader hit is checked
@@ -566,6 +719,23 @@ all variants. The removers and readers include:
     (with a substitute refusing, the abandoned keys are counted);
   - C and B unconfigured: routing and REMOVE are today's, byte for byte
     (owners of 2000 keys compared, REMOVE targets recorded).
+- for revision 11's deferred cleanup (C and B):
+  - a deferred copy, then a ring change and a REMOVE that misses S, then a
+    read through B: `refused_removed`, 0 violations;
+  - another client's later plain episode for the same owner picks S and
+    reads the deferred copy: refused by its M check (`refused_removed`), and
+    with a registered client without `readback=1` the episode end cleans up
+    at once; must fail on revision 11 as first proposed (local check only);
+  - a clean close during the deferral: no tracked key is left on S;
+  - the reroute cap filled by deferred keys: rerouted PUTs refused and
+    counted;
+  - a client drops `readback=1`, or one without it registers, during the
+    deferral (and the registry answer goes stale, and the gate closes): the
+    deferred keys are REMOVEd from S within one poll plus the list cache's
+    TTL plus one tick, counted as cleanup ok;
+  - a client with C but not B, whose registry answer shows a client with
+    `readback=1`: its substitute read of a key it did not write in its
+    current episode is a miss.
 
 Footprint as before: under 2 GiB written, private etcd and ports, everything
 removed afterwards.
@@ -583,6 +753,31 @@ removed afterwards.
 ## 9. Revisions
 
 - Revision 1: first version, after two prototype measurement runs.
+- Revision 11 (stage B's code): the episode-end cleanup removed the
+  substitute copies B's case 3 reads back; with B on it now waits for B's
+  window, but only while every registered client advertises B
+  (`readback=1` in the marker), and a B client asks M before any
+  substitute read of a key outside its own current episode (the pending
+  check is client-local, so another client's episode could otherwise read
+  the deferred copy plainly); the condition is re-checked at every tick and
+  registry answer, and once it fails every deferred key is due and never
+  deferred again; a client with C but not B misses such reads while any
+  client advertises B; the join window stated (one poll plus the list
+  cache's TTL plus one tick, as the gate's); a clean close sends deferred
+  REMOVEs at once; the crash residual, an ownership change during the
+  deferral, a re-write by the same client, and the cap's sizing stated; six
+  more measurement cases; case 5's bar restated against the churned steady
+  rate of the same run.
+- Revision 10 (stage B delta): when a miss is a read-back candidate (not
+  found at the owner itself, not at a substitute; a previous owner from an
+  open window, a C episode or A; gate open; P not cooling); the ask set
+  aligned with C's fan-out (each recent ring's and the held ring's first
+  F members, drainer, absent owner) without the current owner O, with the
+  overlap argument (F − c − 1, safe for c ≤ F − 2) and B requiring F ≥ 3;
+  a failed request makes all its keys unknown; a node whose M is shorter
+  than H is counted; what *unknown* covers and that it always refuses; batching of
+  the M questions and read-backs; acceptance criteria for §7 cases 3 and
+  5; a compact M table before B is default-on.
 - Revision 9 (stage M): M changes no answer of an existing op (a PUT after
   a REMOVE is stored and served as today, a GET, EXIST or REMOVE answered as
   today); M's window relates only to B's lookback H, not to C's S or the MDS
