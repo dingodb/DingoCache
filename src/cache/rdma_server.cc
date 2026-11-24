@@ -475,9 +475,40 @@ Status RdmaServer::Start(int port) {
       });
     }
   }
+  // Watch each rail's port at run time (RDS-02): off unless
+  // DFKV_RDMA_PORT_CHECK_MS is set (1000 recommended).
+  if (const char* value = std::getenv("DFKV_RDMA_PORT_CHECK_MS");
+      value && *value) {
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno == 0 && end != value && *end == '\0' && parsed >= 0)
+      port_check_ms_ = static_cast<int>(std::min<long>(parsed, 60000));
+  }
+  config_dump::RecordResolved("DFKV_RDMA_PORT_CHECK_MS",
+                              std::to_string(port_check_ms_));
+  rail_port_state_ =
+      std::make_unique<std::atomic<int>[]>(anchor_devs_.size());
+  for (size_t i = 0; i < anchor_devs_.size(); ++i) rail_port_state_[i] = -1;
+  rail_last_notice_ms_.assign(anchor_devs_.size(), 0);
+  rail_notified_state_.assign(anchor_devs_.size(), -1);
+  rail_down_polls_.assign(anchor_devs_.size(), 0);
+  rail_down_confirmed_ =
+      std::make_unique<std::atomic<bool>[]>(anchor_devs_.size());
+  for (size_t i = 0; i < anchor_devs_.size(); ++i)
+    rail_down_confirmed_[i] = false;
+  if (port_check_ms_ > 0) {
+    port_watcher_ = std::make_unique<rdma::PortWatcher>(anchor_devs_);
+    CheckRailPorts();  // a rail down at startup is refused from the start
+  }
   running_ = true;
   accept_thread_ =
       std::thread([this] { NameThisThread("rdma-accept"); AcceptLoop(); });
+  if (port_watcher_)
+    port_thread_ = std::thread([this] {
+      NameThisThread("rdma-ports");
+      PortWatchLoop();
+    });
   if (recv_chunk_idle_ms_ != 0) {
     recv_trim_thread_ = std::thread([this] {
       NameThisThread("rdma-recv-trim");
@@ -496,6 +527,92 @@ Status RdmaServer::Start(int port) {
   return Status::kOk;
 }
 
+size_t RdmaServer::DefaultRail() const {
+  for (size_t i = 0; rail_port_state_ && i < anchor_devs_.size(); ++i)
+    if (rail_port_state_[i].load(std::memory_order_acquire) != 0) return i;
+  return 0;
+}
+
+void RdmaServer::CheckRailPorts() {
+  const uint64_t now_ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  std::function<int(size_t)> seam;
+  {
+    std::lock_guard<std::mutex> lock(rail_listener_mu_);
+    seam = port_state_for_test_;
+  }
+  for (size_t rail = 0; rail < anchor_devs_.size(); ++rail) {
+    // The query (ibv_query_port, about 1 ms) runs under no lock.
+    const int state = seam ? seam(rail) : port_watcher_->State(rail);
+    if (state < 0) continue;  // unknown: keep what was last seen
+    const bool active = state == 1;
+    if (active) {
+      // Cleared before ACTIVE is published: a handshake that reads ACTIVE
+      // must not find the old confirmation and end itself.
+      rail_down_polls_[rail] = 0;
+      rail_down_confirmed_[rail].store(false, std::memory_order_release);
+    }
+    const int before =
+        rail_port_state_[rail].exchange(state, std::memory_order_acq_rel);
+    if (state != before) {
+      rail_port_changes_.fetch_add(1, std::memory_order_relaxed);
+      if (before >= 0 || !active)
+        DFKV_LOG_WARN("rdma: rail " + anchor_devs_[rail] + " port is " +
+                      (active ? "ACTIVE again" : "not ACTIVE; new connections "
+                                                 "are refused"));
+    }
+    // New handshakes are refused from the first poll that sees the port down
+    // (rail_port_state_). Existing connections end only on the second poll
+    // in a row: a link that retrains within a poll keeps its pooled QPs.
+    if (!active && ++rail_down_polls_[rail] == 2) {
+      // Set before the wake: a connection registering meanwhile checks it
+      // after its registration and ends itself (Serve).
+      rail_down_confirmed_[rail].store(true, std::memory_order_release);
+      DFKV_LOG_WARN("rdma: rail " + anchor_devs_[rail] +
+                    " port still not ACTIVE; its connections are ended");
+      // That rail's connections only: wake them, as Stop does, and they end.
+      std::lock_guard<std::mutex> lock(conn_mu_);
+      for (const auto& [ep, live] : live_eps_) {
+        if (live.rail != rail) continue;
+        ep->Wake();
+        rail_down_connections_ended_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    // The listener (an early heartbeat) hears of a state that differs from
+    // the last one it heard, at most once a second per rail; a change within
+    // the second is sent on the first poll after it, if it still holds. The
+    // first look at startup is what it starts from, not a change.
+    if (before < 0) {
+      rail_notified_state_[rail] = state;
+      continue;
+    }
+    if (state == rail_notified_state_[rail] ||
+        now_ms - rail_last_notice_ms_[rail] < 1000)
+      continue;
+    rail_last_notice_ms_[rail] = now_ms;
+    rail_notified_state_[rail] = state;
+    RailStateListener listener;
+    {
+      std::lock_guard<std::mutex> lock(rail_listener_mu_);
+      listener = rail_listener_;
+    }
+    if (listener) listener(anchor_devs_[rail], active);
+  }
+}
+
+void RdmaServer::PortWatchLoop() {
+  std::unique_lock<std::mutex> lock(port_mu_);
+  while (!port_cv_.wait_for(
+      lock, std::chrono::milliseconds(port_check_ms_),
+      [this] { return !running_.load(std::memory_order_relaxed); })) {
+    lock.unlock();
+    CheckRailPorts();
+    lock.lock();
+  }
+}
+
 void RdmaServer::Stop() {
   Quiesce();
   // Under the same lock: a second caller must not release the rails while the
@@ -508,6 +625,11 @@ void RdmaServer::Quiesce() {
   std::lock_guard<std::mutex> lk(stop_mu_);
   if (!running_.exchange(false)) return;
   recv_trim_cv_.notify_all();
+  {
+    std::lock_guard<std::mutex> lock(port_mu_);
+    port_cv_.notify_all();
+  }
+  if (port_thread_.joinable()) port_thread_.join();
   if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);  // wake accept()
   if (accept_thread_.joinable()) accept_thread_.join();
   if (recv_trim_thread_.joinable()) recv_trim_thread_.join();
@@ -964,7 +1086,8 @@ void RdmaServer::Serve(
       std::max<size_t>(wire_limits::kIoAlign,
                        std::min<size_t>(declared, max_msg_));
   devbuf[rdma::kDevNameBytes - 1] = '\0';
-  std::string dev = devbuf[0] ? std::string(devbuf) : dev_name_;
+  std::string dev =
+      devbuf[0] ? std::string(devbuf) : anchor_devs_[DefaultRail()];
   const auto rail_it =
       std::find(anchor_devs_.begin(), anchor_devs_.end(), dev);
   if (rail_it == anchor_devs_.end()) {
@@ -975,6 +1098,16 @@ void RdmaServer::Serve(
   }
   const size_t rail_index =
       static_cast<size_t>(std::distance(anchor_devs_.begin(), rail_it));
+  // A rail whose port is not ACTIVE: close before replying, as for a busy
+  // server. The client pauses and tries once more, then cools this rail of
+  // the peer and goes to another, instead of failing each operation on a QP
+  // that cannot carry it after RC retries.
+  if (rail_port_state_ &&
+      rail_port_state_[rail_index].load(std::memory_order_acquire) == 0) {
+    inactive_rail_refusals_.fetch_add(1, std::memory_order_relaxed);
+    close_boot();
+    return;
+  }
   RailStats& rail_stats = *rail_stats_[rail_index];
   const int rail_numa = anchors_[rail_index]->numa_node();
   // Resolved once per real connection, while the bootstrap socket is still
@@ -1296,6 +1429,7 @@ void RdmaServer::Serve(
   // Register this endpoint so Stop() can Wake() us out of WaitComp and join. The
   // running_ check under conn_mu_ closes the race with a concurrent Stop(): either
   // Stop sees us in live_eps_ (and wakes us) or we see running_==false here.
+  if (before_live_registration_for_test_) before_live_registration_for_test_();
   {
     std::lock_guard<std::mutex> lk(conn_mu_);
     if (!running_) {
@@ -1307,7 +1441,15 @@ void RdmaServer::Serve(
                           static_cast<size_t>(recv_lease.data() -
                                               segment->data()),
                           &served_any,
-                          &holding_grants});
+                          &holding_grants, rail_index});
+    // Its rail may have gone down after the check above, and the watcher
+    // may have woken the rail's connections before this one was among
+    // them: it ends itself. (A later wake finds it registered.)
+    if (rail_down_confirmed_ &&
+        rail_down_confirmed_[rail_index].load(std::memory_order_acquire)) {
+      ep.Wake();
+      rail_down_connections_ended_.fetch_add(1, std::memory_order_relaxed);
+    }
   }
   // From now on a close of the client's end wakes this thread, which ends
   // the connection (WaitComp returns -1, as for Stop).
@@ -2738,6 +2880,15 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_session_peer_closed_total", "counter",
     "Connections ended because their client closed its session channel",
     session_peer_closed_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_inactive_rail_refusals_total", "counter",
+    "Bootstrap connections refused because their rail's port was not ACTIVE",
+    inactive_rail_refusals_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_rail_down_connections_ended_total", "counter",
+    "Connections ended because their rail's port stopped being ACTIVE",
+    rail_down_connections_ended_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_rail_port_changes_total", "counter",
+    "Rail port state changes seen by the port watcher (DFKV_RDMA_PORT_CHECK_MS)",
+    rail_port_changes_.load(std::memory_order_relaxed));
   m(s, "dfkv_rdma_segment_evictions_total", "counter",
      "Connections evicted to free shared receive segment space",
      segment_evictions_.load(std::memory_order_relaxed));
@@ -2793,6 +2944,14 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_uring_init_fallbacks_total", "counter",
     "Connections that wanted io_uring but fell back to the sync path (ring init failed)",
     UringInitFallbacks());
+  s += "# HELP dfkv_rdma_rail_port_active Port state of each rail as the port "
+       "watcher last saw it: 1 ACTIVE, 0 not, -1 unknown or not watched\n";
+  s += "# TYPE dfkv_rdma_rail_port_active gauge\n";
+  for (size_t i = 0; rail_port_state_ && i < anchor_devs_.size(); ++i)
+    s += "dfkv_rdma_rail_port_active{dev=\"" +
+         PromLabelEscape(anchor_devs_[i]) + "\"} " +
+         std::to_string(rail_port_state_[i].load(std::memory_order_relaxed)) +
+         "\n";
   auto rail_metric = [&](const char* name, const char* type, const char* help,
                          const auto& value) {
     s += "# HELP "; s += name; s += " "; s += help; s += "\n";

@@ -370,6 +370,8 @@ jobs:
         RdmaPortState.ARailWhosePortGoesDownLeavesSelectionAndComesBack
         RdmaRailAdmission.ACooledRailIsProbedInTheBackground
         RdmaRailAdmission.ARailsLatencyExcludesConnectionSetup
+        RdmaServerPorts.ARailGoingDownEndsOnlyItsConnections
+        RdmaServerPorts.NoDeviceNamedGetsTheFirstActiveRail
         RdmaVerbs.PoolRegistrationDoesNotStallOtherRails
       # No GPU on the runner; the helper child runs only when spawned.
       SKIP_OTHER: >-

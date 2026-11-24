@@ -802,6 +802,18 @@ int main(int argc, char** argv) {
         return written ? dfkv::Status::kOk : dfkv::Status::kIOError;
       });
     }
+#ifdef DFKV_WITH_RDMA
+    // A rail's port going down or coming back reaches the MDS with an early
+    // heartbeat (whose health sample sees it), not up to an interval later.
+    // The listener holds the registrar by pointer: it is cleared, and
+    // rsrv->Stop() joins the port watcher, before the registrar is destroyed.
+    // Keep it so: no early return between here and that teardown.
+    if (rsrv) {
+      dfkv::MdsRegistrar* reg = registrar.get();
+      rsrv->set_rail_state_listener(
+          [reg](const std::string&, bool) { reg->RequestBeat(); });
+    }
+#endif
     registrar->set_registered_callback([mds_ready, group, node_id] {
       mds_ready->store(true, std::memory_order_release);
       DFKV_LOG_INFO("dfkv_server registered with MDS group=" + group +
@@ -874,6 +886,9 @@ int main(int argc, char** argv) {
   };
   if (mhttp) mhttp->Stop();
   registrar_metrics->store(nullptr, std::memory_order_release);
+#ifdef DFKV_WITH_RDMA
+  if (rsrv) rsrv->set_rail_state_listener(nullptr);
+#endif
   if (registrar) registrar->Stop();
   // A node drained by `dfkvctl drain` is being removed: its record goes now,
   // and clients drop it on their next poll instead of when its lease ends.

@@ -524,6 +524,8 @@ journalctl -u dfkv -n 10 --no-pager
 >
 > **本端端口状态**：client 每 `DFKV_RDMA_PORT_CHECK_MS`（默认 1000，0 关闭，上限 60000）查一次各 rail 的端口状态（每条 rail 一个常开的设备句柄，`ibv_query_port`）。端口离开 ACTIVE 的 rail 退出选择，其空闲连接回收，日志 WARN `port not ACTIVE`；回到 ACTIVE 后重新参与选择（INFO）。查询失败按状态未知处理、保持原样。启动时就不是 ACTIVE 的 rail 不在候选里（发现阶段只取 ACTIVE），运行中恢复也不会加入，需重启 client。指标 `dfkv_rdma_client_rails_port_down`、`dfkv_rdma_client_port_down_events_total`。
 >
+> **server 端口状态**：server 用同一个 `DFKV_RDMA_PORT_CHECK_MS` 在单独的线程里查各 rail 的端口（server 上默认 0，即关闭，行为与以前相同；建议设 1000，下面说的都是打开后的变化）（不占握手或服务线程，查询时不持这些线程要的锁）。端口不是 ACTIVE 的 rail：新连接在握手时直接关掉、不回答（`dfkv_rdma_inactive_rail_refusals_total`），client 当作对端忙暂停约 20 ms 再试一次，第二次仍被关就冷却 server 的这条 rail、改走别的 rail，不再在建好却走不通的 QP 上等 RC 重试耗尽；只有这一条 rail 的 client 立刻得到失败。端口连续两次查询都不是 ACTIVE 时（只有一次时只拒绝新连接，链路在一个查询周期内重新训练好的话已有连接不受影响），这条 rail 上已有的连接立即结束（只动这条 rail，`dfkv_rdma_rail_down_connections_ended_total`），释放它们的 pin 和接收槽；开了 `DFKV_RDMA_SESSION_FD` 的 client 复用前就能发现，否则下次使用时照旧等一次 RC 超时。状态变化（每条 rail 每秒至多一次；一秒内被压下的变化，在一秒过后的第一次查询时若仍成立再补发）会让 server 立刻向 MDS 发一次心跳，健康信息随之更新，client 下一次轮询（约 3 s）就看到，而不是最多等一个心跳间隔（10 s）。不指定设备的连接分到第一条不是 DOWN 的 rail。查询失败按未知处理，保持上次看到的状态；端口查询一直失败的设备（状态 -1）永远不会被确认为 DOWN，它上面的连接照旧靠自身的失败结束。`dfkv_rdma_rail_port_active{dev}` 是各 rail 最近一次看到的状态。“端口 ACTIVE 但路径不通”这里检测不到。
+>
 > GPU/CPU 异构示例（名称仅为示例，生产须用两端实际同 fabric 名）：
 > ```bash
 > # GPU host: two preferred rails plus one lower-bandwidth fallback

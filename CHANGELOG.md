@@ -292,6 +292,31 @@
   scratch buffer. Results, statuses and lengths are unchanged; variable-size
   reads (`*_auto`) still receive a shorter value.
 
+- Server, RDMA: the server can watch its rails' ports (RDS-02;
+  `DFKV_RDMA_PORT_CHECK_MS`, off by default on the server; 1000 ms is the
+  recommended setting). It took handshakes on a rail whose port was down;
+  each client then failed only after RC retries (about 3.7 s per
+  operation), the connections held their pins and receive slots until the
+  10-minute idle timeout, and clients learned of the rail through the next
+  heartbeat (up to 10 s) and their poll. With the check on, from a thread
+  of its own that holds no lock a handshake or a serve loop takes:
+  - a handshake on a rail whose port is not ACTIVE is closed before the
+    reply. A client takes that as a busy server once (about 20 ms pause),
+    then cools that rail of the server and uses another; a client with no
+    other rail fails at once;
+  - when a rail's port is not ACTIVE on two polls in a row, that rail's
+    connections are ended, and no other rail's (a link that retrains
+    within one poll keeps them); a connection registering meanwhile ends
+    itself;
+  - a change sends the MDS a heartbeat at once, at most one a second per
+    rail; a change within the second is sent once it is over, if it still
+    holds, so clients see the rail's state within their next poll;
+  - a client that names no device gets the first rail not known down.
+  New `dfkv_rdma_rail_port_active{dev}`,
+  `dfkv_rdma_inactive_rail_refusals_total`,
+  `dfkv_rdma_rail_down_connections_ended_total`,
+  `dfkv_rdma_rail_port_changes_total`.
+
 - Server, RDMA: a connection can write only into its own receive slots
   (RDS-13). The rkey a connection got covered the whole receive chunk, which
   holds other connections' slots: a client writing to a wrong address (a

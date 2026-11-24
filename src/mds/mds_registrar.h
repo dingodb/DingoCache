@@ -79,6 +79,9 @@ class MdsRegistrar {
   // changed drain state to the MDS without waiting out the interval. False
   // if no such heartbeat succeeded in time, or the loop is stopped.
   bool BeatNow(int timeout_ms);
+  // Wakes the background loop for a heartbeat now, without waiting for it.
+  // No effect once the loop has stopped.
+  void RequestBeat();
   // Deletes this member's record at the MDS (kDeregister). Call after Stop().
   bool Deregister();
 
