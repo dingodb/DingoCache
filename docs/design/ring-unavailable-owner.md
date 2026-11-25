@@ -101,8 +101,9 @@ it; its unconfirmed REMOVEs are retried when it returns.
   down); it is counted and queued (bounded, `DFKV_RING_ABSENT_REMOVE_QUEUE`).
   When the member returns the queue is sent at once: the failures during the
   absence put the member in PeerHealth cooldown (up to 30 s), so the return
-  to the view counts as a probe answer and ends the cooldown for that first
-  send, making the retry the trial. What is still unconfirmed is sent again
+  to the view counts as a probe answer and ends the cooldown once, in every
+  client (a reader that cooled it before it vanished included), making the
+  next request, the retry here, the trial. What is still unconfirmed is sent again
   at each tick, with PeerHealth as it is, for up to one grace after the
   return, then dropped and counted. A PUT that reaches the returned member
   before a later retry can be deleted by it: a miss, never a stale value. An absent
