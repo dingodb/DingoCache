@@ -737,6 +737,10 @@ class KVClient {
     ReportPeer(node, statuses.data(), statuses.size());
   }
   OpMetrics op_stats_;  // every public put/get/exist/remove call, exactly once
+  // Keys a node answered kCacheFull (refused for room, or a RAM tier over
+  // its dirty watermark) and kQuotaExceeded: neither is stored, and the
+  // connectors drop the item.
+  std::atomic<uint64_t> refused_cache_full_{0}, refused_quota_{0};
   int get_miss_retries_ = 1;
   uint64_t retain_reprobe_ms_ = 30000;  // DFKV_RETAIN_REPROBE_MS
   // supported == 0, learned less than retain_reprobe_ms_ ago. retain_mu_.

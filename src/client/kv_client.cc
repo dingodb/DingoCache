@@ -1975,7 +1975,13 @@ Status KVClient::RemovedWithin(const std::string& node,
 void KVClient::ReportPeer(const std::string& node, const Status* statuses,
                           size_t count) {
   PeerOutcome outcome;
-  for (size_t i = 0; i < count; ++i) outcome.Add(statuses[i]);
+  for (size_t i = 0; i < count; ++i) {
+    outcome.Add(statuses[i]);
+    if (statuses[i] == Status::kCacheFull)
+      refused_cache_full_.fetch_add(1, std::memory_order_relaxed);
+    else if (statuses[i] == Status::kQuotaExceeded)
+      refused_quota_.fetch_add(1, std::memory_order_relaxed);
+  }
   const bool refused = t_->TakeUnreachableRefusal();
   health_.Report(node, outcome, NowMs(), outcome.failed && refused);
 }
@@ -2049,6 +2055,12 @@ std::string KVClient::MetricsSnapshot() const {
   s += health_.Render();
   s += peer_lat_.Render();
   s += op_stats_.Render();
+  s += "# HELP dfkv_client_node_refusals_total Keys a node refused to store: cache_full (no room, or its RAM tier over the dirty watermark), quota_exceeded\n";
+  s += "# TYPE dfkv_client_node_refusals_total counter\n";
+  s += "dfkv_client_node_refusals_total{status=\"cache_full\"} " +
+       std::to_string(refused_cache_full_.load(std::memory_order_relaxed)) + "\n";
+  s += "dfkv_client_node_refusals_total{status=\"quota_exceeded\"} " +
+       std::to_string(refused_quota_.load(std::memory_order_relaxed)) + "\n";
   if (dedup_) {
     s += "# HELP dfkv_client_dedup_hits_total Rendezvous results served from shm\n";
     s += "# TYPE dfkv_client_dedup_hits_total counter\n";

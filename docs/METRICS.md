@@ -471,6 +471,7 @@ Prometheus 调用。vLLM 使用同一 allowlist，区别只是在 family 前加 
 | `dfkv_client_op_requests_total{op}` | 公开 scalar/batch/SG 调用次数；每次调用严格加 1 |
 | `dfkv_client_op_keys_total{op}` | 调用提交的 key 数；TCP fan-out、RDMA pipeline、重试和 rendezvous 不重复计数 |
 | `dfkv_client_op_hits_total{op}` | put/remove 确认成功数、get 命中数、exist 存在数；shm/CUDA rendezvous 命中也计入 |
+| `dfkv_client_node_refusals_total{status}` | 节点拒绝写入的 key 数：`cache_full`（没有空间，或 RAM 层未落盘数据超过水位 `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`），`quota_exceeded`（超出租户配额）。这些 key 没有写入，连接器按失败处理（不会重试），之后读取会 miss |
 | `dfkv_client_op_bytes_total{op}` | 成功移动的 payload 字节 |
 | `dfkv_client_op_latency_seconds{op}`（C 快照 histogram）/ `dfkv_client_op_max_seconds{op}`（镜像 gauge） | 完整公开调用延迟（含 rendezvous 等待和有界重试）/ lifetime max；prometheus_client 不重复注册外部累计 histogram，插件另用下述 per-batch histogram |
 

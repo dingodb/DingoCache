@@ -3,6 +3,13 @@
 ## Unreleased
 
 
+
+- Client: keys a node refused to store are counted,
+  `dfkv_client_node_refusals_total{status="cache_full"|"quota_exceeded"}`
+  (also in the Python metrics mirror). A write-back RAM tier over its dirty
+  watermark answers new PUTs kCacheFull while its flush backlog drains; the
+  connectors take that as not stored, and it was not visible on the client.
+
 - RDMA client: `DFKV_RDMA_CONNECT_MS` and `DFKV_RDMA_IO_MS` above 2^31-1
   resolved to a negative or zero timeout (the number was cast to an int);
   they now resolve to the default, with the warning they already gave. The

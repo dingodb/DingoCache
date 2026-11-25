@@ -1448,3 +1448,28 @@ TEST(ClientPernodeStats, RotationSplitsBatchesAndBoundsOversizeLines) {
   EXPECT_NE(combined.find("rotation-last"), std::string::npos) << combined;
   EXPECT_EQ(combined.find(std::string(2000, 'x')), std::string::npos);
 }
+
+// A node's refusals to store are counted on the client, by status: the
+// connectors drop such keys, and nothing else on the client showed them.
+TEST(ClientMetrics, NodeRefusalsAreCountedByStatus) {
+  MetricsTransport transport;
+  transport.pipeline = true;
+  transport.cache_statuses = {Status::kCacheFull, Status::kQuotaExceeded,
+                              Status::kCacheFull, Status::kOk};
+  KVClient client({{"refusing-node", "10.0.0.1:12400"}}, "refusals/client",
+                  &transport);
+  const std::string value = "payload";
+  const std::array<std::string, 4> keys{"r0", "r1", "r2", "r3"};
+  std::vector<KvPutItemSg> puts;
+  for (const std::string& key : keys)
+    puts.push_back({key, {value.data()}, {value.size()}});
+  EXPECT_EQ(client.BatchPutSg(puts),
+            std::vector<bool>({false, false, false, true}));
+  const std::string m = client.MetricsSnapshot();
+  EXPECT_NE(m.find("dfkv_client_node_refusals_total{status=\"cache_full\"} 2\n"),
+            std::string::npos)
+      << m;
+  EXPECT_NE(m.find("dfkv_client_node_refusals_total{status=\"quota_exceeded\"} 1\n"),
+            std::string::npos)
+      << m;
+}
