@@ -120,6 +120,11 @@ std::atomic<uint64_t> g_transient_user_mr_active{0};
 std::atomic<uint64_t> g_lease_write_mr_active{0};
 std::atomic<uint64_t> g_lease_read_mr_active{0};
 std::atomic<uint64_t> g_cq_completions{0};
+// The window test hooks can be used by concurrent endpoint opens and closes.
+// Copy a hook while holding this lock so another close cannot restore an empty
+// hook underneath us. Test state must not temporarily hide another endpoint's
+// fault injection; the hook is invoked once copied, outside the lock.
+std::mutex g_window_test_mu;
 std::function<bool()> g_window_alloc_seam;  // test seam, see header
 std::function<int(ibv_mw*)> g_window_dealloc_seam;  // test seam, see header
 std::function<void(ibv_mw*)> g_window_bind_observer;  // test seam, see header
@@ -236,8 +241,12 @@ void RequireVerbsRelease(ibv_context* ctx, int result, const char* operation) {
 // for that release and let the QP be destroyed. Ordinary failures are not
 // swallowed or mapped into a permission to free the backing RAM.
 bool DeallocWindowForRecovery(ibv_context* ctx, ibv_mw* mw) {
-  const int error = g_window_dealloc_seam ? g_window_dealloc_seam(mw)
-                                          : ibv_dealloc_mw(mw);
+  std::function<int(ibv_mw*)> seam;
+  {
+    std::lock_guard<std::mutex> lk(g_window_test_mu);
+    seam = g_window_dealloc_seam;
+  }
+  const int error = seam ? seam(mw) : ibv_dealloc_mw(mw);
   if (error == 0) {
     RequireVerbsRelease(ctx, 0, "ibv_dealloc_mw");
     return false;
@@ -712,11 +721,11 @@ void RcEndpoint::Close() {
     RequireVerbsRelease(ctx_, ibv_destroy_qp(qp_), "ibv_destroy_qp");
     qp_ = nullptr;
   }
-  std::function<int(ibv_mw*)> seam = std::move(g_window_dealloc_seam);
-  g_window_dealloc_seam = nullptr;
+  // The injected recovery tries above include post-ERR errors. Even a
+  // permanently failing seam cannot authorize dropping a bound window: this
+  // final deallocation is the real verb, and failure stays fail-closed.
   for (auto* mw : refused)
     RequireVerbsRelease(ctx_, ibv_dealloc_mw(mw), "ibv_dealloc_mw");
-  g_window_dealloc_seam = std::move(seam);
   for (auto* mr : lease_write_mr_) DeregisterMr(mr);
   g_lease_write_mr_active.fetch_sub(lease_write_mr_.size(),
                                    std::memory_order_relaxed);
@@ -1287,22 +1296,30 @@ uint64_t RcEndpoint::PortRateMbps() const {
 }
 
 void RcEndpoint::SetWindowAllocSeamForTest(std::function<bool()> seam) {
+  std::lock_guard<std::mutex> lk(g_window_test_mu);
   g_window_alloc_seam = std::move(seam);
 }
 
 void RcEndpoint::SetWindowDeallocSeamForTest(std::function<int(ibv_mw*)> seam) {
+  std::lock_guard<std::mutex> lk(g_window_test_mu);
   g_window_dealloc_seam = std::move(seam);
 }
 
 void RcEndpoint::SetWindowBindObserverForTest(
     std::function<void(ibv_mw*)> observer) {
+  std::lock_guard<std::mutex> lk(g_window_test_mu);
   g_window_bind_observer = std::move(observer);
 }
 
 bool RcEndpoint::AllocWindows(size_t n) {
   if (!pd_ || !windows_.empty()) return false;
+  std::function<bool()> alloc_seam;
+  {
+    std::lock_guard<std::mutex> lk(g_window_test_mu);
+    alloc_seam = g_window_alloc_seam;
+  }
   for (size_t i = 0; i < n; ++i) {
-    ibv_mw* mw = g_window_alloc_seam && !g_window_alloc_seam()
+    ibv_mw* mw = alloc_seam && !alloc_seam()
                      ? nullptr
                      : ibv_alloc_mw(pd_, IBV_MW_TYPE_2);
     if (!mw) {
@@ -1334,7 +1351,12 @@ bool RcEndpoint::PostBindWindow(size_t i, ibv_mr* region, const void* addr,
   wr.bind_mw.bind_info.length = len;
   wr.bind_mw.bind_info.mw_access_flags = IBV_ACCESS_REMOTE_READ;
   if (ibv_post_send(qp_, &wr, &bad) != 0) return false;
-  if (g_window_bind_observer) g_window_bind_observer(windows_[i]);
+  std::function<void(ibv_mw*)> observer;
+  {
+    std::lock_guard<std::mutex> lk(g_window_test_mu);
+    observer = g_window_bind_observer;
+  }
+  if (observer) observer(windows_[i]);
   // The window's current key, which the next bind must name (Soft-RoCE
   // refuses a bind that names an older one); a posted bind does not update
   // it as ibv_bind_mw does.
