@@ -11342,13 +11342,16 @@ TEST(RdmaRelease, OrdinaryErrorsAbortButAProvenGoneDeviceIsCounted) {
   ibv_context* ctx = ep.context_for_test();
   const uint64_t prior = rdma::DeadReleaseFailures();
 
-  ASSERT_EXIT((rdma::RequireVerbsReleaseForTest(ctx, 0, "ordinary-bug")),
+  // A still-confirming device makes EIO an ordinary error, so the guard
+  // aborts rather than discarding the caller's MR.
+  rdma::SetReleaseFaultsForTest({{}, []() { return 0; }, {}});
+  ASSERT_EXIT((rdma::RequireVerbsReleaseForTest(ctx, EIO, "ordinary-bug")),
               ::testing::KilledBySignal(SIGABRT), "unsafe resource release");
 
   rdma::SetReleaseFaultsForTest({{}, []() { return ENODEV; }, {}});
   rdma::RequireVerbsReleaseForTest(ctx, ENODEV,
                                    "ibv_dereg_mr(window region)");
-    EXPECT_EQ(rdma::DeadReleaseFailures(), prior + 1);
+  EXPECT_EQ(rdma::DeadReleaseFailures(), prior + 1);
   rdma::SetReleaseFaultsForTest({});
 }
 

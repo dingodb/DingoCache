@@ -292,7 +292,7 @@ TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
     ASSERT_TRUE(server.Healthy());
     ASSERT_TRUE(server.ram_enabled());
 
-    std::string value(8192, '\0');
+    std::string value(4097, '\0');
     for (size_t i = 0; i < value.size(); ++i)
       value[i] = static_cast<char>('a' + (i % 23));
     AlignedBuffer seed(value.size());
@@ -312,7 +312,8 @@ TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
     // An RDMA grant retains the complete reserved RAM allocation, including
     // padding, not only the requested payload. Staging is returned before the
     // grant's SEND completes, so payload-only accounting undercharges it.
-    EXPECT_GT(read.pin_bytes(), read.payload_len());
+    // 4097 bytes takes an 8192-byte RAM slot, not just payload + 4 KiB.
+    EXPECT_EQ(read.pin_bytes(), 8192u);
     AlignedBuffer follower_staging(1 << 20);
     PreparedRead follower;
     std::atomic<bool> follower_entered{false};
@@ -341,7 +342,7 @@ TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
     EXPECT_FALSE(follower.needs_io());
     EXPECT_TRUE(follower.source_registered());
     EXPECT_NE(follower.data(), follower_staging.data());
-    EXPECT_GT(follower.pin_bytes(), follower.payload_len());
+    EXPECT_EQ(follower.pin_bytes(), 8192u);
     EXPECT_EQ(std::memcmp(follower.data(), value.data(), value.size()), 0);
 
     // A second terminal call models SEND completion and releases the retained
