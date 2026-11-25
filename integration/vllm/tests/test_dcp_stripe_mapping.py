@@ -80,6 +80,29 @@ def test_tp8_dcp4_uses_dcp_replica_identity_for_stripes():
     ]
 
 
+def test_sorted_dcp_group_membership_replaces_modulo_rank_mapping():
+    # torch.distributed sorts a strided group's global ranks. Global TP2 is
+    # therefore DCP rank 1 in (0, 2), not rank 0 as global_rank % 2 claimed.
+    for tp_rank, dcp_rank in ((0, 0), (2, 1)):
+        identity = _key_stripe_identity(
+            tp_rank=tp_rank,
+            tp_size=4,
+            pcp_rank=0,
+            pcp_size=1,
+            dcp_rank=dcp_rank,
+            dcp_size=2,
+            num_kv_heads=4,
+            use_mla=False,
+            dcp_group_ranks=(0, 2),
+        )
+        assert (
+            identity.tp_rank,
+            identity.dcp_rank,
+            identity.stripe_idx,
+            identity.stripe_step,
+        ) == (tp_rank, dcp_rank, 0, 1)
+
+
 def test_mla_pcp_dcp_store_and_load_key_geometry():
     # (pcp_size, dcp_size, key namespaces, replica stripes per namespace)
     cases = [
@@ -131,3 +154,25 @@ def test_mla_pcp_dcp_store_and_load_key_geometry():
                 )
                 namespace = (identity.tp_rank, pcp_rank, identity.dcp_rank)
                 assert stored[namespace] == set(chunks)
+
+
+def test_zero_head_mamba_keeps_tp_identity_without_head_division():
+    # vLLM main's MambaConfig has no KV heads. This must not divide by zero
+    # before is_mamba_group() selects state-specific replication semantics.
+    for tp_rank in (0, 1):
+        identity = _key_stripe_identity(
+            tp_rank=tp_rank,
+            tp_size=2,
+            pcp_rank=0,
+            pcp_size=1,
+            dcp_rank=0,
+            dcp_size=1,
+            num_kv_heads=0,
+            use_mla=False,
+        )
+        assert (
+            identity.tp_rank,
+            identity.dcp_rank,
+            identity.stripe_idx,
+            identity.stripe_step,
+        ) == (tp_rank, 0, 0, 1)

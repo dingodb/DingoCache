@@ -8,7 +8,7 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec  # noqa: E402
+from _cache_api import cache_group, mamba_spec  # noqa: E402
 
 from dfkv_vllm.connector import DfkvStoreConnector  # noqa: E402
 
@@ -19,7 +19,7 @@ except ImportError:  # vLLM before #66605
 
 
 def test_accepts_align_mamba_groups_with_distinct_block_size():
-    spec = MambaSpec(
+    spec = mamba_spec(
         block_size=400,
         shapes=((1,),),
         dtypes=(torch.float16,),
@@ -29,7 +29,7 @@ def test_accepts_align_mamba_groups_with_distinct_block_size():
         cache_config=SimpleNamespace(block_size=4, mamba_cache_mode="align")
     )
     kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[KVCacheGroupSpec(["model.layers.0.mamba"], spec)]
+        kv_cache_groups=[cache_group(["model.layers.0.mamba"], spec)]
     )
 
     DfkvStoreConnector._validate_kv_cache_config(
@@ -55,6 +55,26 @@ def test_refuses_to_release_registered_kv_cache_memory():
     connector = object.__new__(DfkvStoreConnector)
     with pytest.raises(RuntimeError, match="registrations cannot follow"):
         connector.unregister_kv_caches()
+
+
+@pytest.mark.parametrize("load_async,request_level,expected", [
+    (False, False, False),
+    (True, False, True),
+    (False, True, True),
+    (True, True, True),
+])
+def test_may_load_async_matches_actual_admission(load_async, request_level, expected):
+    connector = object.__new__(DfkvStoreConnector)
+    connector.connector_scheduler = SimpleNamespace(
+        load_async=load_async, request_level_loads=request_level
+    )
+    assert connector.may_load_async(object()) is expected
+
+
+def test_may_load_async_is_false_without_a_scheduler():
+    connector = object.__new__(DfkvStoreConnector)
+    connector.connector_scheduler = None
+    assert connector.may_load_async(object()) is False
 
 
 def _construct(extra):

@@ -31,7 +31,7 @@ def _fields(interleave=1, dcp=1, pcp=1, extra=None):
 
 def _namespace(fields):
     return canonical_namespace(
-        "model", "vllm-multiwr-v4", layout_fields={"dcp_size": 2, **fields},
+        "model", "vllm-multiwr-v5", layout_fields={"dcp_size": 2, **fields},
     )
 
 

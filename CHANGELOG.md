@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- vLLM connector: support vLLM's manager-owned KV-cache allocation policy
+  (introduced by upstream #61452) and current main while retaining the legacy
+  pinned policy-typed-spec API. Groups resolve their real manager config and
+  DCP block geometry, mixed layouts no longer use an arbitrary first-layer
+  spec, and full/SWA/Mamba lookup masks follow manager-owned retention/replay
+  settings. Saves stop at emitted lookahead hashes, finish-time tail and
+  partial-tail sources keep their blocks alive, KV events carry lookahead
+  token IDs, async-load admission follows the connector policy, and DCP
+  ranks use actual group membership on main (tested against upstream main
+  `e7f220fdfaf71bb85d8c4bb833070101e9a6ced6` plus the legacy CI pin).
+  Attention-free models legitimately report zero KV heads on main; their rank
+  identity now bypasses attention-head replication without dividing by zero.
+
+- vLLM connector identity: `vllm-multiwr-v5` binds cache layout, manager
+  policy, each group's logical bytes per block, and draft/lookahead semantics.
+  Existing objects intentionally cold-miss; no legacy reads, dual writes,
+  aliases, server upgrade, ABI/wire change, or cache deletion is required.
+
 ## 2.43.0 — 2026-11-25
 
 - Server, failed disks (STO-16 follow-up): a disk excluded from takeover (it

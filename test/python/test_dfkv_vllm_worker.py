@@ -1261,7 +1261,7 @@ class LongestCompletePrefixLookupTest(unittest.TestCase):
             load_mask=lambda _block_hashes, token_len: [
                 [True] * (token_len // 128), [True] * (token_len // 64)
             ],
-            block_hashes_for_spec=lambda _block_hashes, spec: (
+            block_hashes_for_group=lambda _block_hashes, spec: (
                 wide_hashes if spec is wide_spec else fine_hashes
             ),
         )
@@ -1880,7 +1880,7 @@ class LookupAccountingTest(unittest.TestCase):
         coord = _fake_coordinator(
             64,
             load_mask=lambda _hashes, token_len: [[True] * (token_len // 64)],
-            block_hashes_for_spec=lambda values, _spec: values,
+            block_hashes_for_group=lambda values, _spec: values,
         )
         worker = SimpleNamespace(
             coord=coord,

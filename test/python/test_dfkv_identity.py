@@ -264,7 +264,7 @@ class CanonicalIdentityTest(unittest.TestCase):
     def test_pool_key_is_its_affixes_around_the_hash_field(self):
         namespaces = [
             {},
-            {"pool": "mamba-states", "group_id": 3, "component": "vllm-multiwr-v4"},
+            {"pool": "mamba-states", "group_id": 3, "component": "vllm-multiwr-v5"},
             {"pool": b"kv", "dp_size": 2, "dp_rank": 1, "tp_size": 8,
              "tp_rank": 7, "pcp_size": 2, "pcp_rank": 1, "dcp_size": 4,
              "dcp_rank": 3, "pp_size": 2, "pp_rank": 1},

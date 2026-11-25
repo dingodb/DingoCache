@@ -169,14 +169,12 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def _validate_kv_cache_config(
         vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
     ) -> None:
-        from vllm.v1.kv_cache_interface import CrossAttentionSpec
+        from .cache_api import is_cross_attention
 
         unsupported: list[str] = []
-        cache_block_size = vllm_config.cache_config.block_size
-        for g_idx, g in enumerate(kv_cache_config.kv_cache_groups):
-            spec = g.kv_cache_spec
-            if isinstance(spec, CrossAttentionSpec):
-                unsupported.append(f"group {g_idx}: CrossAttentionSpec")
+        for g_idx, group in enumerate(kv_cache_config.kv_cache_groups):
+            if is_cross_attention(group):
+                unsupported.append(f"group {g_idx}: CrossAttention")
         # NOTE: multi-group (hybrid attention, e.g. GLM-5.2 DSA = MLA + sparse
         # indexer groups) together with PCP/DCP > 1 is now supported: each group
         # is normalized to scheduler_block_size in the worker and every rank
@@ -234,6 +232,13 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
     # ============================================================
     # Scheduler-side methods
     # ============================================================
+
+    def may_load_async(self, request: Request) -> bool:
+        """Match this connector's actual load admission, including HMA layouts."""
+        scheduler = self.connector_scheduler
+        return bool(
+            scheduler and (scheduler.load_async or scheduler.request_level_loads)
+        )
 
     def get_num_new_matched_tokens(
         self,
@@ -296,6 +301,21 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         try:
             assert self.connector_scheduler is not None
             return self.connector_scheduler.request_finished(request, block_ids)
+        finally:
+            self._finish_call()
+
+    def register_finished_partial_tail(
+        self,
+        request: Request,
+        block_ids: tuple[list[int], ...],
+        partial_tail_offloads: list[tuple[int, int, int]],
+    ) -> bool:
+        self._begin_call()
+        try:
+            assert self.connector_scheduler is not None
+            return self.connector_scheduler.register_finished_partial_tail(
+                request, block_ids, partial_tail_offloads
+            )
         finally:
             self._finish_call()
 

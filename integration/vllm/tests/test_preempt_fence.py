@@ -19,7 +19,7 @@ from _coordinator_fake import fake_coordinator
 try:
     import torch
     from vllm.v1.core.kv_cache_utils import BlockHash
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+    from _cache_api import cache_group, full_attention_spec
 
     from dfkv_vllm.connector import DfkvStoreConnector
     from dfkv_vllm.coordinator import DfkvStoreCoordinator
@@ -100,12 +100,12 @@ class PreemptFenceTest(unittest.TestCase):
         database.set_seg_layout([
             (ctypes.addressof(pool), block_size, block_size),
         ])
-        spec = FullAttentionSpec(
+        spec = full_attention_spec(
             block_size=block_size, num_kv_heads=1, head_size=1,
             head_size_v=0, dtype=torch.uint8,
         )
         coordinator = DfkvStoreCoordinator(
-            [KVCacheGroupSpec(["kv"], spec)], block_size, block_size,
+            [cache_group(["kv"], spec)], block_size, block_size,
         )
         put_entered = threading.Event()
         release_put = threading.Event()
@@ -224,7 +224,7 @@ class PreemptFenceTest(unittest.TestCase):
         entered = threading.Event()
         release = threading.Event()
 
-        def store_mask(token_len):
+        def store_mask(token_len, *, num_prompt_tokens=None):
             entered.set()
             release.wait(10)
             return []
@@ -252,7 +252,7 @@ class PreemptFenceTest(unittest.TestCase):
         # before any work (store_mask is the first touch inside the body).
         calls: list[int] = []
 
-        def store_mask(token_len):
+        def store_mask(token_len, *, num_prompt_tokens=None):
             calls.append(token_len)
             return []
 

@@ -732,13 +732,21 @@ jobs:
           path: wheels/*.whl
 
   vllm-connector-tests:
-    name: vLLM connector tests (CPU)
+    name: vLLM connector tests (CPU, ${{ matrix.vllm.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        vllm:
+          # Preserve the legacy policy-typed-spec contract and deliberately
+          # advance the manager-owned KV-cache API pin with connector changes.
+          - name: legacy
+            commit: 08aa305fb5c56d66566f98f55d51a39b43af936f
+          - name: manager-api
+            commit: e7f220fdfaf71bb85d8c4bb833070101e9a6ced6
     env:
-      # The connector tracks upstream vLLM main and calls private scheduler and
-      # KV-cache-manager APIs. Bump this pin deliberately with connector changes.
-      VLLM_COMMIT: 08aa305fb5c56d66566f98f55d51a39b43af936f
+      VLLM_COMMIT: ${{ matrix.vllm.commit }}
       TORCH_VERSION: 2.14.0
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6

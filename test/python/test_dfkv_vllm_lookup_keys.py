@@ -55,7 +55,7 @@ def _worker(hashes, present):
     worker.client = _Ring(present)
     worker.coord = fake_coordinator(
         LCM, load_mask=lambda _b, n: [[True] * (n // LCM)],
-        block_hashes_for_spec=lambda b, _s: b)
+        block_hashes_for_group=lambda b, _s: b)
     worker.token_dbs = [SimpleNamespace(block_size=LCM, metadata=_md(0))]
     worker._kv_cache_groups = [SimpleNamespace(kv_cache_spec=object())]
     worker.tp_size = TP

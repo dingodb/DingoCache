@@ -2,12 +2,9 @@ from types import SimpleNamespace
 
 import torch
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheGroupSpec,
-    SlidingWindowSpec,
-)
+from _cache_api import cache_group, full_attention_spec, sliding_window_spec
 
+from dfkv_vllm.cache_api import group_block_size, manager_api
 from dfkv_vllm.coordinator import DfkvStoreCoordinator
 from dfkv_vllm.data import KeyMetadata, PoolKey
 from dfkv_vllm.worker import DfkvStoreWorker
@@ -19,32 +16,46 @@ def _coordinator(
 ):
     groups = []
     if dense:
-        groups.append(KVCacheGroupSpec(
+        groups.append(cache_group(
             ["main"],
-            FullAttentionSpec(
+            full_attention_spec(
                 block_size=scheduler_block, num_kv_heads=1,
                 head_size=8, dtype=torch.float16,
             ),
         ))
-    groups.append(KVCacheGroupSpec(
+    groups.append(cache_group(
         ["window"],
-        SlidingWindowSpec(
+        sliding_window_spec(
             block_size=64, num_kv_heads=1, head_size=8,
             dtype=torch.float16, sliding_window=128,
         ),
         is_eagle_group=eagle,
     ))
     return DfkvStoreCoordinator(
-        groups, scheduler_block, 64, use_eagle=eagle and drop
+        groups, scheduler_block, 64, use_eagle=eagle and drop,
+        num_hash_lookahead_tokens=64 if eagle and drop else 0,
     )
 
 
 def _stored_prefix(coordinator, tokens=256):
-    hashes = [BlockHash(bytes([i + 1]) * 32) for i in range(tokens // 64)]
+    hashable_tokens = max(
+        0, tokens - getattr(coordinator, "num_hash_lookahead_tokens", 0)
+    )
+    hashes = [
+        BlockHash(bytes([i + 1]) * 32) for i in range(hashable_tokens // 64)
+    ]
     exists = set()
-    for group, mask in enumerate(coordinator.store_mask(tokens)):
-        group_hashes = coordinator.block_hashes_for_spec(
-            hashes, coordinator.kv_cache_groups[group].kv_cache_spec
+    store_tokens = tokens
+    if manager_api():
+        # ReqMeta.from_request_tracker clamps the durable scheduler-block
+        # watermark to the hashes vLLM has actually emitted.
+        lcm = coordinator.lcm_block_size
+        store_tokens = min(
+            tokens // lcm * lcm, len(hashes) * 64 // lcm * lcm
+        )
+    for group, mask in enumerate(coordinator.store_mask(store_tokens)):
+        group_hashes = coordinator.block_hashes_for_group(
+            hashes, coordinator.kv_cache_groups[group]
         )
         exists.update(
             (group, bytes(group_hashes[index]))
@@ -55,6 +66,20 @@ def _stored_prefix(coordinator, tokens=256):
 
 
 def _lookup(coordinator, tokens, hashes, exists):
+    if manager_api() and coordinator.num_hash_lookahead_tokens:
+        # Match the scheduler's consumer-facing bound before calling the
+        # worker directly: a hit may use only hashes emitted by the engine.
+        from vllm.v1.kv_cache_interface import get_reusable_prefix_length
+
+        alignment = coordinator.hit_alignment
+        tokens = min(
+            get_reusable_prefix_length(
+                tokens,
+                num_hash_lookahead_tokens=coordinator.num_hash_lookahead_tokens,
+                alignment_tokens=alignment,
+            ),
+            len(hashes) * alignment,
+        )
     metadata = [
         KeyMetadata(
             model_name="stable-draft", dp_size=1, dp_rank=-1,
@@ -68,7 +93,7 @@ def _lookup(coordinator, tokens, hashes, exists):
     worker = SimpleNamespace(
         coord=coordinator,
         token_dbs=[
-            SimpleNamespace(metadata=md, block_size=group.kv_cache_spec.block_size)
+            SimpleNamespace(metadata=md, block_size=group_block_size(group))
             for md, group in zip(metadata, coordinator.kv_cache_groups, strict=True)
         ],
         client=SimpleNamespace(
@@ -84,15 +109,29 @@ def _lookup(coordinator, tokens, hashes, exists):
 
 
 def test_equal_block_size_window_excludes_unneeded_prefix():
-    assert _coordinator(eagle=False).store_mask(256) == (
-        [True, True, True, True], [False, False, True, True],
-    )
+    masks = _coordinator(eagle=False).store_mask(256)
+    if manager_api():
+        # With no sparse retention interval, #61452 keeps every block that can
+        # participate in a dense hit (here the two-block window spans every
+        # one-block alignment segment).
+        assert masks == ([True] * 4, [True] * 4)
+    else:
+        assert masks == (
+            [True, True, True, True], [False, False, True, True],
+        )
 
 
 def test_volatile_draft_tail_is_not_persisted():
     coordinator = _coordinator(eagle=True)
     hashes, exists = _stored_prefix(coordinator)
-    assert (1, bytes(hashes[-1])) not in exists
+    if manager_api():
+        # Lookahead proves the emitted hash through token 256; only the block
+        # whose lookahead is still unknown is volatile.
+        assert (1, bytes(hashes[-1])) in exists
+        volatile = BlockHash(bytes([len(hashes) + 1]) * 32)
+    else:
+        volatile = hashes[-1]
+    assert (1, bytes(volatile)) not in exists
 
 
 def test_worker_admits_only_the_stored_stable_draft_prefix():
@@ -105,12 +144,19 @@ def test_worker_admits_only_the_stored_stable_draft_prefix():
     )
 
 
-def test_longer_writer_makes_the_previous_draft_tail_reusable():
+def test_longer_writer_respects_the_lookahead_hash_horizon():
     coordinator = _coordinator(eagle=True)
     hashes, exists = _stored_prefix(coordinator, tokens=320)
     hit = _lookup(coordinator, 256, hashes, exists)
-    assert hit == 256
-    assert coordinator.load_mask(hashes, hit)[1] == [False, False, True, True]
+    if manager_api():
+        # #66234: the hash for [192, 256) also covers [256, 320), which the
+        # shorter reader has not supplied. Its usable prefix therefore ends at
+        # 192 instead of legacy's drop-on-store/load extension to 256.
+        assert hit == 192
+        assert coordinator.load_mask(hashes, hit)[1] == [False, True, True]
+    else:
+        assert hit == 256
+        assert coordinator.load_mask(hashes, hit)[1] == [False, False, True, True]
 
 
 def test_disabled_eagle_drop_preserves_the_complete_prefix():

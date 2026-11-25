@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+from _cache_api import cache_group, full_attention_spec
 
 from dfkv_vllm.coordinator import DfkvStoreCoordinator
 from dfkv_vllm.data import KeyMetadata, PoolKey
@@ -44,10 +44,10 @@ def test_tp_sharded_state_covers_every_tp_and_pcp_rank():
 
 
 def _gqa_dcp_lookup(store):
-    spec = FullAttentionSpec(
+    spec = full_attention_spec(
         block_size=BLOCK, num_kv_heads=1, head_size=8, dtype=torch.bfloat16,
     )
-    groups = [KVCacheGroupSpec(["layer"], spec)]
+    groups = [cache_group(["layer"], spec)]
     md = KeyMetadata(
         model_name="gqa", dp_size=1, dp_rank=-1, tp_size=8, tp_rank=0,
         pcp_size=1, pcp_rank=0, dcp_size=2, dcp_rank=0, pp_size=1, pp_rank=0,

@@ -294,12 +294,12 @@ contains before/after metric evidence.
 
 `model_name` is the exact vLLM `model_config.model`, not an extra-config key.
 The binary namespace and every object key bind it to the source-controlled
-`vllm-multiwr-v4` storage-layout ID; operator-supplied aliases are rejected.
+`vllm-multiwr-v5` storage-layout ID; operator-supplied aliases are rejected.
 
 Object keys are self-delimiting binary bytes: `DFKVPOOL\x02`, uint32-LE
 length-framed pool and full page hash, fixed `(uint32 size, int32 rank)` pairs
 for DP/TP/PCP/DCP/PP, uint32 KV-cache group, and the length-framed
-`vllm-multiwr-v4` component. There is exactly one key per logical chunk,
+`vllm-multiwr-v5` component. There is exactly one key per logical chunk,
 independent of its GPU segment count or the negotiated HCA `max_sge`. Every
 native operation receives a pointer plus its exact uint64 length (parallel
 pointer/length arrays for batch and SG); no C-string, decode/re-encode,
@@ -311,12 +311,15 @@ envelope. A read is accepted only when the object hits and its returned length
 exactly equals the complete destination-vector capacity; otherwise that logical
 chunk is failed closed and recomputed.
 
-`multiwr-v4` binds the full effective cache-spec geometry into the namespace,
-including wrapped specs and DCP-adjusted block coverage. It is a clean cutover
-from earlier Python layouts: old objects cold-miss, with no legacy read,
-dual write, alias, or cleanup of existing objects. Roll Python producers and
-consumers together and expect a cold external cache. The native C ABI and
-server protocol are unchanged.
+`multiwr-v5` binds the full effective cache geometry, per-group logical object
+sizes, and the vLLM manager allocation policy into the namespace, including
+mixed-layout groups, Mamba checkpoint policy, and DCP-adjusted block coverage.
+Main's lookahead hash and completion-time tail-save semantics follow the engine;
+legacy policy-typed-spec operation remains supported on the existing pinned API.
+It is a clean cutover from earlier Python layouts: old objects cold-miss, with
+no legacy read, dual write, alias, or cleanup of existing objects. Roll Python
+producers and consumers together and expect a cold external cache. The native
+C ABI and server protocol are unchanged.
 
 Two settings reorder an object's bytes without changing its length, and are
 bound too, each only when it differs from the default (so a default
