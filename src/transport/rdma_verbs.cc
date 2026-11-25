@@ -229,11 +229,6 @@ void RequireVerbsRelease(ibv_context* ctx, int result, const char* operation) {
   RequireVerbsRelease(facts, result, operation);
 }
 
-void RequireVerbsReleaseForTest(ibv_context* ctx, int result,
-                                const char* operation) {
-  RequireVerbsRelease(ctx, result, operation);
-}
-
 // A bound window on a live QP can report EBUSY until its QP is stopped. Save
 // such a failure for bounded recovery, not success. Device-gone evidence is
 // different: no QP-stage retry can revoke a vanished device's work, so account
@@ -540,6 +535,11 @@ bool QueryPortInfo(ibv_context* ctx, uint8_t port, PortInfo* out) {
   return true;
 }
 }  // namespace
+
+void RequireVerbsReleaseForTest(ibv_context* ctx, int result,
+                                const char* operation) {
+  RequireVerbsRelease(ctx, result, operation);
+}
 
 uint64_t RcEndpoint::AdhocUserMrTotal() {
   return g_adhoc_user_mr.load(std::memory_order_relaxed);
