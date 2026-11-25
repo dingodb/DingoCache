@@ -12960,6 +12960,10 @@ struct MwEvents {
     std::lock_guard<std::mutex> lock(mu);
     events.push_back({name, at, std::chrono::steady_clock::now()});
   }
+  std::vector<Event> Snapshot() {
+    std::lock_guard<std::mutex> lock(mu);
+    return events;
+  }
   // The events of the range at `at`, in order.
   std::vector<Event> For(const void* at) {
     std::lock_guard<std::mutex> lock(mu);
@@ -13475,7 +13479,7 @@ TEST(RdmaServerMw, ArenaPinBudgetSurvivesEarlyStagingRelease) {
   const bool released = events.WaitFor(at, "released", 2000);
   if (!released) {
     ADD_FAILURE() << "no release event, MW metrics:\n" << node.rsrv->MetricsText();
-    for (const auto& event : events.events)
+    for (const auto& event : events.Snapshot())
       ADD_FAILURE() << "event=" << event.name << " at=" << event.at
                     << " (range=" << at << ")";
     for (const auto& event : events.For(at))
