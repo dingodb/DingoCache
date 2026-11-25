@@ -12283,12 +12283,15 @@ TEST(RdmaBatchGet, AFailedWindowFailsOnlyItsOwnKeys) {
 
 // A batch that finds its pooled connection reclaimed by the server reads
 // the failed window again on a new connection, once, and every key arrives.
+// The client has one rail: with two, the second batch may pick the other
+// rail by its latency estimate, find no pooled connection there and never
+// meet the stale one (4 of 50 runs on two rails).
 TEST(RdmaBatchGet, AStalePooledConnectionIsRetriedOnce) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   if (SoftRoceOnly()) GTEST_SKIP() << kRxeNoRetryExceeded;
   ReclaimingServerEnv env;
   RdmaNode node("batch-get-stale");
-  RdmaTransport rt(kMaxMsg);
+  RdmaTransport rt(kMaxMsg, node.rsrv->DeviceNames().front());
   std::vector<char> pool;
   std::vector<RangeDst> dsts;
   const auto keys = StoreBatch(rt, node, "stale-", &pool, &dsts);
