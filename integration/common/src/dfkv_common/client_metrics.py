@@ -126,6 +126,8 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     "dfkv_client_readback_reads_total": ("result",),
     "dfkv_client_readback_changes_refused_total": ("reason",),
     "dfkv_client_readback_memory_short_total": ("reason",),
+    # Keys a node refused to store (kCacheFull, kQuotaExceeded).
+    "dfkv_client_node_refusals_total": ("status",),
     "dfkv_rdma_client_no_compatible_rail_total": (),
     "dfkv_rdma_client_admission_failures_total": (),
     "dfkv_rdma_client_local_resource_failures_total": (),
