@@ -116,6 +116,13 @@ struct ReleaseFaultsForTest {
   std::function<bool()> listed;
 };
 void SetReleaseFaultsForTest(ReleaseFaultsForTest faults);
+// Applies the same fail-closed release policy as a live failed verb. In
+// particular, this function does not discard the caller's MR on a normally
+// failed deregistration: its caller owns recovery and retains the registry
+// entry. Only a context proven disassociated permits that exceptional drop.
+// Internal/test helper: callers supply the same context and error as the verb.
+void RequireVerbsReleaseForTest(ibv_context* ctx, int result,
+                                const char* operation);
 // Tests: overrides DFKV_RDMA_DEVICE_REBUILD (1 on, 0 off, -1 the variable).
 // A transport reads the switch when it is constructed.
 void SetDeviceRebuildForTest(int enabled);
@@ -492,10 +499,13 @@ class RcEndpoint {
   // A region windows bind to: local write and window binding, no remote
   // access, so its own rkey authorizes nothing. Owned by the caller.
   ibv_mr* RegisterBindRegion(void* base, size_t size);
-  // 0/null if absent. Otherwise enforce the context-aware release guard:
+// 0/null if absent. Otherwise enforce the context-aware release guard:
   // an underegistered live region fails closed rather than letting the RAM
-  // allocation be freed while DMA may still address it.
+  // allocation be freed while DMA may still address it. A caught ordinary
+  // error is returned to a recovery owner (the RAM registry entry must stay);
+  // an otherwise unproven failed release aborts before its memory is freed.
   static int DeregisterBindRegion(ibv_mr* mr);
+  ibv_context* context_for_test() const { return ctx_; }
   // Test seam: consulted before each window allocation; false fails it.
   static void SetWindowAllocSeamForTest(std::function<bool()> seam);
   // Test seam: replaces Close()'s first deallocation of each window (the

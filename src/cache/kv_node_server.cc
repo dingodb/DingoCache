@@ -2080,7 +2080,8 @@ PreparedRead KvNodeServer::PrepareReadForKey(
     const uint64_t token = hit.TransferToken();
     PreparedRead read = PreparedRead::Ready(
         hit.in_arena ? hit.ptr : staging, hit.len, hit.value_len,
-        hit.in_arena, staging, staging_cap, this, token, &FinishRamRead);
+        hit.in_arena, staging, staging_cap, this, token, &FinishRamRead,
+        hit.allocated_bytes);
     if (hit.len > staging_cap || (hit.len != 0 && hit.ptr == nullptr)) {
       read.Abort();
       return PreparedRead::Result(Status::kInvalid);
@@ -2182,7 +2183,8 @@ PreparedRead KvNodeServer::PrepareReadForKey(
     return PreparedRead::Storage(
         std::move(lease), destination, destination_cap, promoted.get(),
         flight, &FinishPromotedDiskRead,
-        /*source_registered=*/true, staging, staging_cap, promoted);
+        /*source_registered=*/true, staging, staging_cap, promoted,
+        destination_cap);
   }
 
   return PreparedRead::Storage(

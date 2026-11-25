@@ -70,6 +70,7 @@ list(FILTER DFKV_SRCS EXCLUDE REGEX "_main\\.cc$")
 if(NOT DFKV_WITH_RDMA)
   list(REMOVE_ITEM DFKV_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/rdma_verbs.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/rdma_mw.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/rdma_topology.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/rdma_transport.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cache/rdma_server.cc)

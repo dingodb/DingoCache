@@ -204,9 +204,46 @@ void RequireVerbsRelease(const DeviceFacts& device, int result,
   std::abort();
 }
 
+// A release failure can be discarded only on a context proven disassociated.
+// Every other failure is fail-closed; callers that own an MR keep registry
+// ownership rather than reporting a spurious release. Count the exception
+// consistently for deregistration as for every other verbs release.
+bool ReleasePermittedOnGoneDevice(const DeviceFacts& device, int result) {
+  if (result == 0) return false;
+  const int err = result > 0 ? result : errno;
+  if (!ProvenDisassociated(device, err)) return false;
+  g_dead_release_failures.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 void RequireVerbsRelease(ibv_context* ctx, int result, const char* operation) {
+  // A successful deallocation has no recovery error. A failure must pass the
+  // whole TRN-29 decision, including its dead-device accounting shortcut.
   if (result == 0 && !g_release_faults.release) return;
-  RequireVerbsRelease(FactsOf(ctx), result, operation);
+  const DeviceFacts facts = FactsOf(ctx);
+  if (ReleasePermittedOnGoneDevice(facts, result)) {
+    DFKV_LOG_WARN(std::string("rdma: ") + operation +
+                  " failed on a device proven gone");
+    return;
+  }
+  RequireVerbsRelease(facts, result, operation);
+}
+
+void RequireVerbsReleaseForTest(ibv_context* ctx, int result,
+                                const char* operation) {
+  RequireVerbsRelease(ctx, result, operation);
+}
+
+// A bound window on a live QP can report EBUSY until its QP is stopped. Save
+// such a failure for bounded recovery, not success. Device-gone evidence is
+// different: no QP-stage retry can revoke a vanished device's work, so account
+// for that release and let the QP be destroyed. Ordinary failures are not
+// swallowed or mapped into a permission to free the backing RAM.
+bool DeallocWindowForRecovery(ibv_context* ctx, ibv_mw* mw) {
+  const int error = g_window_dealloc_seam ? g_window_dealloc_seam(mw)
+                                          : ibv_dealloc_mw(mw);
+  return error != 0 &&
+         !ReleasePermittedOnGoneDevice(FactsOf(ctx), error);
 }
 
 void DeregisterMr(ibv_mr* mr) {
@@ -646,9 +683,7 @@ void RcEndpoint::Close() {
   // do not free storage whose DMA revocation is still unproven.
   std::vector<ibv_mw*> refused;
   for (auto* mw : windows_) {
-    const int error = g_window_dealloc_seam ? g_window_dealloc_seam(mw)
-                                            : ibv_dealloc_mw(mw);
-    if (error != 0) refused.push_back(mw);
+    if (DeallocWindowForRecovery(ctx_, mw)) refused.push_back(mw);
   }
   windows_.clear();
   window_rkeys_.clear();
@@ -663,8 +698,8 @@ void RcEndpoint::Close() {
     for (int round = 0; round < 10 && !refused.empty(); ++round) {
       if (round != 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
       refused.erase(std::remove_if(refused.begin(), refused.end(),
-                                   [](ibv_mw* mw) {
-                                     return ibv_dealloc_mw(mw) == 0;
+                                   [this](ibv_mw* mw) {
+                                     return !DeallocWindowForRecovery(ctx_, mw);
                                    }),
                     refused.end());
     }
@@ -673,8 +708,11 @@ void RcEndpoint::Close() {
     RequireVerbsRelease(ctx_, ibv_destroy_qp(qp_), "ibv_destroy_qp");
     qp_ = nullptr;
   }
+  std::function<int(ibv_mw*)> seam = std::move(g_window_dealloc_seam);
+  g_window_dealloc_seam = nullptr;
   for (auto* mw : refused)
     RequireVerbsRelease(ctx_, ibv_dealloc_mw(mw), "ibv_dealloc_mw");
+  g_window_dealloc_seam = std::move(seam);
   for (auto* mr : lease_write_mr_) DeregisterMr(mr);
   g_lease_write_mr_active.fetch_sub(lease_write_mr_.size(),
                                    std::memory_order_relaxed);
@@ -1315,12 +1353,13 @@ ibv_mr* RcEndpoint::RegisterBindRegion(void* base, size_t size) {
 
 int RcEndpoint::DeregisterBindRegion(ibv_mr* mr) {
   if (!mr) return 0;
+  ibv_context* const ctx = mr->context;
   const int error = ibv_dereg_mr(mr);
-  // Never turn an underegistered region into a prose warning: the anchor owns
-  // RAM past this point. Ordinary failures fail closed; a proven gone device
-  // follows the same exception as the rest of the teardown.
-  RequireVerbsRelease(mr->context, error, "ibv_dereg_mr(window region)");
-  return 0;
+  // Only a context-aware release guard may authorize dropping the region.
+  // Ordinary errors abort here, so no registry can discard an MR whose RAM
+  // remains DMA-visible; a proven disassociated context counts the failure.
+  RequireVerbsRelease(ctx, error, "ibv_dereg_mr(window region)");
+  return error;
 }
 
 int RcEndpoint::QpAccessFlags() const {
