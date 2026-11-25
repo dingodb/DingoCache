@@ -11323,6 +11323,15 @@ TEST(RdmaVerbs, ADeviceNothingHoldsIsOpenedAgain) {
   EXPECT_EQ(rdma::RcEndpoint::DeviceOpens(), held_opens);
 }
 
+// Fault-injection tests for guards and device disassociation only. No real
+// device is reset or taken down.
+namespace {
+struct DeviceRebuildOn {
+  explicit DeviceRebuildOn(int on = 1) { rdma::SetDeviceRebuildForTest(on); }
+  ~DeviceRebuildOn() { rdma::SetDeviceRebuildForTest(-1); }
+};
+}  // namespace
+
 // A failed verbs release is never an ignored success. Only a disassociated
 // context lifts the fail-closed guard, and that exception is accounted for.
 TEST(RdmaRelease, OrdinaryErrorsAbortButAProvenGoneDeviceIsCounted) {
@@ -11347,11 +11356,6 @@ TEST(RdmaRelease, OrdinaryErrorsAbortButAProvenGoneDeviceIsCounted) {
 // No device is ever reset here: a seam reports DEVICE_FATAL, or fails Opens
 // with ENODEV, as a reset would.
 namespace {
-
-struct DeviceRebuildOn {
-  explicit DeviceRebuildOn(int on = 1) { rdma::SetDeviceRebuildForTest(on); }
-  ~DeviceRebuildOn() { rdma::SetDeviceRebuildForTest(-1); }
-};
 
 long LabelledVal(const std::string& text, const std::string& line_prefix) {
   const auto pos = text.find("\n" + line_prefix);

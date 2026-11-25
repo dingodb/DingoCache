@@ -242,8 +242,11 @@ void RequireVerbsReleaseForTest(ibv_context* ctx, int result,
 bool DeallocWindowForRecovery(ibv_context* ctx, ibv_mw* mw) {
   const int error = g_window_dealloc_seam ? g_window_dealloc_seam(mw)
                                           : ibv_dealloc_mw(mw);
-  return error != 0 &&
-         !ReleasePermittedOnGoneDevice(FactsOf(ctx), error);
+  if (error == 0) {
+    RequireVerbsRelease(ctx, 0, "ibv_dealloc_mw");
+    return false;
+  }
+  return !ReleasePermittedOnGoneDevice(FactsOf(ctx), error);
 }
 
 void DeregisterMr(ibv_mr* mr) {
