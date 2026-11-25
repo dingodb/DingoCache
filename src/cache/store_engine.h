@@ -174,6 +174,9 @@ class PreparedRead {
   size_t value_len() const noexcept { return value_len_; }
   char* staging() const noexcept { return staging_; }
   size_t staging_cap() const noexcept { return staging_cap_; }
+  // Bytes of the allocation retained by a pinned arena hit, 0 for storage
+  // whose ownership is not a RAM slot. A range may expose fewer bytes than this.
+  size_t pin_bytes() const noexcept { return pin_bytes_; }
   const char* data() const noexcept { return data_; }
   bool source_registered() const noexcept { return source_registered_; }
   // Checks a completed storage read's bytes where the engine can (see
@@ -278,7 +281,8 @@ class PreparedRead {
   static PreparedRead Ready(const char* data, size_t payload_len,
                             size_t value_len, bool source_registered,
                             char* staging, size_t staging_cap, void* owner,
-                            uint64_t token, FinishFn finish) noexcept {
+                            uint64_t token, FinishFn finish,
+                            size_t pin_bytes = 0) noexcept {
     PreparedRead read;
     read.status_ = Status::kOk;
     read.payload_len_ = payload_len;
@@ -291,6 +295,7 @@ class PreparedRead {
     read.token_ = token;
     read.finish_ = finish;
     read.active_ = true;
+    read.pin_bytes_ = pin_bytes;
     return read;
   }
   void MoveFrom(PreparedRead&& other) noexcept {
@@ -312,6 +317,7 @@ class PreparedRead {
     token_ = std::exchange(other.token_, 0);
     finish_ = std::exchange(other.finish_, nullptr);
     lease_ = std::move(other.lease_);
+    pin_bytes_ = other.pin_bytes_;
     post_read_hold_ = std::move(other.post_read_hold_);
   }
 
@@ -334,6 +340,7 @@ class PreparedRead {
   FinishFn finish_ = nullptr;
   ReadLease lease_;
   std::shared_ptr<void> post_read_hold_;
+  size_t pin_bytes_ = 0;
 };
 struct ValueMetadata {
   uint64_t value_len = 0;

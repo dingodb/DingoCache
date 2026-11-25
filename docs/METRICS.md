@@ -242,12 +242,12 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_server_mw_mode{dev}` | gauge | 这条 rail 的 GET 授权是否用内存窗口（`DFKV_RDMA_SERVER_MW` 开、且网卡支持 type-2B 窗口为 1；否则 0，用逐次 MR） |
 | `dfkv_rdma_server_mw_binds_total` / `dfkv_rdma_server_mw_invalidations_total` | counter | 用窗口授权的 GET / RELEASE 时作废的窗口 |
 | `dfkv_rdma_server_mw_invalidation_failures_total` | counter | 没能投递或以错误完成的作废；连接随之关闭，范围照样先隔离再复用 |
-| `dfkv_rdma_server_mw_quarantine_bytes` | gauge | 已作废、正在隔离期内、还不能复用的 GET 范围（staging 租约或 arena pin）字节数；上限 `DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES` |
+| `dfkv_rdma_server_mw_quarantine_bytes` | gauge | 已作废、正在隔离期内、还不能复用的 GET 范围（arena pin）字节数；不含尚未撤销的 bind 预留。实际隔离 + 授权时原子的 grant 预留共同受 `DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES` 限制，预留转隔离或取消只扣一次 |
 | `dfkv_rdma_server_mw_quarantined_total` | counter | 进入隔离期的 GET 范围（RELEASE 作废，或连接关闭时） |
 | `dfkv_rdma_server_mw_quarantine_fallbacks_total` | counter | 因隔离区已满、或所需隔离期超过 `DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS` 而改用逐次 MR 的 GET；持续增长说明这条 rail 上同时在途的 GET 字节太多，或上限偏小 |
-| `dfkv_rdma_server_mw_fallback_grants_total` | counter | 有窗口的连接上改用逐次 MR 的 GET：所在接收 chunk 或 arena extent 还没为窗口注册好（注册在后台，第一次用到时开始）、注册失败，或超出 `DFKV_RDMA_SERVER_MW_ARENA_BYTES` |
+| `dfkv_rdma_server_mw_fallback_grants_total` | counter | 有窗口的连接上改用逐次 MR 的 RAM 层 GET：所在 arena extent 还没为窗口注册好（注册在后台，第一次用到时开始）、注册失败，或超出 `DFKV_RDMA_SERVER_MW_ARENA_BYTES`。要从盘暂存的 GET 不用窗口，也不计入 |
 | `dfkv_rdma_server_mw_fallback_connections_total` | counter | 分配不到内存窗口（`ibv_alloc_mw` 失败，例如超过网卡的 `max_mw`）、整条连接改用逐次 MR 的连接 |
-| `dfkv_rdma_server_mw_region_registrations_total` / `dfkv_rdma_server_mw_region_register_failures_total` | counter | 为窗口注册的接收 chunk 和 arena extent（每条 rail 各一次）/ 注册失败（10 s 后才会再试） |
+| `dfkv_rdma_server_mw_region_registrations_total` / `dfkv_rdma_server_mw_region_register_failures_total` | counter | 为窗口注册的 arena extent（每条 rail 各一次）/ 注册失败（10 s 后才会再试） |
 | `dfkv_rdma_server_mw_arena_registered_bytes{dev}` | gauge | 这条 rail 上为窗口注册的 arena 字节数 |
 | `dfkv_op_latency_seconds{op="get"}`（arena pull） | histogram | 记录 RAM handler 准备耗时，与 staged range handler 的计时边界一致；成功 PullRelease 后才提交样本，不包含客户端持有 grant、RDMA READ 或 MR 撤销时间。端到端延迟看客户端 bench，不能用此序列替代 |
 | `dfkv_rdma_connection_bytes{class=\"data|control\"}` | gauge | data/control connection 当前 lease 字节；应随 adaptive class 而非 logical max 增长 |

@@ -3,7 +3,8 @@
 Status: implemented (ledger RDS-09, part A), on top of #539, #527, #540,
 #542 and #553. Switch: `DFKV_RDMA_SERVER_MW`, server side, default off.
 Nothing changes on the wire. Section 13 lists where the code differs from
-this design and why.
+this design and why; the largest difference: only GETs served from the RAM
+arena use windows, GETs staged from disk keep the per-grant MR (RDS-29).
 
 ## 1. Why
 
@@ -32,7 +33,8 @@ each signalled on the connection's QP: bind 3.5 us (9.0), invalidate 3.4 us
 
 ## 2. Scope
 
-- **GET grants (READ) use windows.** This is the change.
+- **GET grants (READ) use windows.** This is the change. As built, only
+  grants of RAM-arena ranges (section 13).
 - **Leased PUT grants (WRITE) keep today's exact per-grant MR** with
   synchronous deregistration. A WRITE that raced a window's invalidation could
   write into a range already reused for another connection's data; the
@@ -50,12 +52,12 @@ each signalled on the connection's QP: bind 3.5 us (9.0), invalidate 3.4 us
   windows for mlx5 physical functions only, so virtual functions fall back.
 - **Bind-only regions.** After #539 there are no chunk-wide MRs: each
   connection's slots have their own registration, which is what isolates
-  connections. Window mode adds one region per receive chunk, registered
-  with `IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_MW_BIND` and **no remote access**:
-  its rkey authorizes nothing remotely, only the binding of windows, so #539's
-  isolation is unchanged. Likewise one per RAM-arena extent (section 7). Both
-  are registered outside `g_dev_mu` (#540's rule), off the request path where
-  possible (a chunk's at its creation, the arena's per extent, section 7).
+  connections. As implemented (RDS-29), windows bind only RAM-arena extents,
+  one per extent; receive chunks never get bind-only regions. An arena extent
+  is registered with `IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_MW_BIND` and **no
+  remote access**: its rkey authorizes nothing remotely, only binding windows,
+  so #539's isolation is unchanged. Registration runs outside `g_dev_mu`
+  (#540's rule), in the background on first use (section 7).
 - **Windows per connection:** one per pull slot (depth; 16 with #553), allocated
   when the connection is set up and deallocated when it ends. If
   `ibv_alloc_mw` fails, that connection serves its GETs with per-grant MRs,
@@ -129,13 +131,18 @@ So the doc does not claim a tight bound on mlx5.
 
 ### Quarantine time
 
-Per grant: `max(floor, 2 x rail_bytes / slowest_link_rate + margin)`, where
-- `rail_bytes` is the bytes of GET grants outstanding on the grant's rail
-  (READY sent, not yet released or revoked), this one included, when the
-  window goes: what the port could still have to send ahead of a READ
-  already in the responder. The design first used the grant's own bytes;
-  the incast measurement below showed a READ's lag follows the port's
-  backlog, not its own size;
+Every admitted window's quarantine is the configured maximum,
+`DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS` (at least the floor). This deliberately
+conservative rule pays a longer hold for a simple release invariant: grants
+accepted by other connections afterwards cannot shorten this grant's quarantine.
+
+The rail's outstanding grant bytes are only an **admission estimate**, not a
+promise about later grants. If that estimate exceeds the maximum the request
+falls back to a per-grant MR. The estimate uses
+`max(floor, 2 x rail_bytes / slowest_link_rate + margin)`, where:
+- `rail_bytes` is the observed outstanding GET grants, including this one,
+  when the window is authorized; it is not assumed to bound future rail
+  pressure. This value never reduces the quarantine of the admitted request;
 - `slowest_link_rate` is the lowest active rate among the server's rails
   (`ibv_query_port`: active speed x width) or a configured lower bound,
   whichever is lower;
@@ -162,10 +169,11 @@ READ's own wire time, but within twice the backlog of 16 such grants on
 the port (0.7 ms and 2.7 ms) plus 1 ms. Every such grant here quarantines
 the 5 ms floor.
 
-For example, with the 5 ms floor at 400 Gb/s, up to about 95 MiB of
-outstanding grants on a rail quarantine 5 ms; 1 GiB about 44 ms; past
-`DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS` (50 ms) a grant takes a per-grant
-MR.
+For example, with the 5 ms floor and a configured 40–50 ms ceiling, a small
+RAM-arena GET pays the full ceiling on every windowed revoke, rather than a
+lower queue-length estimate. A grant whose estimated backlog exceeds the
+ceiling takes an exact MR instead. The maximum is a time budget for the quarantine,
+not a statement that all later grants remain consistent with a bind-time estimate.
 
 ### What remains
 
@@ -196,15 +204,24 @@ requires that first; the CHANGELOG and the PR say so.
 
 - Quarantined bytes are counted (gauge) and capped:
   `DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES`, default one eighth of the receive
-  pool budget. A range is released from quarantine by the serve loop's timer
-  (it already wakes for idle and grant deadlines).
+  pool budget. At authorization a bound-grant reservation atomically claims
+  the bytes it will quarantine. The cap charges those live reservations plus
+  the actual quarantine, so concurrent connections cannot overshoot it.
+  A bind failure cancels a reservation exactly once; successful revocation
+  transfers it under the same accounting lock. The gauge is actual quarantine
+  only, not still-bound reserved grants. A range is released by the trim thread.
 - When the cap is reached, or a grant would need a quarantine longer than
   `DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS` (default 50 ms), **that grant uses a
   per-grant MR**, counted. Quarantine never blocks a grant and never starves
   the pool.
 - For a RAM-arena grant, the range is the arena slot: the grant's pin on it
   (`PreparedRead`) is held until the quarantine ends, so the RAM tier does not
-  evict or overwrite the value under it; the pin counts in the same cap.
+  evict or overwrite the value under it. `PreparedRead` carries the whole
+  allocation's `pin_bytes`, including padding and offset slices. A temporary
+  staging lease also shares the accounting and the release cannot replace it
+  with the requested output length: the same reserved amount proceeds through
+  bind, release, quarantine and expiry, with no independently changing
+  staging-lease/data-length estimates.
 - **Ownership:** a quarantine entry outlives the connection and its Serve
   thread (a connection may close right after a RELEASE). Entries go into one
   process-wide quarantine list, ordered by expiry, which the receive-chunk
@@ -223,7 +240,10 @@ requires that first; the CHANGELOG and the PR say so.
    error; it neither posts nor serves READs. The connection ends by path 4;
    the range is not released before.
 4. **Connection close, QP in error, server stop.** In `RcEndpoint::Close()`:
-   destroy the QP, then deallocate the connection's windows; then the slots
+   try window deallocation first. On a live-QP refusal, move the QP to ERR
+   and retry before destroying it; an error-transition failure still fails
+   closed. Section 13 gives the implemented ordering. Then the slots reset
+   and their ranges go into quarantine. A window bound to a QP in
    reset and their ranges go into quarantine. A window bound to a QP in
    error cannot be invalidated by a work request (an NVIDIA answer for
    type-2B windows), so this path deallocates instead. In `Serve()` the
@@ -297,6 +317,9 @@ The arena (`DFKV_RAM_TIER_BYTES`, extents of `DFKV_RAM_TIER_EXTENT_BYTES`,
 
 ## 8. Receive chunks
 
+Not built: GETs staged into receive chunks keep the per-grant MR (section
+13, RDS-29). The design was:
+
 - Registering a chunk's bind-only region takes 50-100 ms for a large chunk;
   it must not run under the receive pool's lock (`mu_`) or `g_dev_mu`. Each
   chunk carries a registration state per device (none, in progress,
@@ -347,7 +370,6 @@ Tests (seams where the device would not fail on its own):
 - `ibv_alloc_mw` failure (seam): the connection serves with per-grant MRs;
 - extent registration failure and an in-progress extent (seams): fallback,
   no double registration;
-- chunk trim with a window bound: kept;
 - leased PUT unchanged (per-grant MR);
 - interop: a 2.42.0 client against a server with the switch on; nothing
   changes on the wire.
@@ -360,8 +382,8 @@ Tests (seams where the device would not fail on its own):
 - `dfkv_rdma_server_mw_quarantine_bytes` (gauge), `_quarantined_total`,
   `_quarantine_fallbacks_total`.
 - `dfkv_rdma_server_mw_arena_registered_bytes{dev}`,
-  `_region_registrations_total`, `_region_register_failures_total` (chunks
-  and extents), `_fallback_grants_total`, `_fallback_connections_total`.
+  `_region_registrations_total`, `_region_register_failures_total` (arena
+  extents), `_fallback_grants_total`, `_fallback_connections_total`.
 - `dfkv_rdma_server_grant_register_seconds` (summary: `_sum`, `_count`;
   both modes).
 
@@ -389,7 +411,9 @@ PREPARE 67 -> 38 us (1 MiB), the READ unchanged, the RELEASE 35-67 -> about
 shows at 4 MiB in the RAM tier. Raw verbs on the same host, one QP pair:
 bind, READ and invalidate 31 us (64 KiB) and 76 us (1 MiB), against 50 and
 116 us for a per-operation MR. The p99 column moves with the host's other
-load between runs.
+load between runs. The disk rows were measured with windows over receive
+chunks; as built, a GET staged from disk keeps its per-grant MR (section
+13), so with the switch on it is served as in the "off" column.
 
 ## 13. Where the code differs
 
@@ -407,42 +431,76 @@ load between runs.
   held in the receive FIFO until the reply's completion retires the slot,
   as designed (the reply's completion comes with the client's ACK, a
   separate packet from its next request, so either may be polled first).
-- **Quarantine time**: the rail's outstanding grant bytes, not the grant's
-  own (section 4, from the measurement); the admission check at the grant
-  uses the same bound. The end is clamped to the maximum: grants added
-  to the rail after the admission do not stretch it. A server sees only its
-  own outstanding bytes; queueing at one client's link from several servers
-  is covered by the 5 ms floor alone.
-- **Registration**: one background thread registers both receive chunks
-  and arena extents (section 7 and 8), on the first grant into each; there
-  is no registration ahead of need.
+- **Quarantine time**: every admitted window holds its range for the whole
+  configured maximum, rather than treating a rail accounting snapshot as a
+  safe future upper bound. The estimate is used only for choosing a window
+  versus an exact MR at authorization (section 4, from the incast measurement).
+  A later burst cannot silently shorten an earlier grant's protection because
+  it is not used for the lifetime. The maximum is an admission ceiling, not
+  a late clamp over new rail pressure. A server sees only its own outstanding
+  bytes, so later burst admission or other servers' queueing is not covered
+  by the snapshot alone; this is why the hold is the configured maximum.
+- **Windows only for RAM-arena ranges (RDS-29).** A GET staged from disk
+  into a receive chunk keeps the per-grant MR, registered after the disk
+  wrote the value. The finding, with raw verbs on a host with real
+  InfiniBand and NVMe: the NIC reads a range just written by an NVMe DMA
+  slowly through a registration made before the write (a static MR, or a
+  window over a region registered before), and fast through an MR
+  registered after it. A 256 KiB READ of the range, from another QP, p50 in
+  microseconds over 2-3 repetitions:
+
+  | range written by | read through | 1 thread | 4 threads |
+  |---|---|---|---|
+  | NVMe (`O_DIRECT` read) | MR registered before the write | 114-224 | 92-197 |
+  | NVMe | window bound after the write, over a region registered before | 156-224 | 30-35 (p90 231-307) |
+  | NVMe | MR registered after the write (the per-grant path) | 25-29 | 26-29 |
+  | CPU (`memcpy`) | MR registered before | 57-213 | 73-200 |
+  | CPU | MR registered after | 57-64 | 96-98 |
+  | GPU (copy into host-registered memory) | MR registered before | 24-25 | 24-26 |
+  | nothing since the registration | MR registered before | 23-30 | 24-30 |
+
+  The data read was correct in every case. Flushing the range from the CPU
+  caches, a 40 us wait, a 1 or 10 ms wait, or a second READ did not help;
+  the NIC reading the range as the source of a WRITE is affected alike
+  (154-181 against 24-27 us). For CPU writes, the page size (4 KiB,
+  transparent or hugetlb 2 MiB), shared or private mappings and the MR size
+  (2 or 32 MiB) made no difference; for NVMe writes, 4 KiB and transparent
+  2 MiB pages alike. The device-level reason is not known; it needs a question to
+  the NIC vendor. A server variant that kept the receive chunks registered
+  but served through per-grant MRs was as fast as the switch off. Bind-only
+  regions for receive chunks were therefore removed, with their
+  registration and their deregistration at trim. Such a GET on a
+  connection with windows is not a fallback and is not counted as one.
+  The RAM arena is written by the CPU (a PUT's copy) and by `O_DIRECT`
+  (promotion) after its extents are registered too; end to end, with the
+  arena full and its extents registered before the measured PUTs, windows
+  were still as fast or faster there (5 alternated runs: 64 KiB in batches
+  of 8 22600 -> 25800 GET/s, 256 KiB one at a time 11300 -> 11600).
+- **Registration**: one background thread registers arena extents (section
+  7), on the first grant into each; there is no registration ahead of need.
 - **Chunk trim**: two-phase for every trim, also with the switch off (the
-  chunk is freed after the pool lock is released); a chunk whose
-  deregistration fails is kept, never freed, and counted.
-- **Close order**: `Close()` deallocates the windows, then destroys the
-  QP (section 4 path 4 has it the other way). Deallocation invalidates and
-  unbinds each window, so a READ through it fails from then on; on
-  Soft-RoCE a still-bound window holds its QP, whose destruction then
-  waited (about 50 s in CI). The ranges are still released only after the
-  endpoint is gone. A deallocation the device refuses (`EBUSY` on a live
-  QP in the middle of a transfer) is tried again after the QP is moved to
-  the error state, which ends its work in flight, up to 10 times within
-  10 ms, and only then is the QP destroyed: destroying it with the window
-  still bound waited about 50 s on Soft-RoCE. A window still refused is
-  tried once more after the QP's destruction; only a failure then aborts.
+  chunk is freed after the pool lock is released).
+- **Close order**: `Close()` first tries every window's deallocation, which
+  invalidates and unbinds it; the range still waits out its quarantine.
+  Soft-RoCE can wait about 50 s in QP destruction if a bound window remains.
+  A live-QP refusal therefore moves the QP to ERR to end its work before
+  retrying, up to ten times within 10 ms; the QP is destroyed before a last
+  attempt to deallocate any still-refused window. Every final resource-release
+  call uses the context-aware guards from TRN-29. An error turning it to ERR
+  or a final failed release remains fail-closed; it never proves revocation
+  or completion by elapsed time, and does not claim bound QP destruction is
+  always nonblocking. Only after the endpoint goes away do releases proceed.
 - **Throughput with many clients, measured** (2.35.7 `dfkv_bench`, 4
-  client threads on pinned CPUs, off and on alternated, medians of 3-6
-  runs):
-  - values in the RAM tier: windows equal or faster. 64 KiB in batches of
-    8: 26600 -> 42700 GET/s; 256 KiB one key at a time, four runs on one
-    node: 12500-19900 off, 15100-26100 on.
-  - GETs staged from disk, under that concurrency: slower with windows,
-    e.g. 3900 -> 3400 and 6100 -> 4700 GET/s at 256 KiB. Cause open
-    (RDS-29): not the per-grant bind and invalidation (a window bound once
-    per slot over its whole region was as slow), not the quarantine (none
-    at all was as slow), not the READ (raw verbs: a READ through a window
-    takes as long as one through an MR, 64 KiB to 1 MiB, one or four
-    connections). To be resolved before the default changes.
+  client threads on pinned CPUs, off and on alternated, medians):
+  - values in the RAM tier, 5 runs: windows faster. 64 KiB in batches of
+    8: 29000 -> 42000 GET/s; 256 KiB one key at a time: 18200 -> 20200
+    GET/s (before windows were limited to the arena: 26600 -> 42700 and
+    12500-19900 -> 15100-26100).
+  - GETs staged from disk, under that concurrency: slower with windows
+    over receive chunks (256 KiB one key at a time, 9 alternated runs:
+    4960 -> 3370 GET/s); the cause is above (RDS-29). With windows only for
+    the arena, as built, as fast as the switch off: 5040 -> 5390 GET/s (15
+    runs), 4740 -> 4800 (9 runs).
   - An earlier "batched GETs halve" (5981 -> 2883 GET/s) came from a RAM
     tier too small for the bench's data: those GETs were staged from disk.
     The PUT refusals (`kCacheFull`) seen in such runs come from the RAM

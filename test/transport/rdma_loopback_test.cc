@@ -130,6 +130,9 @@ class RdmaServerTestPeer {
   static size_t AnchorCount(const RdmaServer& server) {
     return server.anchors_.size();
   }
+  static bool MwRegistryStarted(const RdmaServer& server) {
+    return server.mw_regions_.started();
+  }
   static size_t RailStatsCount(const RdmaServer& server) {
     return server.rail_stats_.size();
   }
@@ -170,6 +173,33 @@ class RdmaServerTestPeer {
   static void SetMwRegister(RdmaServer& server,
                             std::function<bool(size_t, char*)> hook) {
     server.mw_register_for_test_ = std::move(hook);
+  }
+  using MwReservation = RdmaServer::MwReservation;
+  static uint64_t MwRailSnapshot(const RdmaServer& server,
+                                 const std::atomic<uint64_t>& rail,
+                                 uint64_t bytes) {
+    return server.MwRailSnapshot(rail, bytes);
+  }
+  static MwReservation MwReserveQuarantine(RdmaServer* server, uint64_t rail,
+                                           uint64_t bytes) {
+    return server->MwReserveQuarantine(rail, bytes);
+  }
+  static uint64_t MwReservedBytes(const RdmaServer& server) {
+    return server.mw_reserved_bytes_;
+  }
+  static uint64_t MwQuarantinedBytes(const RdmaServer& server) {
+    return server.mw_quarantine_bytes_.load(std::memory_order_relaxed);
+  }
+  static void MwQuarantine(RdmaServer* server, MwReservation reservation,
+                           uint64_t rail, uint64_t bytes) {
+    RdmaServer::MwQuarantined entry;
+    entry.reservation = std::move(reservation);
+    entry.rail_bytes = rail;
+    entry.bytes = bytes;
+    server->MwQuarantine(std::move(entry));
+  }
+  static void MwReleaseQuarantine(RdmaServer* server) {
+    server->MwReleaseQuarantine(true);
   }
   static void SetMwEvents(
       RdmaServer& server,
@@ -12800,6 +12830,86 @@ TEST(RdmaSgRead, TouchingUnregisteredSegmentsShareARegistration) {
 
 // ---- Server memory windows (DFKV_RDMA_SERVER_MW) ---------------------------
 
+// ---- Server memory windows (DFKV_RDMA_SERVER_MW) ---------------------------
+
+TEST(RdmaServerMw, ReservationChargesGrantUntilQuarantineExpiry) {
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  ScopedEnv cap("DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES", "1024");
+  ScopedEnv max_ms("DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS", "5000");
+  ScopedEnv link("DFKV_RDMA_SERVER_MW_LINK_GBPS", "1");
+  RdmaServer server([](uint8_t, const BlockKey&, uint64_t, uint64_t,
+                       const char*, uint64_t, std::string*, size_t*) {
+    return Status::kOk;
+  });
+  std::atomic<uint64_t> rail{0};
+  // A concurrent admission can alter the live rail counter. The snapshot
+  // stays an upper bound and never clips to max at quarantine time.
+  const uint64_t admitted =
+      RdmaServerTestPeer::MwRailSnapshot(server, rail, 256);
+  auto granted = RdmaServerTestPeer::MwReserveQuarantine(&server, admitted, 1024);
+  ASSERT_TRUE(granted.held());
+  rail.store(1u << 20);
+  auto moved = std::move(granted);
+  EXPECT_EQ(RdmaServerTestPeer::MwReservedBytes(server), 1024u);
+  EXPECT_EQ(RdmaServerTestPeer::MwQuarantinedBytes(server), 0u);
+  auto over_cap = RdmaServerTestPeer::MwReserveQuarantine(&server, 1, 1);
+  EXPECT_FALSE(over_cap.held());
+  RdmaServerTestPeer::MwQuarantine(&server, std::move(moved), admitted, 1024);
+  EXPECT_EQ(RdmaServerTestPeer::MwReservedBytes(server), 0u);
+  EXPECT_EQ(RdmaServerTestPeer::MwQuarantinedBytes(server), 1024u);
+  // Expiry lets a later 512-byte grant convert; another 512-byte reservation
+  // completes the cap. No remaining capacity now: the refusals own nothing.
+  RdmaServerTestPeer::MwReleaseQuarantine(&server);
+  EXPECT_EQ(RdmaServerTestPeer::MwQuarantinedBytes(server), 0u);
+  granted = RdmaServerTestPeer::MwReserveQuarantine(&server, admitted, 512);
+  ASSERT_TRUE(granted.held());
+  const auto max_refused =
+      RdmaServerTestPeer::MwReserveQuarantine(&server, admitted, 513);
+  EXPECT_FALSE(max_refused.held());
+  // A failed second claim has no cost: the first stays fully reserved.
+  EXPECT_EQ(RdmaServerTestPeer::MwReservedBytes(server), 512u);
+  RdmaServerTestPeer::MwQuarantine(&server, std::move(granted), admitted, 512);
+  granted = RdmaServerTestPeer::MwReserveQuarantine(&server, admitted, 512);
+  ASSERT_TRUE(granted.held());
+  // Actual 512 + reserved 512 fills the cap; conversion is not double charge.
+  over_cap = RdmaServerTestPeer::MwReserveQuarantine(&server, admitted, 1);
+  EXPECT_FALSE(over_cap.held());
+  // Destructor cancellation is idempotent and returns exactly its own bytes.
+  granted = {};
+  EXPECT_EQ(RdmaServerTestPeer::MwReservedBytes(server), 0u);
+  EXPECT_EQ(RdmaServerTestPeer::MwQuarantinedBytes(server), 512u);
+  RdmaServerTestPeer::MwReleaseQuarantine(&server);
+  EXPECT_EQ(RdmaServerTestPeer::MwQuarantinedBytes(server), 0u);
+  EXPECT_EQ(RdmaServerTestPeer::MwReservedBytes(server), 0u);
+  server.Stop();
+}
+
+TEST(RdmaServerMw, ConcurrentReservationsCannotOvershootTheCap) {
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  ScopedEnv cap("DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES", "1024");
+  RdmaServer server([](uint8_t, const BlockKey&, uint64_t, uint64_t,
+                       const char*, uint64_t, std::string*, size_t*) {
+    return Status::kOk;
+  });
+  constexpr size_t kThreads = 8;
+  std::vector<RdmaServerTestPeer::MwReservation> claims(kThreads);
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (size_t i = 0; i < kThreads; ++i)
+    threads.emplace_back([&, i] {
+      claims[i] = RdmaServerTestPeer::MwReserveQuarantine(&server, 1024, 256);
+    });
+  for (auto& thread : threads) thread.join();
+  size_t admitted = 0;
+  for (const auto& claim : claims) admitted += claim.held() ? 1 : 0;
+  EXPECT_EQ(admitted, 4u);
+  EXPECT_EQ(RdmaServerTestPeer::MwReservedBytes(server), 1024u);
+  EXPECT_EQ(RdmaServerTestPeer::MwQuarantinedBytes(server), 0u);
+  for (auto& claim : claims) claim = {};
+  EXPECT_EQ(RdmaServerTestPeer::MwReservedBytes(server), 0u);
+  server.Stop();
+}
+
 namespace {
 
 // Sets RdmaNode::before_start for one node's construction.
@@ -12959,12 +13069,18 @@ TEST(RdmaServerMw, AGrantIsReadThroughAWindowAndWaitsOutTheQuarantine) {
   EXPECT_EQ(wc.status, IBV_WC_REM_ACCESS_ERR);
 }
 
-// A GET staged from the disk is read through a window on its receive chunk,
-// in the synchronous and the io_uring serve loop; a leased PUT keeps its
-// per-grant MR. Stop waits out the quarantine.
-TEST(RdmaServerMw, StagedGetsUseWindowsAndLeasedPutsKeepTheirMr) {
+// A GET staged from the disk keeps its per-grant MR, in the synchronous and
+// the io_uring serve loop: a READ of memory the disk has just written into
+// is slow through a registration older than the write (RDS-29). A leased PUT
+// keeps its per-grant MR too. No receive chunk is registered for windows.
+TEST(RdmaServerMw, StagedGetsAndLeasedPutsKeepTheirMrs) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  // Windows need a RAM arena; the value is then dropped from it, and a read
+  // promotes it back only if read again within 1 ms.
+  SmallRamTier ram_env;
+  ScopedEnv promote("DFKV_RAM_PROMOTE", "second");
+  ScopedEnv promote_window("DFKV_RAM_PROMOTE_WINDOW_MS", "1");
   for (const bool uring : {false, true}) {
     SCOPED_TRACE(uring ? "uring" : "sync");
     ScopedEnv uring_env("DFKV_SERVER_URING", uring ? "1" : "0");
@@ -12984,27 +13100,78 @@ TEST(RdmaServerMw, StagedGetsUseWindowsAndLeasedPutsKeepTheirMr) {
         << "the PUT did not take a lease";
     EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total"), 0)
         << "a PUT lease was bound by a window";
-    bool windowed = false;
-    for (int i = 0; i < 400 && !windowed; ++i) {
+    // Only on disk from here: the RAM copy goes once it is written.
+    RamTier& ram = KvNodeServerTestPeer::Ram(*node.srv);
+    const auto until =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!ram.DropDurableCopy(key) &&
+           std::chrono::steady_clock::now() < until)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_FALSE(ram.Contains(key)) << "the value stayed in the RAM tier";
+    const long grants = MwCounter(
+        *node.rsrv, "dfkv_rdma_server_grant_register_seconds_count");
+    for (int i = 0; i < 20; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(3));
       std::string out(value.size(), '\0');
       std::vector<uint64_t> lens;
       ASSERT_EQ(rt.RangeInto(node.addr, {key}, {{out.data(), out.size()}},
                              &lens),
                 std::vector<Status>{Status::kOk});
       ASSERT_EQ(out, value);
-      windowed = MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total") > 0;
-      if (!windowed) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    EXPECT_TRUE(windowed);
     EXPECT_GE(MwCounter(*node.rsrv,
+                        "dfkv_rdma_server_grant_register_seconds_count") -
+                  grants,
+              20);
+    EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total"), 0);
+    EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_fallback_grants_total"),
+              0)
+        << "a staged GET counted as a window fallback";
+    EXPECT_EQ(MwCounter(*node.rsrv,
                         "dfkv_rdma_server_mw_region_registrations_total"),
-              1);
-    node.rsrv->Stop();
-    EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_quarantine_bytes"),
-              0);
-    EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_quarantined_total"),
-              MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total"));
+              0)
+        << "a receive chunk was registered for windows";
+    EXPECT_FALSE(ram.Contains(key)) << "a GET promoted the value";
   }
+}
+
+// Without a RAM arena nothing can be bound: with the switch on, connections
+// allocate no windows, no region is registered, and the mode gauge says 0.
+TEST(RdmaServerMw, WithoutARamArenaNoWindowsAreAllocated) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  {
+    SmallRamTier ram_env;
+    RdmaNode probe("mw-arena-probe");
+    if (MwMode(*probe.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+  }
+  ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  std::atomic<int> allocations{0};
+  rdma::RcEndpoint::SetWindowAllocSeamForTest([&] {
+    allocations.fetch_add(1);
+    return true;
+  });
+  struct Restore {
+    ~Restore() { rdma::RcEndpoint::SetWindowAllocSeamForTest(nullptr); }
+  } restore;
+  RdmaNode node("mw-no-arena");
+  EXPECT_EQ(MwMode(*node.rsrv), 0);
+  EXPECT_FALSE(RdmaServerTestPeer::MwRegistryStarted(*node.rsrv));
+  RdmaTransport rt(kMaxMsg);
+  const std::string value = PatternValue(200 * 1024, 93);
+  const BlockKey key = ToBlockKey(SelfHdr(), "no-arena");
+  ASSERT_EQ(rt.Cache(node.addr, key, value.data(), value.size()), Status::kOk);
+  for (int i = 0; i < 5; ++i) {
+    std::string out(value.size(), '\0');
+    std::vector<uint64_t> lens;
+    ASSERT_EQ(rt.RangeInto(node.addr, {key}, {{out.data(), out.size()}}, &lens),
+              std::vector<Status>{Status::kOk});
+    ASSERT_EQ(out, value);
+  }
+  EXPECT_EQ(allocations.load(), 0) << "a connection allocated windows";
+  EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_binds_total"), 0);
+  EXPECT_EQ(MwCounter(*node.rsrv,
+                      "dfkv_rdma_server_mw_fallback_connections_total"), 0);
 }
 
 // A connection that ends holding a windowed grant (the client went away; the
@@ -13246,15 +13413,47 @@ TEST(RdmaServerMw, APrepareAheadOfTheReleaseCompletionWaitsForItUring) {
   ExercisePrepareAheadOfReleaseCompletion(true);
 }
 
-// A quarantine is never longer than DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS,
-// even when the rail's outstanding grants grew after the grant was admitted.
-TEST(RdmaServerMw, TheQuarantineEndsByTheMaximum) {
+// Every admitted window uses the configured maximum hold. A rail accounting
+// snapshot chooses MW rather than an exact MR at admission; later rail
+// pressure must not alter the lifetime of this already authorized one.
+TEST(RdmaServerMw, ArenaPinBudgetSurvivesEarlyStagingRelease) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
-  ScopedEnv max_ms("DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS", "5");
+  ScopedEnv cap("DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES", "8388608");
+  RdmaNode node("mw-pin-budget", 1024 * 1024);
+  if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+  MwEvents events;
+  BeforeStart seam([&](RdmaServer& server) {
+    RdmaServerTestPeer::SetMwEvents(
+        server, [&](const char* name, const void* at) { events.Note(name, at); });
+  });
+  const BlockKey key = ToBlockKey(SelfHdr(), "pin-budget-tiny");
+  const std::string value(1, 'v');
+  ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
+  const auto before = MwCounter(*node.rsrv, "dfkv_rdma_server_mw_quarantine_bytes");
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node, 1, false, value.size()));
+  rdma::DynamicPullReady ready;
+  // A one-byte RAM value occupies a full allocation, even though the staging
+  // buffer is returned as soon as the direct-to-arena read is authorized.
+  // Revocation must transfer the same reserved amount, not this range length.
+  ASSERT_TRUE(PrepareWindowed(node, peer, key, 0, value.size(), &ready));
+  ASSERT_TRUE(peer.Release(key, ready));
+  const void* at = reinterpret_cast<const void*>(ready.address);
+  ASSERT_TRUE(events.WaitFor(at, "released", 2000));
+  EXPECT_EQ(RdmaServerTestPeer::MwReservedBytes(*node.rsrv), 0u);
+  EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_quarantine_bytes"), before);
+}
+
+
+TEST(RdmaServerMw, LaterRailPressureDoesNotShortenAnAdmittedQuarantine) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
+  ScopedEnv max_ms("DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS", "40");
   ScopedEnv link("DFKV_RDMA_SERVER_MW_LINK_GBPS", "1");
+  ScopedEnv cap("DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES", "33554432");
   ScopedEnv ram_on("DFKV_RAM_TIER", "1");
-  ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "8388608");
+  ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "16777216");
   ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "4194304");
   ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
   ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
@@ -13263,37 +13462,44 @@ TEST(RdmaServerMw, TheQuarantineEndsByTheMaximum) {
     RdmaServerTestPeer::SetMwEvents(
         server, [&](const char* name, const void* at) { events.Note(name, at); });
   });
-  RdmaNode node("mw-max");
+  RdmaNode node("mw-frozen-rail", 1024 * 1024);
   if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
-  const BlockKey small = ToBlockKey(SelfHdr(), "max-small");
-  const BlockKey big = ToBlockKey(SelfHdr(), "max-big");
-  const std::string small_value = PatternValue(65536, 87);
-  const std::string big_value = PatternValue(256 * 1024, 88);
+  const BlockKey small = ToBlockKey(SelfHdr(), "frozen-small");
+  const BlockKey big = ToBlockKey(SelfHdr(), "frozen-big");
+  const std::string small_value = PatternValue(1024 * 1024, 87);
+  const std::string big_value = PatternValue(1024 * 1024, 88);
   ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, small, small_value));
   ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, big, big_value));
   PinnedPullPeer peer;
-  ASSERT_TRUE(peer.Open(node));
+  ASSERT_TRUE(peer.Open(node, 1, false, 1024 * 1024));
   rdma::DynamicPullReady ready;
-  // 64 KiB at 1 Gbit/s: 2 x 0.5 ms + 1 ms, under the 5 ms floor: windowed.
   ASSERT_TRUE(PrepareWindowed(node, peer, small, 0, small_value.size(), &ready));
-  // Three more grants of 256 KiB held meanwhile: 832 KiB outstanding would
-  // quarantine about 14.6 ms.
+  // Additional grants below pressure fallback accounting, not this grant's hold.
+  // The quarantine itself is the 40 ms maximum. Four more 1 MiB grants take
+  // the live rail backlog to 5 MiB, about 44.9 ms, and later grants over that
+  // threshold use exact MRs. Neither changes the first grant's retained range.
+  // Cap reservations (32 MiB) do not cause a fallback here.
   std::vector<std::unique_ptr<PinnedPullPeer>> holders;
-  std::vector<rdma::DynamicPullReady> held(3);
-  for (int i = 0; i < 3; ++i) {
+  std::vector<rdma::DynamicPullReady> held(4);
+  const long fallbacks_before =
+      MwCounter(*node.rsrv, "dfkv_rdma_server_mw_quarantine_fallbacks_total");
+  for (int i = 0; i < 4; ++i) {
     holders.push_back(std::make_unique<PinnedPullPeer>());
-    ASSERT_TRUE(holders.back()->Open(node));
+    ASSERT_TRUE(holders.back()->Open(node, 1, false, 1024 * 1024));
     ASSERT_TRUE(holders.back()->Prepare(big, 0, big_value.size(), &held[i]));
   }
+  EXPECT_GT(MwCounter(*node.rsrv,
+                      "dfkv_rdma_server_mw_quarantine_fallbacks_total"),
+            fallbacks_before);
   const void* at = reinterpret_cast<const void*>(ready.address);
   ASSERT_TRUE(peer.Release(small, ready));
   ASSERT_TRUE(events.WaitFor(at, "released", 2000));
   const auto life = events.For(at);
   ASSERT_EQ(life.size(), 3u);
-  EXPECT_GE(life[2].when - life[1].when, std::chrono::milliseconds(5));
-  EXPECT_LT(life[2].when - life[1].when, std::chrono::milliseconds(10))
-      << "the quarantine went past the 5 ms maximum";
-  for (int i = 0; i < 3; ++i) ASSERT_TRUE(holders[i]->Release(big, held[i]));
+  const auto held_us = std::chrono::duration_cast<std::chrono::microseconds>(
+      life[2].when - life[1].when).count();
+  EXPECT_GE(held_us, 40000);
+  for (int i = 0; i < 4; ++i) ASSERT_TRUE(holders[i]->Release(big, held[i]));
 }
 
 // A window whose deallocation is refused at close (EBUSY on a live QP)

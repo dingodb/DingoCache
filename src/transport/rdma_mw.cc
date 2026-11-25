@@ -30,37 +30,36 @@ uint64_t MwQuarantineUs(size_t bytes, uint64_t rate_mbps, uint64_t floor_us,
 }
 
 void BindRegionRegistry::Start(size_t rails, RegisterFn reg,
-                               DeregisterFn dereg, uint64_t arena_cap) {
+                               DeregisterFn dereg, uint64_t cap) {
   if (started_) return;
   register_ = std::move(reg);
   deregister_ = std::move(dereg);
-  arena_cap_ = arena_cap;
+  cap_ = cap;
   rails_.assign(rails, {});
   stopping_ = false;
   started_ = true;
   thread_ = std::thread([this] { Run(); });
 }
 
-uint64_t BindRegionRegistry::BytesLocked(size_t rail, Kind kind) const {
+uint64_t BindRegionRegistry::BytesLocked(size_t rail) const {
   uint64_t bytes = 0;
   for (const auto& [base, entry] : rails_[rail])
-    if (entry.kind == kind && entry.state != State::kFailed)
+    if (entry.state != State::kFailed)
       bytes += entry.size;
   return bytes;
 }
 
-uint64_t BindRegionRegistry::RegisteredBytes(size_t rail, Kind kind) const {
+uint64_t BindRegionRegistry::RegisteredBytes(size_t rail) const {
   std::lock_guard<std::mutex> lock(mu_);
   if (rail >= rails_.size()) return 0;
   uint64_t bytes = 0;
   for (const auto& [base, entry] : rails_[rail])
-    if (entry.kind == kind && entry.state == State::kRegistered)
+    if (entry.state == State::kRegistered)
       bytes += entry.size;
   return bytes;
 }
 
-ibv_mr* BindRegionRegistry::Find(size_t rail, char* base, size_t size,
-                                 Kind kind) {
+ibv_mr* BindRegionRegistry::Find(size_t rail, char* base, size_t size) {
   std::lock_guard<std::mutex> lock(mu_);
   if (!started_ || stopping_ || rail >= rails_.size()) return nullptr;
   auto& regions = rails_[rail];
@@ -73,11 +72,8 @@ ibv_mr* BindRegionRegistry::Find(size_t rail, char* base, size_t size,
       return nullptr;
     regions.erase(it);  // failed long enough ago: try again
   }
-  if (kind == Kind::kArena && arena_cap_ != 0 &&
-      BytesLocked(rail, kind) + size > arena_cap_)
-    return nullptr;
+  if (cap_ != 0 && BytesLocked(rail) + size > cap_) return nullptr;
   Entry entry;
-  entry.kind = kind;
   entry.size = size;
   regions.emplace(base, entry);
   queue_.emplace_back(rail, base);
@@ -94,13 +90,12 @@ void BindRegionRegistry::Run() {
     queue_.pop_front();
     const auto it = rails_[rail].find(base);
     if (it == rails_[rail].end() || it->second.state != State::kQueued)
-      continue;  // forgotten meanwhile
+      continue;
     it->second.state = State::kRegistering;
     const size_t size = it->second.size;
     lock.unlock();
     ibv_mr* mr = register_(rail, base, size);
     lock.lock();
-    // Forget waits for kRegistering, so the entry is still there.
     Entry& entry = rails_[rail].at(base);
     if (mr) {
       entry.state = State::kRegistered;
@@ -121,36 +116,6 @@ void BindRegionRegistry::Run() {
     }
     done_cv_.notify_all();
   }
-}
-
-bool BindRegionRegistry::Forget(char* base) {
-  std::vector<ibv_mr*> registered;
-  {
-    std::unique_lock<std::mutex> lock(mu_);
-    if (!started_) return true;
-    for (auto& regions : rails_) {
-      done_cv_.wait(lock, [&] {
-        const auto it = regions.find(base);
-        return it == regions.end() ||
-               it->second.state != State::kRegistering;
-      });
-      const auto it = regions.find(base);
-      if (it == regions.end()) continue;
-      if (it->second.mr) registered.push_back(it->second.mr);
-      regions.erase(it);
-    }
-  }
-  bool ok = true;
-  for (ibv_mr* mr : registered) {
-    const int error = deregister_(mr);
-    if (error == 0) continue;
-    ok = false;
-    DFKV_LOG_ERROR("rdma: a memory-window region still has a window bound "
-                   "as its memory is released (deregistration error " +
-                   std::to_string(error) +
-                   "); the memory is kept. This is a bug.");
-  }
-  return ok;
 }
 
 void BindRegionRegistry::Stop() {

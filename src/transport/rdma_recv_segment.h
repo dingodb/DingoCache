@@ -5,7 +5,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -156,16 +155,6 @@ class RecvSegmentPool {
                  int affinity = -1, int numa_node = -1,
                  LeaseClass lease_class = LeaseClass::kConnection);
   size_t TrimIdle(uint64_t idle_ms);
-  // Called for a chunk about to be freed, outside the pool lock, before its
-  // memory goes (a trim unlinks it under the lock first). False keeps the
-  // chunk's memory for good. Set before the first allocation.
-  void set_release_hook(std::function<bool(const RecvSegment*)> hook) {
-    release_hook_ = std::move(hook);
-  }
-  // Chunks the release hook refused, kept for good.
-  uint64_t kept_chunks() const {
-    return kept_chunks_.load(std::memory_order_relaxed);
-  }
   RecvSegment* initial_segment() const;
   size_t max_bytes() const;
   // The pool as it is now, for planning which leases to give up: every
@@ -203,7 +192,7 @@ class RecvSegmentPool {
   // *unlinked; mu_ held.
   size_t TrimEmptyLocked(size_t wanted,
                          std::vector<std::unique_ptr<Chunk>>* unlinked);
-  // Frees unlinked chunks through the release hook; mu_ not held.
+  // Frees unlinked chunks; mu_ not held.
   void FreeUnlinked(std::vector<std::unique_ptr<Chunk>>* chunks);
 
   size_t chunk_bytes_ = 0;
@@ -211,8 +200,6 @@ class RecvSegmentPool {
   size_t staging_reserve_bytes_ = 0;
   size_t alignment_ = 0;
   bool huge_pages_ = false;
-  std::function<bool(const RecvSegment*)> release_hook_;
-  std::atomic<uint64_t> kept_chunks_{0};
   // Allocations, growth, trimming. A release takes only its chunk's own
   // lock: it no longer goes through the pool.
   mutable std::mutex mu_;
