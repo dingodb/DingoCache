@@ -366,8 +366,10 @@ refuse a read-back of a removed key, wherever the remover sent its REMOVE.
   acknowledgement is sent. A PUT does not clear an entry.
 - **Bounds.** Entries older than `DFKV_REMOVE_MEMORY_MS` are dropped
   (default when on: 600 s; at least B's lookback H, §3.4). Capacity
-  `DFKV_REMOVE_MEMORY_ENTRIES` (default 1 Mi; measured about 106 B each, so
-  ~106 MiB at 1 Mi: a hash-map node, its bucket and the record-order entry);
+  `DFKV_REMOVE_MEMORY_ENTRIES` (default 1 Mi; 40 B each, so 40 MiB at 1 Mi:
+  a 32-byte record in a ring that grows up to the capacity, and a 4-byte
+  slot of an open-addressing index at most 70 % full; CLI-33, replacing a
+  hash map at about 93-106 B an entry);
   when full the oldest entry is dropped and the node's *coverage* shrinks.
 - **Coverage.** The node keeps `covered_since`: the latest of its start time
   and the time of the newest entry it dropped for capacity. It knows every

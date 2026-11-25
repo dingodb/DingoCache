@@ -52,8 +52,8 @@
 - Server: recent-REMOVE memory (CLI-02 stage M), behind
   `DFKV_REMOVE_MEMORY_MS` (default 0 = off, up to 3600000). A node records
   every REMOVE it acknowledges (key and tenant, before the reply; RAM only,
-  at most `DFKV_REMOVE_MEMORY_ENTRIES`, default 1048576, about 106 MiB when
-  full) and answers a new op,
+  at most `DFKV_REMOVE_MEMORY_ENTRIES`, default 1048576, 40 MiB when
+  full: 40 B an entry, CLI-33) and answers a new op,
   `kRemovedWithin` (25, TCP and RDMA): was each key removed here within the
   last `age_ms`, or unknown when that reaches before the node's start or
   its oldest kept record. It exists for the previous-owner read-back of a

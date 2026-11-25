@@ -16,8 +16,16 @@ constexpr uint64_t kMaxEntries = 67108864;
 }  // namespace
 
 RemoveMemory::RemoveMemory(uint64_t window_ms, size_t capacity,
-                           uint64_t now_ms)
-    : window_ms_(window_ms), capacity_(capacity), covered_since_ms_(now_ms) {}
+                           uint64_t now_ms, size_t presize_above)
+    : window_ms_(window_ms), capacity_(capacity), covered_since_ms_(now_ms) {
+  if (capacity_ <= presize_above) return;
+  // Whole at start: neither the ring nor the index ever grows (the index
+  // stays below 70 % full with every record a distinct key).
+  ring_.resize(capacity_);
+  size_t slots = 1024;
+  while (10 * capacity_ > 7 * slots) slots *= 2;
+  index_.assign(slots, kEmpty);
+}
 
 std::unique_ptr<RemoveMemory> RemoveMemory::FromEnv(uint64_t now_ms) {
   uint64_t window = config_dump::EnvU64("DFKV_REMOVE_MEMORY_MS", 0);
@@ -51,32 +59,100 @@ uint64_t RemoveMemory::NowLocked(uint64_t now_ms) {
   return last_now_ms_;
 }
 
-void RemoveMemory::ExpireLocked(uint64_t now_ms) {
-  while (!order_.empty() && now_ms >= order_.front().second &&
-         now_ms - order_.front().second > window_ms_) {
-    const auto& [key, at] = order_.front();
-    const auto it = last_.find(key);
-    if (it != last_.end() && it->second == at) last_.erase(it);
-    order_.pop_front();
+size_t RemoveMemory::SlotLocked(const BlockKey& key) const {
+  const size_t mask = index_.size() - 1;
+  size_t slot = BlockKeyMixHash()(key) & mask;
+  while (index_[slot] != kEmpty && !(ring_[index_[slot]].key == key))
+    slot = (slot + 1) & mask;
+  return slot;
+}
+
+void RemoveMemory::EraseSlotLocked(size_t slot) {
+  // Backward-shift deletion: every later entry of the run that may sit at
+  // `slot` moves up, so that no probe stops early at a hole.
+  const size_t mask = index_.size() - 1;
+  size_t hole = slot;
+  for (size_t next = (hole + 1) & mask; index_[next] != kEmpty;
+       next = (next + 1) & mask) {
+    const size_t home = BlockKeyMixHash()(ring_[index_[next]].key) & mask;
+    // `next` may move to `hole` unless its home lies cyclically in
+    // (hole, next].
+    const bool stays = hole <= next ? (hole < home && home <= next)
+                                    : (hole < home || home <= next);
+    if (stays) continue;
+    index_[hole] = index_[next];
+    hole = next;
   }
+  index_[hole] = kEmpty;
+  --live_;
+}
+
+void RemoveMemory::RebuildIndexLocked(size_t slots) {
+  index_.assign(slots, kEmpty);
+  live_ = 0;
+  for (size_t i = 0; i < size_; ++i) {  // oldest first: the latest wins
+    size_t pos = head_ + i;
+    if (pos >= ring_.size()) pos -= ring_.size();
+    const size_t slot = SlotLocked(ring_[pos].key);
+    if (index_[slot] == kEmpty) ++live_;
+    index_[slot] = static_cast<uint32_t>(pos);
+  }
+}
+
+void RemoveMemory::PopFrontLocked() {
+  const size_t slot = SlotLocked(ring_[head_].key);
+  if (index_[slot] == head_) EraseSlotLocked(slot);  // its latest record
+  if (++head_ == ring_.size()) head_ = 0;
+  --size_;
+}
+
+void RemoveMemory::PushBackLocked(const BlockKey& key, uint64_t now_ms) {
+  if (size_ == ring_.size()) {
+    // Grow (never past capacity_, which Record keeps size_ below): lay the
+    // ring out from 0 again, which moves every position.
+    std::vector<Rec> grown(std::min(capacity_, std::max<size_t>(1024, 2 * size_)));
+    for (size_t i = 0; i < size_; ++i) {
+      size_t pos = head_ + i;
+      if (pos >= ring_.size()) pos -= ring_.size();
+      grown[i] = ring_[pos];
+    }
+    ring_.swap(grown);
+    head_ = 0;
+    RebuildIndexLocked(std::max<size_t>(index_.size(), 1024));
+  }
+  size_t pos = head_ + size_;
+  if (pos >= ring_.size()) pos -= ring_.size();
+  ring_[pos] = Rec{key, now_ms};
+  ++size_;
+  size_t slot = SlotLocked(key);
+  if (index_[slot] == kEmpty) {
+    if (10 * (live_ + 1) > 7 * index_.size()) {
+      RebuildIndexLocked(2 * index_.size());
+      slot = SlotLocked(key);
+    }
+    if (index_[slot] == kEmpty) ++live_;
+  }
+  index_[slot] = static_cast<uint32_t>(pos);
+}
+
+void RemoveMemory::ExpireLocked(uint64_t now_ms) {
+  while (size_ != 0 && now_ms >= ring_[head_].at &&
+         now_ms - ring_[head_].at > window_ms_)
+    PopFrontLocked();
 }
 
 void RemoveMemory::Record(const BlockKey& key, uint64_t now_ms) {
   std::lock_guard<std::mutex> lk(mu_);
   now_ms = NowLocked(now_ms);
   ExpireLocked(now_ms);
-  while (order_.size() >= capacity_) {
+  while (size_ >= capacity_) {
     // Full: drop the oldest record; this node no longer knows what was
     // removed up to and including its time.
-    const auto& [old_key, at] = order_.front();
-    const auto it = last_.find(old_key);
-    if (it != last_.end() && it->second == at) last_.erase(it);
-    covered_since_ms_ = std::max(covered_since_ms_, at + 1);
-    order_.pop_front();
+    covered_since_ms_ = std::max(covered_since_ms_, ring_[head_].at + 1);
+    PopFrontLocked();
     dropped_.fetch_add(1, std::memory_order_relaxed);
   }
-  order_.emplace_back(key, now_ms);
-  last_[key] = now_ms;
+  PushBackLocked(key, now_ms);
 }
 
 uint64_t RemoveMemory::CoveredMs(uint64_t now_ms) {
@@ -101,9 +177,9 @@ uint64_t RemoveMemory::Query(uint64_t tenant_hash, const char* digests,
     uint8_t answer = kUnknown;
     if (known) {
       const char* d = digests + i * 16;
-      const auto it = last_.find(
-          BlockKey{net::GetU64(d), net::GetU64(d + 8), tenant_hash});
-      answer = it != last_.end() && now_ms - it->second <= age_ms
+      const BlockKey key{net::GetU64(d), net::GetU64(d + 8), tenant_hash};
+      const uint32_t pos = index_.empty() ? kEmpty : index_[SlotLocked(key)];
+      answer = pos != kEmpty && now_ms - ring_[pos].at <= age_ms
                    ? kRemoved
                    : kNotRemoved;
     }
@@ -115,7 +191,17 @@ uint64_t RemoveMemory::Query(uint64_t tenant_hash, const char* digests,
 
 size_t RemoveMemory::Entries() {
   std::lock_guard<std::mutex> lk(mu_);
-  return last_.size();
+  return live_;
+}
+
+size_t RemoveMemory::RingSlotsForTest() {
+  std::lock_guard<std::mutex> lk(mu_);
+  return ring_.size();
+}
+
+size_t RemoveMemory::IndexSlotsForTest() {
+  std::lock_guard<std::mutex> lk(mu_);
+  return index_.size();
 }
 
 uint64_t RemoveMemory::Dropped() const {
