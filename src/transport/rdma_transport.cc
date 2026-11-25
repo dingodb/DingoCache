@@ -26,67 +26,15 @@
 #include "transport/rdma_protocol.h"
 #include "transport/rdma_operation.h"
 #include "transport/rdma_connection_lifecycle.h"
+#include "transport/rdma_settings.h"
 
 namespace dfkv {
 
 namespace {
-int EnvInt(const char* name, int dflt) {
-  const char* v = std::getenv(name);
-  if (!v || !*v) return dflt;
-  long x = std::strtol(v, nullptr, 10);
-  const int resolved = x > 0 ? static_cast<int>(x) : dflt;
-  envparse::ReportUnlessPlain(name, 1, std::numeric_limits<int>::max(),
-                              std::to_string(resolved));
-  return resolved;
-}
-
-int EnvBoundedInt(const char* name, int dflt, int upper) {
-  const char* v = std::getenv(name);
-  if (!v || !*v) return dflt;
-  errno = 0;
-  char* end = nullptr;
-  long x = std::strtol(v, &end, 10);
-  const int resolved =
-      (errno != 0 || end == v || *end != '\0' || x <= 0)
-          ? dflt
-          : static_cast<int>(std::min<long>(x, upper));
-  // A default of 0 means "not set" to the caller, so 0 is a clean value.
-  envparse::ReportUnlessPlain(name, dflt == 0 ? 0 : 1,
-                              static_cast<uint64_t>(upper),
-                              std::to_string(resolved));
-  return resolved;
-}
-
-size_t EnvBytes(const char* name, size_t dflt) {
-  const char* v = std::getenv(name);
-  if (!v || !*v) return dflt;
-  errno = 0;
-  char* end = nullptr;
-  unsigned long long x = std::strtoull(v, &end, 10);
-  constexpr unsigned long long kMaxSge =
-      static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max() -
-                                      2 * rdma::kDirectIoAlign);
-  size_t resolved = dflt;
-  if (!(errno != 0 || end == v || x == 0))
-    resolved = static_cast<size_t>(x > kMaxSge ? kMaxSge : x);
-  envparse::ReportUnlessPlain(name, 1, kMaxSge, std::to_string(resolved));
-  return resolved;
-}
-uint64_t EnvU64(const char* name, uint64_t dflt) {
-  const char* value = std::getenv(name);
-  if (!value || !*value) return dflt;
-  errno = 0;
-  char* end = nullptr;
-  const unsigned long long parsed = std::strtoull(value, &end, 10);
-  const uint64_t resolved =
-      errno == 0 && end != value && *end == '\0' && parsed > 0
-          ? static_cast<uint64_t>(parsed)
-          : dflt;
-  envparse::ReportUnlessPlain(name, 1, std::numeric_limits<uint64_t>::max(),
-                              std::to_string(resolved));
-  return resolved;
-}
-
+// The byte settings' bound: dbuf/SGE length is uint32, with room for the
+// direct-I/O alignment rounding.
+constexpr uint64_t kMaxSgeBytes =
+    std::numeric_limits<uint32_t>::max() - 2 * rdma::kDirectIoAlign;
 
 // The DFKV_RDMA_TEST_* fault hooks below read the environment only once a
 // test binary has turned them on (RdmaTransport::EnableTestHooks). A process
@@ -141,12 +89,9 @@ bool InjectPullReadFailure(std::atomic<uint64_t>* reads) {
 
 size_t ResolveMaxPayload(size_t configured) {
   size_t n = configured ? configured : (64u << 20);
-  n = EnvBytes("DFKV_RDMA_MAX_PAYLOAD_BYTES", n);
-  // dbuf/SGE length is uint32; keep room for direct-I/O alignment rounding.
-  constexpr size_t kMaxSge = static_cast<size_t>(
-      std::numeric_limits<uint32_t>::max() - 2 * rdma::kDirectIoAlign);
-  if (n > kMaxSge) n = kMaxSge;
-  return n;
+  n = rdma_settings::ReadBytes("DFKV_RDMA_MAX_PAYLOAD_BYTES", n, kMaxSgeBytes);
+  // A --max-msg above the bound is clamped too.
+  return n > kMaxSgeBytes ? static_cast<size_t>(kMaxSgeBytes) : n;
 }
 
 
@@ -488,17 +433,19 @@ bool RdmaTransport::Available() {
 RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
     : max_payload_(ResolveMaxPayload(max_msg)),
       declared_(std::min<uint64_t>(
-          EnvBytes("DFKV_RDMA_MAX_BLOCK_BYTES", 4ull << 20),
+          rdma_settings::ReadBytes("DFKV_RDMA_MAX_BLOCK_BYTES", 4ull << 20,
+                                   kMaxSgeBytes),
           ResolveMaxPayload(max_msg))),
       connection_min_block_bytes_(std::min<size_t>(
-          EnvBytes("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", 256ull << 10),
+          rdma_settings::ReadBytes("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES",
+                                   256ull << 10, kMaxSgeBytes),
           static_cast<size_t>(declared_))),
       depth_(4) {
   // Optional staged-lease PUT threshold (env DFKV_RDMA_INLINE_PUT_MAX_BYTES,
   // default 4 MiB; explicit 0 disables). Objects larger than this use the
   // per-op staging-lease datapath on connections whose peer negotiated it,
   // keeping the connection-resident receive-slot class at the threshold.
-  // Unlike EnvBytes, an explicit 0 must stay 0 (disabled), not fall back.
+  // Unlike ReadBytes, an explicit 0 must stay 0 (disabled), not fall back.
   inline_put_max_bytes_ = 4ull << 20;
   size_t inline_resolved_state = 1;  // 1 = default, 0 = disabled, 2 = value
   if (const char* const v = std::getenv("DFKV_RDMA_INLINE_PUT_MAX_BYTES")) {
@@ -595,11 +542,11 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   }
   peer_topologies_ = std::make_unique<rdma::PeerTopologyStore>(
       devs_, rail_tiers_, peer_topology_required_);
-  const int remote_base_cooldown_ms = EnvBoundedInt(
+  const int remote_base_cooldown_ms = rdma_settings::ReadBoundedInt(
       "DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS", 2000, 30000);
   const int remote_max_cooldown_ms = std::max(
       remote_base_cooldown_ms,
-      EnvBoundedInt("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS", 30000, 30000));
+      rdma_settings::ReadBoundedInt("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS", 30000, 30000));
   remote_rail_health_ = std::make_unique<RemoteRailHealth>(
       RemoteRailHealthConfig{
           static_cast<uint64_t>(remote_base_cooldown_ms) * 1000,
@@ -641,11 +588,11 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       std::to_string(connection_min_block_bytes_));
   config_dump::RecordResolved("DFKV_RDMA_NUMA", numa_aware_ ? "1" : "0");
   const size_t endpoint_limit = static_cast<size_t>(
-      EnvBoundedInt("DFKV_RDMA_ENDPOINT_CACHE_MAX", 256, 65536));
+      rdma_settings::ReadBoundedInt("DFKV_RDMA_ENDPOINT_CACHE_MAX", 256, 65536));
   const size_t qp_limit = static_cast<size_t>(
-      EnvBoundedInt("DFKV_RDMA_QP_BUDGET",
+      rdma_settings::ReadBoundedInt("DFKV_RDMA_QP_BUDGET",
                     static_cast<int>(endpoint_limit), 65536));
-  const size_t wr_limit = static_cast<size_t>(EnvU64(
+  const size_t wr_limit = static_cast<size_t>(rdma_settings::ReadU64(
       "DFKV_RDMA_WR_BUDGET",
       static_cast<uint64_t>(endpoint_limit) * depth_));
   const uint64_t slot_bytes =
@@ -656,10 +603,10 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
                   std::numeric_limits<uint64_t>::max() / slot_bytes / depth_ / 2
           ? 2 * slot_bytes * depth_ * endpoint_limit
           : std::numeric_limits<uint64_t>::max();
-  const uint64_t registered_limit = EnvU64(
+  const uint64_t registered_limit = rdma_settings::ReadU64(
       "DFKV_RDMA_REGISTERED_BYTES_BUDGET", default_registered_budget);
   resource_acquire_ms_ =
-      EnvBoundedInt("DFKV_RDMA_RESOURCE_ACQUIRE_MS", 10000, 600000);
+      rdma_settings::ReadBoundedInt("DFKV_RDMA_RESOURCE_ACQUIRE_MS", 10000, 600000);
   resource_budget_ = ProcessResourceBudget(
       {endpoint_limit, qp_limit, wr_limit, registered_limit});
   // Any explicitly pinned budget dimension turns the whole autoscale off:
@@ -700,18 +647,18 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
                               std::to_string(resource_acquire_ms_));
   rdma::RailPolicyConfig rail_config;
   rail_config.credits_per_rail = static_cast<uint32_t>(
-      EnvBoundedInt("DFKV_RDMA_RAIL_CREDITS", 64, 4096));
+      rdma_settings::ReadBoundedInt("DFKV_RDMA_RAIL_CREDITS", 64, 4096));
   rail_config.error_threshold = static_cast<uint32_t>(
-      EnvBoundedInt("DFKV_RDMA_RAIL_ERROR_THRESHOLD", 3, 1000));
+      rdma_settings::ReadBoundedInt("DFKV_RDMA_RAIL_ERROR_THRESHOLD", 3, 1000));
   const int cooldown_ms =
-      EnvBoundedInt("DFKV_RDMA_RAIL_COOLDOWN_MS", 5000, 600000);
+      rdma_settings::ReadBoundedInt("DFKV_RDMA_RAIL_COOLDOWN_MS", 5000, 600000);
   rail_config.quarantine_us = static_cast<uint64_t>(cooldown_ms) * 1000;
   rail_config.latency_weight = static_cast<uint32_t>(
-      EnvBoundedInt("DFKV_RDMA_RAIL_LATENCY_WEIGHT", 1, 1000));
+      rdma_settings::ReadBoundedInt("DFKV_RDMA_RAIL_LATENCY_WEIGHT", 1, 1000));
   rail_config.error_penalty_us = static_cast<uint64_t>(
-      EnvBoundedInt("DFKV_RDMA_RAIL_ERROR_PENALTY_US", 100000, 60000000));
+      rdma_settings::ReadBoundedInt("DFKV_RDMA_RAIL_ERROR_PENALTY_US", 100000, 60000000));
   const int backpressure_ms =
-      EnvBoundedInt("DFKV_RDMA_RAIL_BACKPRESSURE_MS", 0, 60000);
+      rdma_settings::ReadBoundedInt("DFKV_RDMA_RAIL_BACKPRESSURE_MS", 0, 60000);
   rail_policy_ =
       std::make_unique<rdma::RailPolicy>(devs_.size(), rail_config);
   config_dump::RecordResolved("DFKV_RDMA_RAIL_CREDITS",
@@ -746,8 +693,8 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   envparse::ReportUnlessPlain("DFKV_RDMA_SPIN_US", 0, 10000,
                               std::to_string(spin_us_));
   config_dump::RecordResolved("DFKV_RDMA_SPIN_US", std::to_string(spin_us_));
-  connect_ms_ = EnvInt("DFKV_RDMA_CONNECT_MS", 3000);
-  io_ms_ = EnvInt("DFKV_RDMA_IO_MS", 10000);
+  connect_ms_ = rdma_settings::ReadInt("DFKV_RDMA_CONNECT_MS", 3000);
+  io_ms_ = rdma_settings::ReadInt("DFKV_RDMA_IO_MS", 10000);
   // An explicit zero disables the single-op datapath completion deadline.
   {
     const char* value = std::getenv("DFKV_RDMA_OP_TIMEOUT_MS");
@@ -832,7 +779,7 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   }
   // An explicit limit remains a hard per-pool retention limit. With no
   // override, only data endpoints get a bounded, expiring burst allowance.
-  const int pool_override = EnvBoundedInt(
+  const int pool_override = rdma_settings::ReadBoundedInt(
       "DFKV_RDMA_POOL_MAX", 0, std::numeric_limits<int>::max());
   if (pool_override > 0)
     pool_max_ = data_pool_max_ = static_cast<size_t>(pool_override);
