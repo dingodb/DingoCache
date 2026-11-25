@@ -521,6 +521,11 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_op_deadline_expired_total` | counter | 操作的期限（`DFKV_RDMA_OP_TIMEOUT_MS`，批量操作为每次尝试的批量期限）在建连途中用完的次数：操作以 `kIOError` 超时，不记对端不可达、不冷却任何 rail |
 | `dfkv_rdma_client_rails_port_down` | gauge | 当前因端口不是 ACTIVE 而退出选择的本端 rail 数（`DFKV_RDMA_PORT_CHECK_MS`） |
 | `dfkv_rdma_client_port_down_events_total` | counter | 本端 rail 因端口离开 ACTIVE 而退出选择的次数 |
+| `dfkv_rdma_client_async_events_total{dev,event}` | counter | 读到的网卡异步事件（`IBV_EVENT_*` 的名字），开关关闭时也计数 |
+| `dfkv_rdma_client_device_suspect_total{dev,reason}` | counter | rail 的设备可能已复位的信号：`fatal`（DEVICE_FATAL），`open`（新建 endpoint 失败于 `ENODEV`/`EIO`） |
+| `dfkv_rdma_client_device_dead{dev}` | gauge | 因设备复位退出选择、等待重建的 rail（`DFKV_RDMA_DEVICE_REBUILD`） |
+| `dfkv_rdma_client_device_rebuilds_total{dev}` | counter | 在复位后的设备上重建完成的次数 |
+| `dfkv_rdma_client_dead_release_failures_total` | counter | 在已证明失效的设备上释放失败、被丢弃而没有中止进程的资源（进程级） |
 | `dfkv_rdma_client_local_resource_failures_total` | counter | 因本进程资源问题失败的操作：调用方 buffer 注册失败且 errno 为 ENOMEM/EAGAIN/EFAULT/EINVAL（locked-memory 上限、地址不可 pin），或建 endpoint 时 fd/内存耗尽（EMFILE/ENFILE/ENOMEM）。不计 rail、不冷却对端；建连时 `socket()` 或建 endpoint 时 fd 耗尽会先用对端在其他 rail 上的空闲连接，ENOMEM（可能只是该设备的 QP/CQ 上限）会在其他 rail 上新建连接（见下一行），都不行时操作返回 `kResourceExhausted`。**按失败的那次打开计**，不按操作：一次操作在几条 rail 上各失败一次就计几次；日志里有 `cannot register a caller buffer` / `cannot create an endpoint` 及 errno。其他 errno 仍按本地 rail 故障处理。>0 先查本进程的 `ulimit -l` / `LimitMEMLOCK`，再查 `LimitNOFILE` |
 | `dfkv_rdma_client_local_resource_rail_fallbacks_total` | counter | 建 endpoint 因本地资源失败后，改在其他 rail 上完成的操作（fd 耗尽时用已有的空闲连接，ENOMEM 时新建） |
 | `dfkv_rdma_client_local_resource_held_total` | counter | 直接以 `kResourceExhausted` 失败的操作：选中的 rail 没有空闲连接，且它和其他可用 rail 最近 2 秒内建 endpoint 都 ENOMEM 过（进程的 locked memory 用完），不再拨号，免得每次操作都让对端看到 N 个半途而废的握手；处于这 2 秒内的 rail 上已有的空闲连接照常使用 |

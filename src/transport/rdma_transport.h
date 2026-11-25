@@ -308,6 +308,16 @@ class RdmaTransport : public Transport {
   // Follows each rail's port state: a rail whose port is not ACTIVE is out
   // of selection until it is again (DFKV_RDMA_PORT_CHECK_MS).
   void CheckPorts();
+  // TRN-29 (docs/design/rdma-device-reset.md), on the background thread:
+  // reads the devices' async events (counted; with DFKV_RDMA_DEVICE_REBUILD,
+  // DEVICE_FATAL retires the device's binding) and, with the switch, takes a
+  // rail whose device generation moved out of selection and rebuilds it.
+  void CheckDevices();
+  void MarkRailStale(size_t rail);
+  // One attempt; false if it could not run or failed (retried later).
+  bool RebuildRail(size_t rail, uint64_t generation);
+  // With the switch: the rail's device generation moved since it was built.
+  bool RailStale(size_t rail) const;
   // A recovery probe for each rail whose cooldown has elapsed: a keepalive
   // on that rail to a node this client has connected to, trying up to
   // kProbeNodes of them. Runs on the keepalive thread; a dial there takes up
@@ -517,6 +527,23 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> rail_background_probes_{0};
   std::mutex known_nodes_mu_;
   std::set<std::string> known_nodes_;  // nodes connected to (ProbeRails)
+  // TRN-29. device_rebuild_: DFKV_RDMA_DEVICE_REBUILD. Per rail: the device
+  // generation its connections and anchor were built on; whether it is out
+  // of selection for a rebuild; DEVICE_FATAL / Open ENODEV-EIO signals
+  // (suspects, 2 per rail); rebuilds. The rest: background thread only.
+  bool device_rebuild_ = false;
+  std::unique_ptr<std::atomic<uint64_t>[]> rail_generation_;
+  std::unique_ptr<std::atomic<uint8_t>[]> rail_stale_;
+  std::unique_ptr<std::atomic<uint64_t>[]> device_suspects_;
+  std::unique_ptr<std::atomic<uint64_t>[]> device_rebuilds_;
+  std::vector<uint64_t> rebuild_not_before_us_;
+  std::vector<uint64_t> rebuild_backoff_ms_;
+  mutable std::mutex device_events_mu_;
+  std::map<std::pair<std::string, std::string>, uint64_t> device_events_;
+  // Tests: a rebuild attempt fails as if the device did not open; the
+  // background thread does not look at the devices.
+  std::atomic<bool> rebuild_fails_for_test_{false};
+  std::atomic<bool> device_checks_paused_for_test_{false};
   std::atomic<bool> keepalive_stop_{false};
   std::condition_variable keepalive_cv_;
   std::mutex keepalive_mu_;

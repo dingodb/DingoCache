@@ -83,6 +83,44 @@ constexpr size_t kMaxSge = 30;
 // Open()'s "trust the documented cap" fallback keeps the client guard at its
 // historical 29-payload-segs behavior instead of silently shrinking it.
 size_t QueryMaxSge(const char* dev_name);
+
+// TRN-29: recovering a rail after a device reset
+// (docs/design/rdma-device-reset.md). DFKV_RDMA_DEVICE_REBUILD, default off,
+// read once.
+bool DeviceRebuildEnabled();
+// The device name's generation: bumped by each RetireDevice. A shared
+// context records the generation it was opened under. "" = first device.
+uint64_t DeviceGeneration(const std::string& dev_name);
+// Retires the name's binding if its generation is still `generation`: the
+// next Open of the name opens a fresh context; the old one is closed with its
+// last reference. False if it was retired already.
+bool RetireDevice(const std::string& dev_name, uint64_t generation);
+struct DeviceEvent {
+  std::string device;
+  std::string event;
+  bool fatal = false;          // IBV_EVENT_DEVICE_FATAL
+  uint64_t generation = 0;     // of the context it came from
+};
+// Drains the async events of every shared context (one reader at a time).
+std::vector<DeviceEvent> PollDeviceEvents();
+// Releases that failed on a context proven disassociated, and were dropped.
+uint64_t DeadReleaseFailures();
+// Tests: the next PollDeviceEvents reports DEVICE_FATAL for the device.
+void InjectDeviceFatalForTest(const std::string& dev_name);
+// Tests: faults for the release decision. `release` overrides the result
+// of a release that succeeded (by operation name; 0 = keep), `confirm` what
+// the confirming verb returns, `listed` whether the device is still listed.
+struct ReleaseFaultsForTest {
+  std::function<int(const char* operation)> release;
+  std::function<int()> confirm;
+  std::function<bool()> listed;
+};
+void SetReleaseFaultsForTest(ReleaseFaultsForTest faults);
+// Tests: overrides DFKV_RDMA_DEVICE_REBUILD (1 on, 0 off, -1 the variable).
+// A transport reads the switch when it is constructed.
+void SetDeviceRebuildForTest(int enabled);
+// Retired contexts still referenced. Diagnostic/test.
+size_t RetiredDeviceCount();
 // Alignment used for server-side O_DIRECT read buffers. NVMe/xfs are happy with
 // 4096, and it is a safe superset for 512-byte logical-sector devices.
 constexpr size_t kDirectIoAlign = 4096;
@@ -261,6 +299,8 @@ class RcEndpoint {
   // Test seam: called right after a pool MR is handed back to `retired`
   // (it may throw, as an allocation there could). Empty = none.
   static void SetPoolRetireSeamForTest(std::function<void()> seam);
+  // The device generation the endpoint's context was opened under (TRN-29).
+  uint64_t device_generation() const { return device_generation_; }
   // References this open endpoint's device; not held if it is not open.
   DeviceRef ReferenceDevice() const;
   // Process-wide references to opened devices (endpoints and DeviceRefs).
@@ -429,6 +469,7 @@ class RcEndpoint {
   void Close();
 
   ibv_context* ctx_ = nullptr;
+  uint64_t device_generation_ = 0;
   ibv_pd* pd_ = nullptr;
   ibv_cq* cq_ = nullptr;
   ibv_comp_channel* chan_ = nullptr;

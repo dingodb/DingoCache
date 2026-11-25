@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <unistd.h>
 
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <list>
 #include <map>
 #include <mutex>
 #include <random>
@@ -61,12 +63,19 @@ struct PortInfo {
   ibv_gid gid{};
 };
 struct SharedDevice {
-  ibv_context* ctx;
-  ibv_pd* pd;
-  long refs;
+  ibv_context* ctx = nullptr;
+  ibv_pd* pd = nullptr;
+  long refs = 0;
   // Registered once per PD. Entries retire at zero endpoint refs.
   std::vector<SharedPoolMr> pool_mrs;
   std::map<uint8_t, PortInfo> ports;
+  // TRN-29. The device's name, the name's generation this context was
+  // opened under, the inode of /sys/class/infiniband/<name> then (0 if it
+  // could not be read), and whether IBV_EVENT_DEVICE_FATAL was received.
+  std::string name;
+  uint64_t generation = 0;
+  uint64_t sysfs_inode = 0;
+  bool fatal = false;
 };
 // Guards g_devs and each device's pool_mrs and ports. No ibv_reg_mr or
 // ibv_dereg_mr runs under it: a large registration pins and zero-fills every
@@ -81,6 +90,18 @@ std::function<void()> g_pool_deregistration_seam;
 std::function<void()> g_pool_retire_seam;
 std::function<bool(void*, size_t)> g_transient_registration_seam;
 std::unordered_map<std::string, SharedDevice> g_devs;
+// TRN-29: entries whose name binding was retired (RetireDevice): still
+// referenced by endpoints opened before, closed with their last reference.
+std::list<SharedDevice> g_retired_devs;
+// Per device key: bumped by each RetireDevice; an entry records the value it
+// was opened under.
+std::unordered_map<std::string, uint64_t> g_dev_generations;
+std::atomic<uint64_t> g_dead_release_failures{0};
+// Tests: device keys whose next PollDeviceEvents reports DEVICE_FATAL.
+std::vector<std::string> g_injected_fatal;
+// Tests: what a release returned, what the confirming verb returned, and
+// whether the device is still listed (see ReleaseFaultsForTest).
+ReleaseFaultsForTest g_release_faults;
 
 // Cumulative one-shot user MRs registered outside explicit pool regions.
 // Unlike the live gauge below this legitimately grows when callers do not
@@ -104,15 +125,91 @@ std::atomic<uint64_t> g_cq_errors{0};
 // A failed revocation is not cleanup success: the NIC may still hold a key or
 // pinned pages. Continuing would let the allocator reuse DMA-visible storage.
 // There is no recoverable ownership path here; fail closed before any free.
-void RequireVerbsRelease(int result, const char* operation) {
+// TRN-29: with DFKV_RDMA_DEVICE_REBUILD on, a release that fails on a context
+// proven disassociated (the device that could DMA is gone) is counted instead.
+// What the decision needs to know of the context's device.
+struct DeviceFacts {
+  ibv_context* ctx = nullptr;
+  std::string name;
+  uint64_t sysfs_inode = 0;
+  bool fatal = false;
+};
+DeviceFacts FactsOf(ibv_context* ctx);
+
+std::string DeviceKey(const char* dev_name) {
+  return (dev_name && *dev_name) ? std::string(dev_name)
+                                 : std::string("\x01first");
+}
+
+uint64_t SysfsInode(const std::string& name) {
+  struct stat st {};
+  if (name.empty() ||
+      ::stat(("/sys/class/infiniband/" + name).c_str(), &st) != 0)
+    return 0;
+  return static_cast<uint64_t>(st.st_ino);
+}
+
+bool DeviceListed(const std::string& name) {
+  if (g_release_faults.listed) return g_release_faults.listed();
+  int n = 0;
+  ibv_device** list = ibv_get_device_list(&n);
+  bool listed = false;
+  for (int i = 0; list && i < n; ++i)
+    listed = listed || name == ibv_get_device_name(list[i]);
+  if (list) ibv_free_device_list(list);
+  return listed;
+}
+
+// Proof that the context is disassociated: DEVICE_FATAL received for it; or
+// the release failed with EIO/ENODEV and a confirming verb on the same
+// context fails with ENODEV, or with EIO while the device is gone from the
+// device list or its sysfs node was removed or replaced. Wedged firmware can
+// answer EIO and still DMA, so EIO alone is never enough.
+bool ProvenDisassociated(const DeviceFacts& device, int err) {
+  if (!DeviceRebuildEnabled() || !device.ctx) return false;
+  if (device.fatal) return true;
+  if (err != EIO && err != ENODEV) return false;
+  int confirm = 0;
+  if (g_release_faults.confirm) {
+    confirm = g_release_faults.confirm();
+  } else {
+    ibv_device_attr attr{};
+    confirm = ibv_query_device(device.ctx, &attr);
+  }
+  if (confirm == ENODEV) return true;
+  if (confirm != EIO) return false;
+  if (!DeviceListed(device.name)) return true;
+  const uint64_t inode = SysfsInode(device.name);
+  return inode == 0 || (device.sysfs_inode != 0 && inode != device.sysfs_inode);
+}
+
+void RequireVerbsRelease(const DeviceFacts& device, int result,
+                         const char* operation) {
+  if (g_release_faults.release && result == 0)
+    result = g_release_faults.release(operation);
   if (result == 0) return;
+  const int err = result > 0 ? result : errno;
+  if (ProvenDisassociated(device, err)) {
+    g_dead_release_failures.fetch_add(1, std::memory_order_relaxed);
+    DFKV_LOG_WARN(std::string("rdma: ") + operation + " failed (" +
+                  std::to_string(err) + ") on device " + device.name +
+                  ", which is gone; the object is dropped");
+    return;
+  }
   DFKV_LOG_ERROR(std::string("rdma: unsafe resource release: ") + operation +
                  " failed (" + std::to_string(result) + ")");
   std::abort();
 }
 
+void RequireVerbsRelease(ibv_context* ctx, int result, const char* operation) {
+  if (result == 0 && !g_release_faults.release) return;
+  RequireVerbsRelease(FactsOf(ctx), result, operation);
+}
+
 void DeregisterMr(ibv_mr* mr) {
-  if (mr) RequireVerbsRelease(ibv_dereg_mr(mr), "ibv_dereg_mr");
+  if (!mr) return;
+  ibv_context* ctx = mr->context;
+  RequireVerbsRelease(ctx, ibv_dereg_mr(mr), "ibv_dereg_mr");
 }
 
 // rdma_wc_status.h names completion statuses by number without verbs.h.
@@ -124,10 +221,11 @@ static_assert(IBV_WC_SUCCESS == 0 && IBV_WC_WR_FLUSH_ERR == 5 &&
 // Get-or-open the shared {ctx, pd} for `dev_name` (nullptr/"" = first device),
 // bumping its refcount. Returns {nullptr,nullptr} on failure (no refcount taken).
 std::pair<ibv_context*, ibv_pd*> AcquireSharedDevice(const char* dev_name) {
-  const std::string key = (dev_name && *dev_name) ? std::string(dev_name) : std::string("\x01first");
+  const std::string key = DeviceKey(dev_name);
   std::lock_guard<std::mutex> lk(g_dev_mu);
   auto it = g_devs.find(key);
   if (it != g_devs.end()) { ++it->second.refs; return {it->second.ctx, it->second.pd}; }
+  std::string name;
   int n = 0;
   ibv_device** list = ibv_get_device_list(&n);
   if (!list || n == 0) { if (list) ibv_free_device_list(list); return {nullptr, nullptr}; }
@@ -139,13 +237,24 @@ std::pair<ibv_context*, ibv_pd*> AcquireSharedDevice(const char* dev_name) {
     dev = list[0];
   }
   if (!dev) { ibv_free_device_list(list); return {nullptr, nullptr}; }
+  name = ibv_get_device_name(dev);
   ibv_context* ctx = ibv_open_device(dev);
   ibv_free_device_list(list);
   if (!ctx) return {nullptr, nullptr};
   g_device_opens.fetch_add(1, std::memory_order_relaxed);
   ibv_pd* pd = ibv_alloc_pd(ctx);
   if (!pd) { ibv_close_device(ctx); return {nullptr, nullptr}; }
-  g_devs.emplace(key, SharedDevice{ctx, pd, 1, {}});
+  // Async events are read by PollDeviceEvents, which must not block.
+  const int flags = ::fcntl(ctx->async_fd, F_GETFL);
+  if (flags >= 0) ::fcntl(ctx->async_fd, F_SETFL, flags | O_NONBLOCK);
+  SharedDevice device;
+  device.ctx = ctx;
+  device.pd = pd;
+  device.refs = 1;
+  device.name = name;
+  device.generation = g_dev_generations[key];
+  device.sysfs_inode = SysfsInode(name);
+  g_devs.emplace(key, std::move(device));
   return {ctx, pd};
 }
 
@@ -156,28 +265,57 @@ void ReleaseSharedDevice(ibv_context* ctx) {
   SharedDevice last{};
   {
     std::lock_guard<std::mutex> lk(g_dev_mu);
+    bool found = false;
     for (auto it = g_devs.begin(); it != g_devs.end(); ++it) {
       if (it->second.ctx != ctx) continue;
+      found = true;
       if (--it->second.refs == 0) {
         last = std::move(it->second);
         g_devs.erase(it);
       }
       break;
     }
+    // A retired entry is released like any other (TRN-29).
+    for (auto it = g_retired_devs.begin(); !found && it != g_retired_devs.end();
+         ++it) {
+      if (it->ctx != ctx) continue;
+      found = true;
+      if (--it->refs == 0) {
+        last = std::move(*it);
+        g_retired_devs.erase(it);
+      }
+    }
   }
   if (!last.ctx) return;
+  // The entry is gone from the registry: its facts travel with it.
+  const DeviceFacts facts{last.ctx, last.name, last.sysfs_inode, last.fatal};
   for (auto& p : last.pool_mrs) {
-    DeregisterMr(p.mr);
+    RequireVerbsRelease(facts, ibv_dereg_mr(p.mr), "ibv_dereg_mr");
     g_pool_mr_active.fetch_sub(1, std::memory_order_relaxed);
   }
-  RequireVerbsRelease(ibv_dealloc_pd(last.pd), "ibv_dealloc_pd");
-  RequireVerbsRelease(ibv_close_device(last.ctx), "ibv_close_device");
+  RequireVerbsRelease(facts, ibv_dealloc_pd(last.pd), "ibv_dealloc_pd");
+  RequireVerbsRelease(facts, ibv_close_device(last.ctx), "ibv_close_device");
 }
 
 SharedDevice* FindDeviceLocked(ibv_context* ctx) {
   for (auto& d : g_devs)
     if (d.second.ctx == ctx) return &d.second;
+  for (auto& d : g_retired_devs)
+    if (d.ctx == ctx) return &d;
   return nullptr;
+}
+
+uint64_t GenerationOf(ibv_context* ctx) {
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  const SharedDevice* device = FindDeviceLocked(ctx);
+  return device ? device->generation : 0;
+}
+
+DeviceFacts FactsOf(ibv_context* ctx) {
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  const SharedDevice* device = FindDeviceLocked(ctx);
+  if (!device) return DeviceFacts{ctx, {}, 0, false};
+  return DeviceFacts{ctx, device->name, device->sysfs_inode, device->fatal};
 }
 
 SharedPoolMr* FindPoolMrLocked(SharedDevice* device, uintptr_t base,
@@ -399,6 +537,7 @@ long RcEndpoint::DeviceReferences() {
   std::lock_guard<std::mutex> lk(g_dev_mu);
   long refs = 0;
   for (const auto& device : g_devs) refs += device.second.refs;
+  for (const auto& device : g_retired_devs) refs += device.refs;
   return refs;
 }
 
@@ -495,7 +634,7 @@ void RcEndpoint::Close() {
   // Successful QP destruction fences inbound DMA before any MR or buffer is
   // released, including bootstrap failures and abandoned initiator READs.
   if (qp_) {
-    RequireVerbsRelease(ibv_destroy_qp(qp_), "ibv_destroy_qp");
+    RequireVerbsRelease(ctx_, ibv_destroy_qp(qp_), "ibv_destroy_qp");
     qp_ = nullptr;
   }
   for (auto* mr : lease_write_mr_) DeregisterMr(mr);
@@ -562,6 +701,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
   ctx_ = shared.first;
   pd_ = shared.second;
   if (!ctx_ || !pd_) return fail();
+  device_generation_ = GenerationOf(ctx_);
 
   chan_ = ibv_create_comp_channel(ctx_);
   if (!chan_) return fail();
@@ -1472,6 +1612,88 @@ void RcEndpoint::Wake() {
   if (wake_wfd_ >= 0) { char b = 1; ssize_t n = ::write(wake_wfd_, &b, 1); (void)n; }
 }
 
+
+namespace {
+std::atomic<int> g_rebuild_override{-1};
+}  // namespace
+
+void SetDeviceRebuildForTest(int enabled) { g_rebuild_override = enabled; }
+
+size_t RetiredDeviceCount() {
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  return g_retired_devs.size();
+}
+
+bool DeviceRebuildEnabled() {
+  const int override_value = g_rebuild_override.load();
+  if (override_value >= 0) return override_value != 0;
+  static const bool enabled = [] {
+    const bool on = envparse::EnvSwitch("DFKV_RDMA_DEVICE_REBUILD", false,
+                                        envparse::OffWhen::kStartsWithZero);
+    config_dump::RecordResolved("DFKV_RDMA_DEVICE_REBUILD", on ? "on" : "off");
+    return on;
+  }();
+  return enabled;
+}
+
+uint64_t DeviceGeneration(const std::string& dev_name) {
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  const auto it = g_dev_generations.find(DeviceKey(dev_name.c_str()));
+  return it == g_dev_generations.end() ? 0 : it->second;
+}
+
+bool RetireDevice(const std::string& dev_name, uint64_t generation) {
+  const std::string key = DeviceKey(dev_name.c_str());
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  uint64_t& current = g_dev_generations[key];
+  if (current != generation) return false;  // retired already
+  ++current;
+  const auto it = g_devs.find(key);
+  if (it != g_devs.end() && it->second.generation == generation) {
+    g_retired_devs.push_back(std::move(it->second));
+    g_devs.erase(it);
+  }
+  return true;
+}
+
+std::vector<DeviceEvent> PollDeviceEvents() {
+  std::vector<DeviceEvent> events;
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  for (auto& [key, device] : g_devs) {
+    const auto injected =
+        std::find(g_injected_fatal.begin(), g_injected_fatal.end(), key);
+    if (injected != g_injected_fatal.end()) {
+      g_injected_fatal.erase(injected);
+      device.fatal = true;
+      events.push_back(DeviceEvent{device.name, "device fatal error", true,
+                                   device.generation});
+    }
+    ibv_async_event event{};
+    // Non-blocking since the context was opened: EAGAIN ends the loop.
+    while (ibv_get_async_event(device.ctx, &event) == 0) {
+      const bool fatal = event.event_type == IBV_EVENT_DEVICE_FATAL;
+      if (fatal) device.fatal = true;
+      events.push_back(DeviceEvent{device.name,
+                                   ibv_event_type_str(event.event_type), fatal,
+                                   device.generation});
+      ibv_ack_async_event(&event);
+    }
+  }
+  return events;
+}
+
+void InjectDeviceFatalForTest(const std::string& dev_name) {
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  g_injected_fatal.push_back(DeviceKey(dev_name.c_str()));
+}
+
+void SetReleaseFaultsForTest(ReleaseFaultsForTest faults) {
+  g_release_faults = std::move(faults);
+}
+
+uint64_t DeadReleaseFailures() {
+  return g_dead_release_failures.load(std::memory_order_relaxed);
+}
 
 }  // namespace rdma
 }  // namespace dfkv

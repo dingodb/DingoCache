@@ -141,6 +141,12 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     "dfkv_rdma_client_rail_refusals_total": (),
     "dfkv_rdma_client_op_deadline_expired_total": (),
     "dfkv_rdma_client_port_down_events_total": (),
+    # Device resets (TRN-29): async events, reset signals, rebuilds, and
+    # releases dropped on a device proven gone.
+    "dfkv_rdma_client_async_events_total": ("dev", "event"),
+    "dfkv_rdma_client_device_suspect_total": ("dev", "reason"),
+    "dfkv_rdma_client_device_rebuilds_total": ("dev",),
+    "dfkv_rdma_client_dead_release_failures_total": (),
     "dfkv_rdma_client_rail_background_probes_total": (),
     "dfkv_rdma_client_peer_topology_updates_total": (),
     "dfkv_rdma_client_remote_rail_normal_leases_total": (),
@@ -203,6 +209,7 @@ _GAUGES: dict[str, tuple[str, ...]] = {
     "dfkv_rdma_client_rail_recovery_probe": ("dev",),
     "dfkv_rdma_client_rail_latency_ewma_us": ("dev",),
     "dfkv_rdma_client_rails_port_down": (),
+    "dfkv_rdma_client_device_dead": ("dev",),
     "dfkv_rdma_client_pipeline_depth": (),
     "dfkv_rdma_client_transient_user_mr_active": (),
     "dfkv_rdma_client_pool_mr_active_registrations": (),

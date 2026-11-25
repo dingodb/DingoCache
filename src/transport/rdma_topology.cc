@@ -273,6 +273,23 @@ PortWatcher::~PortWatcher() {
     if (context) ibv_close_device(static_cast<ibv_context*>(context));
 }
 
+void PortWatcher::Reopen(size_t index) {
+  if (index >= names_.size()) return;
+  // The old context is of a device that was reset: its close is not checked.
+  if (contexts_[index])
+    ibv_close_device(static_cast<ibv_context*>(contexts_[index]));
+  contexts_[index] = nullptr;
+  int count = 0;
+  ibv_device** list = ibv_get_device_list(&count);
+  if (!list) return;
+  for (int i = 0; i < count && !contexts_[index]; ++i) {
+    const char* name = ibv_get_device_name(list[i]);
+    if (name && names_[index] == name)
+      contexts_[index] = ibv_open_device(list[i]);
+  }
+  ibv_free_device_list(list);
+}
+
 std::atomic<PortWatcher::StateFn>& PortWatcher::OverrideForTest() {
   static std::atomic<StateFn> override{nullptr};
   return override;

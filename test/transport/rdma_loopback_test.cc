@@ -255,6 +255,16 @@ class RdmaTransportTestPeer {
   static long Rails(const RdmaTransport& transport) {
     return static_cast<long>(transport.devs_.size());
   }
+  static std::string Rail(const RdmaTransport& transport, size_t rail) {
+    return transport.devs_[rail];
+  }
+  // TRN-29 hooks.
+  static void FailRebuilds(RdmaTransport* transport, bool fail) {
+    transport->rebuild_fails_for_test_ = fail;
+  }
+  static void PauseDeviceChecks(RdmaTransport* transport, bool paused) {
+    transport->device_checks_paused_for_test_ = paused;
+  }
 
   struct SeededFailure {
     uint64_t now_us = 0;
@@ -11268,6 +11278,367 @@ TEST(RdmaVerbs, ADeviceNothingHoldsIsOpenedAgain) {
     ASSERT_TRUE(reused.Open(nullptr, rdma::kV2ControlCap, 1));
   }
   EXPECT_EQ(rdma::RcEndpoint::DeviceOpens(), held_opens);
+}
+
+// TRN-29 (docs/design/rdma-device-reset.md): a rail whose device was reset.
+// No device is ever reset here: a seam reports DEVICE_FATAL, or fails Opens
+// with ENODEV, as a reset would.
+namespace {
+
+struct DeviceRebuildOn {
+  explicit DeviceRebuildOn(int on = 1) { rdma::SetDeviceRebuildForTest(on); }
+  ~DeviceRebuildOn() { rdma::SetDeviceRebuildForTest(-1); }
+};
+
+long LabelledVal(const std::string& text, const std::string& line_prefix) {
+  const auto pos = text.find("\n" + line_prefix);
+  if (pos == std::string::npos) return -1;
+  const auto value = text.find(' ', pos + 1 + line_prefix.size() - 1);
+  try {
+    return std::stol(text.substr(value + 1));
+  } catch (...) {
+    return -1;
+  }
+}
+
+long Rebuilds(RdmaTransport& rt, const std::string& dev) {
+  return LabelledVal(rt.MetricsText(),
+                     "dfkv_rdma_client_device_rebuilds_total{dev=\"" + dev +
+                         "\"} ");
+}
+
+long Dead(RdmaTransport& rt, const std::string& dev) {
+  return LabelledVal(rt.MetricsText(),
+                     "dfkv_rdma_client_device_dead{dev=\"" + dev + "\"} ");
+}
+
+template <class F>
+bool Eventually(F done, int ms = 5000) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+  while (!done()) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return true;
+}
+
+// The background thread ticks every 20 ms (the port check's period).
+struct FastTicks {
+  ScopedEnv port_check{"DFKV_RDMA_PORT_CHECK_MS", "20"};
+};
+
+}  // namespace
+
+// Switch off: a DEVICE_FATAL is counted and changes nothing else.
+TEST(RdmaDeviceReset, WithTheSwitchOffAFatalEventIsOnlyCounted) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  DeviceRebuildOn off(0);
+  FastTicks ticks;
+  RdmaNode node("reset-off");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  std::vector<char> region(1 << 20);
+  ASSERT_TRUE(rt.RegisterMemory(region.data(), region.size()));
+  const std::string v(4096, 'o');
+  ASSERT_TRUE(c.Put("off", v.data(), v.size()));
+  const std::string dev = RdmaTransportTestPeer::Rail(rt, 0);
+  const uint64_t generation = rdma::DeviceGeneration(dev);
+  const uint64_t opens = rdma::RcEndpoint::DeviceOpens();
+  rdma::InjectDeviceFatalForTest(dev);
+  ASSERT_TRUE(Eventually([&] {
+    return LabelledVal(rt.MetricsText(),
+                       "dfkv_rdma_client_device_suspect_total{dev=\"" + dev +
+                           "\",reason=\"fatal\"} ") == 1;
+  }));
+  EXPECT_EQ(rdma::DeviceGeneration(dev), generation);
+  EXPECT_EQ(Dead(rt, dev), 0);
+  std::string out(v.size(), '\0');
+  EXPECT_TRUE(c.Get("off", &out[0], out.size()));
+  EXPECT_EQ(out, v);
+  EXPECT_EQ(rdma::RcEndpoint::DeviceOpens(), opens);
+}
+
+// Switch on: a DEVICE_FATAL retires the binding; the transport rebuilds the
+// rail on a fresh context, every declared region registered on it, and the
+// rail serves again.
+TEST(RdmaDeviceReset, AFatalEventRebuildsTheRailOnAFreshContext) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  DeviceRebuildOn on;
+  FastTicks ticks;
+  RdmaNode node("reset-fatal");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  std::vector<char> region(2 << 20);
+  ASSERT_TRUE(rt.RegisterMemory(region.data(), 1 << 20));
+  ASSERT_TRUE(rt.RegisterMemory(region.data() + (1 << 20), 1 << 20));
+  const std::string v(4096, 'f');
+  ASSERT_TRUE(c.Put("fatal", v.data(), v.size()));
+  const std::string dev = RdmaTransportTestPeer::Rail(rt, 0);
+  const uint64_t generation = rdma::DeviceGeneration(dev);
+  const uint64_t opens = rdma::RcEndpoint::DeviceOpens();
+  const uint64_t regs = rdma::RcEndpoint::PoolMrRegistrations();
+  rdma::InjectDeviceFatalForTest(dev);
+  ASSERT_TRUE(Eventually([&] { return Rebuilds(rt, dev) == 1; }));
+  EXPECT_EQ(rdma::DeviceGeneration(dev), generation + 1);
+  EXPECT_GE(rdma::RcEndpoint::DeviceOpens(), opens + 1);
+  // Both regions, once each, on the new context.
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrRegistrations(), regs + 2);
+  EXPECT_EQ(Dead(rt, dev), 0);
+  std::string out(v.size(), '\0');
+  for (int i = 0; i < 8; ++i) {  // every rail, the rebuilt one included
+    ASSERT_TRUE(c.Exist("fatal"));
+    ASSERT_TRUE(c.Get("fatal", &out[0], out.size()));
+    EXPECT_EQ(out, v);
+  }
+}
+
+// Without a server holding the device too, the old context closes once the
+// old anchor and connections are gone.
+TEST(RdmaDeviceReset, TheOldContextClosesAfterTheRebuild) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  DeviceRebuildOn on;
+  FastTicks ticks;
+  const size_t retired = rdma::RetiredDeviceCount();
+  {
+    RdmaTransport rt(kMaxMsg);
+    std::vector<char> region(1 << 20);
+    ASSERT_TRUE(rt.RegisterMemory(region.data(), region.size()));
+    const std::string dev = RdmaTransportTestPeer::Rail(rt, 0);
+    rdma::InjectDeviceFatalForTest(dev);
+    ASSERT_TRUE(Eventually([&] { return Rebuilds(rt, dev) == 1; }));
+    EXPECT_EQ(rdma::RetiredDeviceCount(), retired)
+        << "the retired context is still referenced";
+  }
+  EXPECT_EQ(rdma::RetiredDeviceCount(), retired);
+}
+
+// An Open that fails with ENODEV retires the binding the rail was built on;
+// the rail is rebuilt and serves again.
+TEST(RdmaDeviceReset, AnOpenFailingWithEnodevRebuildsTheRail) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  DeviceRebuildOn on;
+  FastTicks ticks;
+  RdmaNode node("reset-open");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  std::vector<char> region(1 << 20);
+  ASSERT_TRUE(rt.RegisterMemory(region.data(), region.size()));
+  const std::string v(4096, 'e');
+  ASSERT_TRUE(c.Put("enodev", v.data(), v.size()));
+  RdmaTransportTestPeer::DropAllPooled(&rt);
+  const long rails = RdmaTransportTestPeer::Rails(rt);
+  for (long rail = 0; rail < rails; ++rail)
+    RdmaTransportTestPeer::FailOpenOn(&rt, static_cast<size_t>(rail), ENODEV);
+  (void)c.Exist("enodev");
+  for (long rail = 0; rail < rails; ++rail)
+    RdmaTransportTestPeer::FailOpenOn(&rt, static_cast<size_t>(rail), 0);
+  const std::string dev = RdmaTransportTestPeer::Rail(rt, 0);
+  ASSERT_TRUE(Eventually([&] { return Rebuilds(rt, dev) >= 1; }));
+  ASSERT_TRUE(Eventually([&] { return Dead(rt, dev) == 0; }));
+  std::string out(v.size(), '\0');
+  ASSERT_TRUE(Eventually([&] { return c.Get("enodev", &out[0], out.size()); }));
+  EXPECT_EQ(out, v);
+}
+
+// While a rail cannot be rebuilt (its device does not open yet), memory can
+// still be declared; the rebuild registers it with the rest.
+TEST(RdmaDeviceReset, MemoryDeclaredWhileARailIsDeadIsRegisteredByItsRebuild) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  DeviceRebuildOn on;
+  FastTicks ticks;
+  RdmaTransport rt(kMaxMsg);
+  std::vector<char> region(2 << 20);
+  ASSERT_TRUE(rt.RegisterMemory(region.data(), 1 << 20));
+  const std::string dev = RdmaTransportTestPeer::Rail(rt, 0);
+  RdmaTransportTestPeer::FailRebuilds(&rt, true);
+  rdma::InjectDeviceFatalForTest(dev);
+  ASSERT_TRUE(Eventually([&] { return Dead(rt, dev) == 1; }));
+  EXPECT_TRUE(rt.RegisterMemory(region.data() + (1 << 20), 1 << 20));
+  const uint64_t regs = rdma::RcEndpoint::PoolMrRegistrations();
+  RdmaTransportTestPeer::FailRebuilds(&rt, false);
+  // The backoff after the failed attempts is at most a few seconds.
+  ASSERT_TRUE(Eventually([&] { return Rebuilds(rt, dev) == 1; }, 20000));
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrRegistrations(), regs + 2)
+      << "the rebuild did not register both regions";
+}
+
+// A rebuild attempt never waits for register_mu_: while a RegisterMemory
+// holds it, the attempt is skipped and made on a later tick.
+TEST(RdmaDeviceReset, AnAttemptWhileMemoryIsBeingDeclaredIsMadeLater) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  DeviceRebuildOn on;
+  FastTicks ticks;
+  RdmaTransport rt(kMaxMsg);
+  std::vector<char> region(2 << 20);
+  ASSERT_TRUE(rt.RegisterMemory(region.data(), 1 << 20));
+  const std::string dev = RdmaTransportTestPeer::Rail(rt, 0);
+  std::thread declaring;
+  {
+    HeldPoolRegistration held;
+    declaring = std::thread(
+        [&] { EXPECT_TRUE(rt.RegisterMemory(region.data(), 2 << 20)); });
+    ASSERT_TRUE(held.AwaitEntry());
+    rdma::InjectDeviceFatalForTest(dev);
+    ASSERT_TRUE(Eventually([&] { return Dead(rt, dev) == 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(Rebuilds(rt, dev), 0) << "the rebuild waited for the lock";
+    held.Release();
+    declaring.join();
+  }
+  ASSERT_TRUE(Eventually([&] { return Rebuilds(rt, dev) == 1; }, 20000));
+}
+
+// Destroying the transport while a rebuild registers (held by a seam) or
+// waits out its backoff returns: the background thread is joined before
+// register_mu_ is taken, and a staging stops between regions.
+TEST(RdmaDeviceReset, DestructionDuringARebuildReturns) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  DeviceRebuildOn on;
+  FastTicks ticks;
+  const uint64_t active = rdma::RcEndpoint::PoolMrActiveRegistrations();
+  {  // in the backoff
+    auto rt = std::make_unique<RdmaTransport>(kMaxMsg);
+    std::vector<char> region(1 << 20);
+    ASSERT_TRUE(rt->RegisterMemory(region.data(), region.size()));
+    const std::string dev = RdmaTransportTestPeer::Rail(*rt, 0);
+    RdmaTransportTestPeer::FailRebuilds(rt.get(), true);
+    rdma::InjectDeviceFatalForTest(dev);
+    ASSERT_TRUE(Eventually([&] { return Dead(*rt, dev) == 1; }));
+    const auto t0 = std::chrono::steady_clock::now();
+    rt.reset();
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(1));
+  }
+  {  // in an attempt, registering the first of two regions
+    auto rt = std::make_unique<RdmaTransport>(kMaxMsg);
+    std::vector<char> region(2 << 20);
+    ASSERT_TRUE(rt->RegisterMemory(region.data(), 1 << 20));
+    ASSERT_TRUE(rt->RegisterMemory(region.data() + (1 << 20), 1 << 20));
+    const std::string dev = RdmaTransportTestPeer::Rail(*rt, 0);
+    std::atomic<bool> destroyed{false};
+    std::thread destroying;
+    {
+      HeldPoolRegistration held;
+      rdma::InjectDeviceFatalForTest(dev);
+      ASSERT_TRUE(held.AwaitEntry());  // the rebuild's first registration
+      destroying = std::thread([&] {
+        rt.reset();
+        destroyed = true;
+      });
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      EXPECT_FALSE(destroyed.load());
+      held.Release();
+      destroying.join();
+    }
+    EXPECT_TRUE(destroyed.load());
+  }
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrActiveRegistrations(), active);
+}
+
+// The race the post-Open check closes: transport A sees the reset and
+// retires the binding; transport B, whose background thread has not looked
+// yet, opens a connection that lands on the new context. B drops it, takes
+// the rail out of its selection, and rebuilds when its thread looks.
+TEST(RdmaDeviceReset, AnOpenOnANewerContextThanTheRailIsDropped) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  DeviceRebuildOn on;
+  FastTicks ticks;
+  RdmaNode node("reset-race");
+  RdmaTransport a(kMaxMsg), b(kMaxMsg);
+  KVClient ca({{"n", node.addr}}, SelfHdr(), &a);
+  KVClient cb({{"n", node.addr}}, SelfHdr(), &b);
+  std::vector<char> region_a(1 << 20), region_b(1 << 20);
+  ASSERT_TRUE(a.RegisterMemory(region_a.data(), region_a.size()));
+  ASSERT_TRUE(b.RegisterMemory(region_b.data(), region_b.size()));
+  const std::string v(4096, 'r');
+  ASSERT_TRUE(ca.Put("race", v.data(), v.size()));
+  ASSERT_TRUE(cb.Exist("race"));
+  const std::string dev = RdmaTransportTestPeer::Rail(b, 0);
+  RdmaTransportTestPeer::PauseDeviceChecks(&b, true);
+  RdmaTransportTestPeer::DropAllPooled(&b);
+  rdma::InjectDeviceFatalForTest(dev);
+  ASSERT_TRUE(Eventually([&] { return Rebuilds(a, dev) == 1; }));
+  // B's rail 0 still believes the old context: every Open lands on the new.
+  const bool served = cb.Exist("race");
+  EXPECT_EQ(Dead(b, dev), 1) << "B kept a rail with no registration";
+  if (RdmaTransportTestPeer::Rails(b) > 1)
+    EXPECT_TRUE(served) << "the operation did not go to another rail";
+  EXPECT_EQ(Rebuilds(b, dev), 0);
+  RdmaTransportTestPeer::PauseDeviceChecks(&b, false);
+  ASSERT_TRUE(Eventually([&] { return Rebuilds(b, dev) == 1; }));
+  std::string out(v.size(), '\0');
+  ASSERT_TRUE(Eventually([&] { return cb.Get("race", &out[0], out.size()); }));
+  EXPECT_EQ(out, v);
+}
+
+// The abort on a failed release is skipped only on proof that the context
+// is disassociated. Death tests run the statement in a new process.
+
+TEST(RdmaDeviceReset, AFailedReleaseOnAProvenDeadDeviceIsCounted) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  DeviceRebuildOn on;
+  struct Case {
+    int release, confirm;
+    bool fatal, listed;
+  };
+  for (const Case c : {Case{EIO, 0, true, true}, Case{EIO, ENODEV, false, true},
+                       Case{ENODEV, ENODEV, false, true},
+                       Case{EIO, EIO, false, false}}) {
+    SCOPED_TRACE("release " + std::to_string(c.release) + " confirm " +
+                 std::to_string(c.confirm));
+    const uint64_t dropped = rdma::DeadReleaseFailures();
+    {
+      rdma::RcEndpoint ep;
+      ASSERT_TRUE(ep.Open(nullptr, rdma::kV2ControlCap, 1));
+      if (c.fatal) {
+        rdma::InjectDeviceFatalForTest("");
+        (void)rdma::PollDeviceEvents();
+      }
+      rdma::ReleaseFaultsForTest faults;
+      faults.release = [c](const char* operation) {
+        return std::strcmp(operation, "ibv_destroy_qp") == 0 ? c.release : 0;
+      };
+      faults.confirm = [c] { return c.confirm; };
+      faults.listed = [c] { return c.listed; };
+      rdma::SetReleaseFaultsForTest(faults);
+    }  // closes: the destroy "fails"
+    rdma::SetReleaseFaultsForTest({});
+    EXPECT_EQ(rdma::DeadReleaseFailures(), dropped + 1);
+    // A context marked fatal is not reused: retire it.
+    rdma::RetireDevice("", rdma::DeviceGeneration(""));
+  }
+}
+
+TEST(RdmaDeviceResetDeathTest, AFailedReleaseWithoutProofStillAborts) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  struct Case {
+    const char* what;
+    int on, release, confirm;
+    bool listed;
+  };
+  for (const Case c :
+       {Case{"a live device answering EIO once", 1, EIO, 0, true},
+        Case{"a confirmed EIO on a device still listed", 1, EIO, EIO, true},
+        Case{"EBUSY", 1, EBUSY, ENODEV, false},
+        Case{"the switch off", 0, EIO, ENODEV, false}}) {
+    SCOPED_TRACE(c.what);
+    EXPECT_DEATH(
+        {
+          rdma::SetDeviceRebuildForTest(c.on);
+          rdma::RcEndpoint ep;
+          if (!ep.Open(nullptr, rdma::kV2ControlCap, 1)) std::exit(3);
+          rdma::ReleaseFaultsForTest faults;
+          faults.release = [c](const char* operation) {
+            return std::strcmp(operation, "ibv_destroy_qp") == 0 ? c.release
+                                                                 : 0;
+          };
+          faults.confirm = [c] { return c.confirm; };
+          faults.listed = [c] { return c.listed; };
+          rdma::SetReleaseFaultsForTest(faults);
+        },
+        "unsafe resource release");
+  }
 }
 
 // Mixed versions, server side: a client that does not ask (every release
