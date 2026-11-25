@@ -508,8 +508,9 @@ class RcEndpoint {
   ibv_context* context_for_test() const { return ctx_; }
   // Test seam: consulted before each window allocation; false fails it.
   static void SetWindowAllocSeamForTest(std::function<bool()> seam);
-  // Test seam: replaces Close()'s first deallocation of each window (the
-  // retry after the QP's destruction is real); nonzero fails it.
+  // Test seam: replaces Close()'s injected deallocation attempts, including
+  // the retry after QP-to-ERR. The refused window's final deallocation after
+  // QP destruction always uses the real verb; nonzero fails the injected try.
   static void SetWindowDeallocSeamForTest(std::function<int(ibv_mw*)> seam);
   // Test seam: observes the exact window after its bind was posted. No bind
   // semantics change; the callback is absent in production.
