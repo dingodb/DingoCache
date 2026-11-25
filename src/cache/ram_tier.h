@@ -257,6 +257,9 @@ class RamTier {
     const char* ptr = nullptr;
     size_t len = 0;
     size_t value_len = 0;
+    // The whole allocation pinned by this hit (including padding). This is
+    // not necessarily equal to the payload or requested range length.
+    size_t allocated_bytes = 0;
     void* mr = nullptr;
     bool in_arena = false;
 

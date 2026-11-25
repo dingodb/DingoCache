@@ -1426,6 +1426,7 @@ bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
     out->ptr = e.data(arena_) + start;
     out->len = static_cast<size_t>(n);
     out->value_len = static_cast<size_t>(e.len);
+    out->allocated_bytes = e.cap;
     out->in_arena = e.in_arena();
     out->mr = out->in_arena
                   ? arena_mr_.load(std::memory_order_acquire)

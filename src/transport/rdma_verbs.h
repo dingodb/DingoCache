@@ -472,8 +472,10 @@ class RcEndpoint {
   int MaxWindows() const;
   // This port's active rate in Mbit/s (speed x width); 0 if unknown.
   uint64_t PortRateMbps() const;
-  // n type-2 windows, deallocated by Close after the QP is destroyed. False
-  // (and none kept) if any allocation fails.
+  // n type-2 windows, deallocated by Close. Close first tries deallocation,
+  // moves a QP holding refused windows to ERR, and retries before QP destroy.
+  // Any unproven revocation remains fail-closed, never assumed safe by time.
+  // False (and none kept) if any allocation fails.
   bool AllocWindows(size_t n);
   size_t window_count() const { return windows_.size(); }
   // Binds window i to [addr, addr+len) of `region` for remote READ under a
@@ -490,8 +492,9 @@ class RcEndpoint {
   // A region windows bind to: local write and window binding, no remote
   // access, so its own rkey authorizes nothing. Owned by the caller.
   ibv_mr* RegisterBindRegion(void* base, size_t size);
-  // 0, or the error ibv_dereg_mr returned (EBUSY: a window is still bound).
-  // Unlike every other deregistration here it does not abort.
+  // 0/null if absent. Otherwise enforce the context-aware release guard:
+  // an underegistered live region fails closed rather than letting the RAM
+  // allocation be freed while DMA may still address it.
   static int DeregisterBindRegion(ibv_mr* mr);
   // Test seam: consulted before each window allocation; false fails it.
   static void SetWindowAllocSeamForTest(std::function<bool()> seam);

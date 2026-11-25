@@ -377,12 +377,6 @@ Status RdmaServer::Start(int port) {
   const bool recv_huge_pages =
       config_dump::EnvBool("DFKV_RDMA_RECV_HUGEPAGES", true);
   recv_segments_.set_huge_pages(recv_huge_pages);
-  // A chunk windows are bound in is deregistered before its memory goes
-  // (the trim unlinks it first, under the pool lock).
-  if (mw_enabled_)
-    recv_segments_.set_release_hook([this](const rdma::RecvSegment* segment) {
-      return mw_regions_.Forget(segment->data());
-    });
   const size_t min_slot_bytes = rdma::V2SlotSize(max_msg_);
   // Reserve one staging chunk only if it can hold the largest legal staged
   // object and the hard budget still fits one resident chunk per configured
@@ -484,6 +478,18 @@ Status RdmaServer::Start(int port) {
   if (mw_enabled_) {
     uint64_t slowest = 0;
     bool any = false;
+    if (mw_arena_tier_ && mw_arena_tier_->arena_base() &&
+        mw_arena_tier_->extent_bytes() != 0) {
+      mw_arena_ = mw_arena_tier_->arena_base();
+      mw_arena_bytes_ = mw_arena_tier_->arena_bytes();
+      mw_extent_bytes_ = mw_arena_tier_->extent_bytes();
+      mw_arena_tier_->HoldArenaRegistrations(1);
+    }
+    // Windows bind only RAM-arena ranges (RDS-29): without an arena no
+    // connection gets windows and no region is registered.
+    if (!mw_arena_)
+      DFKV_LOG_INFO("rdma: DFKV_RDMA_SERVER_MW is on, but there is no RAM "
+                    "arena: GET grants use per-grant MRs");
     // Windows per connection: one per pull slot. The receive pool bounds the
     // connections: at most that many control connections of full depth.
     const uint64_t connections =
@@ -492,13 +498,14 @@ Status RdmaServer::Start(int port) {
                                   rdma::V2SlotSize(rdma::kV2ControlCap));
     for (size_t rail = 0; rail < anchors_.size(); ++rail) {
       rdma::RcEndpoint& anchor = *anchors_[rail];
-      rail_mw_[rail] = anchor.ProbeType2Windows() ? 1 : 0;
+      rail_mw_[rail] = mw_arena_ && anchor.ProbeType2Windows() ? 1 : 0;
       any = any || rail_mw_[rail];
       const uint64_t rate = anchor.PortRateMbps();
       if (rate != 0 && (slowest == 0 || rate < slowest)) slowest = rate;
       DFKV_LOG_INFO("rdma: rail " + anchor_devs_[rail] + ": GET grants use " +
                     (rail_mw_[rail] ? "memory windows (type 2B)"
-                                    : "per-grant MRs (no type-2B windows)") +
+                     : mw_arena_    ? "per-grant MRs (no type-2B windows)"
+                                    : "per-grant MRs (no RAM arena)") +
                     ", link " + std::to_string(rate) + " Mbit/s");
       const int max_mw = anchor.MaxWindows();
       if (rail_mw_[rail] && max_mw > 0 &&
@@ -514,13 +521,6 @@ Status RdmaServer::Start(int port) {
       slowest = mw_link_gbps_ * 1000;
     mw_rate_mbps_ = slowest;
     if (mw_quarantine_cap_ == 0) mw_quarantine_cap_ = recv_segment_max_bytes_ / 8;
-    if (mw_arena_tier_ && mw_arena_tier_->arena_base() &&
-        mw_arena_tier_->extent_bytes() != 0) {
-      mw_arena_ = mw_arena_tier_->arena_base();
-      mw_arena_bytes_ = mw_arena_tier_->arena_bytes();
-      mw_extent_bytes_ = mw_arena_tier_->extent_bytes();
-      mw_arena_tier_->HoldArenaRegistrations(1);
-    }
     if (any)
       mw_regions_.Start(
           anchors_.size(),
@@ -1037,27 +1037,23 @@ std::vector<rdma::RcEndpoint*> RdmaServer::PlanPressureVictimsLocked(
   return victims;
 }
 
-ibv_mr* RdmaServer::MwRegionFor(size_t rail, const char* at, size_t len,
-                                const rdma::RecvSegmentPool::Lease& lease) {
+ibv_mr* RdmaServer::MwRegionFor(size_t rail, const char* at, size_t len) {
   const auto inside = [&](const char* base, size_t size) {
     return at >= base && len <= size &&
            static_cast<size_t>(at - base) <= size - len;
   };
-  if (mw_arena_ && inside(mw_arena_, mw_arena_bytes_)) {
-    // Values up to an extent never cross one.
-    const size_t extent = static_cast<size_t>(at - mw_arena_) / mw_extent_bytes_;
-    char* base = mw_arena_ + extent * mw_extent_bytes_;
-    const size_t size = std::min(mw_extent_bytes_,
-                                 mw_arena_bytes_ - extent * mw_extent_bytes_);
-    if (!inside(base, size)) return nullptr;
-    return mw_regions_.Find(rail, base, size,
-                            rdma::BindRegionRegistry::Kind::kArena);
-  }
-  const rdma::RecvSegment* segment = lease ? lease.segment() : nullptr;
-  if (segment && inside(segment->data(), segment->size()))
-    return mw_regions_.Find(rail, segment->data(), segment->size(),
-                            rdma::BindRegionRegistry::Kind::kChunk);
-  return nullptr;
+  // Values up to an extent never cross one.
+  const size_t extent = static_cast<size_t>(at - mw_arena_) / mw_extent_bytes_;
+  char* base = mw_arena_ + extent * mw_extent_bytes_;
+  const size_t size = std::min(mw_extent_bytes_,
+                               mw_arena_bytes_ - extent * mw_extent_bytes_);
+  if (!inside(base, size)) return nullptr;
+  return mw_regions_.Find(rail, base, size);
+}
+
+bool RdmaServer::MwInArena(const char* at, size_t len) const {
+  return mw_arena_ && at >= mw_arena_ && len <= mw_arena_bytes_ &&
+         static_cast<size_t>(at - mw_arena_) <= mw_arena_bytes_ - len;
 }
 
 uint64_t RdmaServer::MwQuarantineUsFor(uint64_t rail_bytes) const {
@@ -1065,22 +1061,80 @@ uint64_t RdmaServer::MwQuarantineUsFor(uint64_t rail_bytes) const {
                               mw_margin_us_);
 }
 
-bool RdmaServer::MwQuarantineAllows(uint64_t rail_bytes,
-                                    uint64_t held_bytes) const {
-  return MwQuarantineUsFor(rail_bytes) <= mw_max_us_ &&
-         mw_quarantine_bytes_.load(std::memory_order_relaxed) + held_bytes <=
-             mw_quarantine_cap_;
+RdmaServer::MwReservation::~MwReservation() { Cancel(); }
+
+RdmaServer::MwReservation::MwReservation(MwReservation&& other) noexcept
+    : server_(other.server_), bytes_(other.bytes_) {
+  other.server_ = nullptr;
+  other.bytes_ = 0;
+}
+
+RdmaServer::MwReservation& RdmaServer::MwReservation::operator=(
+    MwReservation&& other) noexcept {
+  if (this == &other) return *this;
+  Cancel();
+  server_ = other.server_;
+  bytes_ = other.bytes_;
+  other.server_ = nullptr;
+  other.bytes_ = 0;
+  return *this;
+}
+
+void RdmaServer::MwReservation::Cancel() {
+  if (!server_) return;
+  server_->MwReleaseReservation(bytes_);
+  server_ = nullptr;
+  bytes_ = 0;
+}
+
+void RdmaServer::MwReservation::Convert() {
+  if (!server_) return;
+  server_ = nullptr;
+  bytes_ = 0;
+}
+
+void RdmaServer::MwReleaseReservation(uint64_t bytes) {
+  std::lock_guard<std::mutex> lock(mw_quarantine_mu_);
+  if (bytes > mw_reserved_bytes_) std::abort();  // double-cancellation is a bug
+  mw_reserved_bytes_ -= bytes;
+}
+
+uint64_t RdmaServer::MwRailSnapshot(const std::atomic<uint64_t>& rail_bytes,
+                                    uint64_t grant_bytes) const {
+  return rail_bytes.load(std::memory_order_relaxed) + grant_bytes;
+}
+
+RdmaServer::MwReservation RdmaServer::MwReserveQuarantine(
+    uint64_t rail_bytes, uint64_t held_bytes) {
+  if (!mw_enabled_ || MwQuarantineUsFor(rail_bytes) > mw_max_us_) return {};
+  std::lock_guard<std::mutex> lock(mw_quarantine_mu_);
+  const uint64_t actual =
+      mw_quarantine_bytes_.load(std::memory_order_relaxed);
+  if (actual > mw_quarantine_cap_ ||
+      held_bytes > mw_quarantine_cap_ - actual ||
+      mw_reserved_bytes_ > mw_quarantine_cap_ - actual - held_bytes)
+    return {};
+  mw_reserved_bytes_ += held_bytes;
+  return MwReservation(this, held_bytes);
 }
 
 void RdmaServer::MwQuarantine(MwQuarantined entry) {
-  // The admission (MwQuarantineAllows) took the decision; more grants on
-  // the rail since then do not stretch it past the maximum.
-  const uint64_t until =
-      SteadyUs() + std::min(MwQuarantineUsFor(entry.rail_bytes), mw_max_us_);
+  // Every admitted window keeps its range for the configured maximum. Using
+  // an estimate at this point (even one frozen at bind) is not safe: other
+  // connections can grant more rail backlog before this read retires. The
+  // estimate in MwReserveQuarantine only chooses a window versus an exact MR.
+  const uint64_t until = SteadyUs() + mw_max_us_;
   const char* at = entry.at;
   bool earliest = false;
   {
     std::lock_guard<std::mutex> lock(mw_quarantine_mu_);
+    if (entry.reservation.held()) {
+      if (entry.bytes > mw_reserved_bytes_) std::abort();
+      mw_reserved_bytes_ -= entry.bytes;
+      entry.reservation.Convert();
+    }
+    // A reservation always travels with a successful windowed grant.
+    if (!mw_enabled_ || entry.bytes == 0) std::abort();
     mw_quarantine_bytes_.fetch_add(entry.bytes, std::memory_order_relaxed);
     const auto it = mw_quarantine_.emplace(until, std::move(entry));
     earliest = it == mw_quarantine_.begin();
@@ -1443,6 +1497,9 @@ void RdmaServer::Serve(
     // slot's own window, under rkey). Revoking: its invalidation is posted
     // and not yet complete; the slot stays busy until it is.
     bool windowed = false;
+    // Admission-estimate metadata only; the hold uses the configured maximum.
+    uint64_t window_rail_bytes = 0;
+    MwReservation reservation;
     bool revoking = false;
     uint32_t rkey = 0;
     const char* read_at = nullptr;  // the range the window covers
@@ -1465,11 +1522,11 @@ void RdmaServer::Serve(
       Reset();
     }
     // A windowed range leaves the slot for the quarantine, with what holds
-    // it (the staging lease, the arena pin); its window is known dead.
+    // it (RAM-arena pins in the arena-only mode); its window is known dead.
     void Quarantine() {
       if (!windowed) return;
       MwQuarantined entry;
-      entry.bytes = lease ? lease.size() : std::max<size_t>(data_len, 1);
+      entry.bytes = reservation.bytes();  // one amount through the whole grant
       if (lease) {
         active_bytes->fetch_sub(lease.size(), std::memory_order_relaxed);
         active_count->fetch_sub(1, std::memory_order_relaxed);
@@ -1479,7 +1536,8 @@ void RdmaServer::Serve(
       entry.data_len = data_len;
       entry.read_elapsed_sec = read_elapsed_sec;
       entry.at = read_at;
-      entry.rail_bytes = rail_grant_bytes->load(std::memory_order_relaxed);
+      entry.rail_bytes = window_rail_bytes;
+      entry.reservation = std::move(reservation);
       windowed = false;
       revoking = false;
       server->MwQuarantine(std::move(entry));
@@ -1501,6 +1559,8 @@ void RdmaServer::Serve(
       }
       mr = nullptr;
       windowed = false;
+      window_rail_bytes = 0;
+      reservation = MwReservation{};
       revoking = false;
       rkey = 0;
       read_at = nullptr;
@@ -1925,23 +1985,36 @@ void RdmaServer::Serve(
   constexpr uint64_t kMwWrTag = uint64_t{1} << 63;  // a bind or invalidation
   constexpr uint64_t kMwInvalidate = uint64_t{1} << 62;
   auto authorize_read = [&](size_t slot, const char* at, size_t len,
-                            uint32_t* rkey) -> bool {
+                            uint32_t* rkey, size_t pin_bytes = 0) -> bool {
     PullSlotState& state = pull_slots[slot];
     const uint64_t started_ns = SteadyNs();
     const size_t bytes = std::max<size_t>(len, 1);
+    // The cap bounds what the grant retains, including RAM slot padding, not
+    // just the requested range bytes. A temporary staging lease released on
+    // the arena path is covered conservatively by taking the maximum.
+    const uint64_t held =
+        std::max<uint64_t>(bytes, std::max(state.lease ? state.lease.size() : 0,
+                                           pin_bytes));
     bool ok = false;
-    if (conn_windows) {
-      const uint64_t held = state.lease ? state.lease.size() : bytes;
+    // Only ranges of the RAM arena: a READ of memory a disk has just written
+    // into is slow through any registration older than the write (a window
+    // over a region registered once, or a long-lived MR) and fast through
+    // one made after it (measured, RDS-29), so a GET staged from disk keeps
+    // its per-grant MR.
+    if (conn_windows && MwInArena(at, bytes)) {
       const uint64_t rail_bytes =
-          state.rail_grant_bytes->load(std::memory_order_relaxed) + bytes;
-      ibv_mr* region = MwRegionFor(rail_index, at, bytes, state.lease);
+          MwRailSnapshot(*state.rail_grant_bytes, bytes);
+      MwReservation reservation = MwReserveQuarantine(rail_bytes, held);
+      ibv_mr* region = MwRegionFor(rail_index, at, bytes);
       if (region == nullptr) {
         mw_fallback_grants_.fetch_add(1, std::memory_order_relaxed);
-      } else if (!MwQuarantineAllows(rail_bytes, held)) {
+      } else if (!reservation.held()) {
         mw_quarantine_fallbacks_.fetch_add(1, std::memory_order_relaxed);
       } else if (ep.PostBindWindow(slot, region, at, bytes, kMwWrTag | slot,
                                    rkey)) {
         state.windowed = true;
+        state.window_rail_bytes = rail_bytes;
+        state.reservation = std::move(reservation);
         state.rkey = *rkey;
         state.read_at = at;
         mw_binds_.fetch_add(1, std::memory_order_relaxed);
@@ -2021,10 +2094,10 @@ void RdmaServer::Serve(
     // payload READ. The one registered sentinel byte is not a wire request.
     if (output_len == 0) output = state.lease.data();
     uint32_t rkey = 0;
-    bool authorized = authorize_read(slot, output, output_len, &rkey);
+    bool authorized = authorize_read(slot, output, output_len, &rkey, prepared.pin_bytes());
     if (!authorized && prepared.source_registered() && prepared.Stage()) {
       output = prepared.data();
-      authorized = authorize_read(slot, output, output_len, &rkey);
+      authorized = authorize_read(slot, output, output_len, &rkey, prepared.pin_bytes());
     }
     if (!authorized) return error_reply(Status::kIOError);
     // Served from outside the staging range (a coalesced follower reading
@@ -2072,7 +2145,8 @@ void RdmaServer::Serve(
     PullSlotState& state = pull_slots[slot];
     uint32_t rkey = 0;
     if (fail_pinned_registration_for_test_ ||
-        !authorize_read(slot, pinned.data(), pinned.payload_len(), &rkey)) {
+        !authorize_read(slot, pinned.data(), pinned.payload_len(), &rkey,
+                       pinned.pin_bytes())) {
       // Falls back to a staged copy. Worth counting: with the arena no longer
       // registered up front, a memlock limit or a device MR limit shows up
       // here, per read, instead of failing startup.
@@ -3075,11 +3149,14 @@ sync_serve_loop:;
   for (;;) {
     // Serve on while running, and during Stop()'s drain for as long as a
     // grant waits for the client. Requests are served synchronously here:
-    // nothing of the server's is in flight while it waits.
-    const GrantView grants = grant_view(/*server_work=*/false);
+    // A window's invalidation/RELEASE reply is also work we owe the peer,
+    // not evidence that the server has nothing left to do.
+    const bool has_window_send_work = revoking_slots != 0;
+    const GrantView grants = grant_view(/*server_work=*/has_window_send_work);
     if (fail || (!running_ && !grants.holding)) break;
     const bool deferred_for_test =
-        reorder_cq_for_test_ && free_send.size() != K;
+        reorder_cq_for_test_ &&
+        (free_send.size() != K || has_window_send_work);
     bool grant_wait = false;
     const int bound_ms = wait_bound_ms(grants, &grant_wait);
     const int wait_ms =
@@ -3399,8 +3476,7 @@ std::string RdmaServer::MetricsText() const {
   for (size_t i = 0; i < anchor_devs_.size(); ++i)
     s += "dfkv_rdma_server_mw_arena_registered_bytes{dev=\"" +
          PromLabelEscape(anchor_devs_[i]) + "\"} " +
-         std::to_string(mw_regions_.RegisteredBytes(
-             i, rdma::BindRegionRegistry::Kind::kArena)) +
+         std::to_string(mw_regions_.RegisteredBytes(i)) +
          "\n";
   const auto load = [](const std::atomic<uint64_t>& v) {
     return v.load(std::memory_order_relaxed);
@@ -3424,20 +3500,20 @@ std::string RdmaServer::MetricsText() const {
     "would have been longer than DFKV_RDMA_SERVER_MW_QUARANTINE_MAX_MS",
     load(mw_quarantine_fallbacks_));
   m(s, "dfkv_rdma_server_mw_fallback_grants_total", "counter",
-    "GET grants given a per-grant MR on a connection with windows: their "
-    "memory not (yet) registered for windows",
+    "GET grants from the RAM arena given a per-grant MR on a connection "
+    "with windows: the extent not (yet) registered for windows, or over "
+    "DFKV_RDMA_SERVER_MW_ARENA_BYTES",
     load(mw_fallback_grants_));
   m(s, "dfkv_rdma_server_mw_fallback_connections_total", "counter",
     "Connections that could not allocate their memory windows and serve "
     "GETs with per-grant MRs",
     load(mw_fallback_connections_));
   m(s, "dfkv_rdma_server_mw_region_registrations_total", "counter",
-    "Receive chunks and RAM-arena extents registered for memory windows, "
-    "per device",
+    "RAM-arena extents registered for memory windows, per device",
     mw_regions_.Registrations());
   m(s, "dfkv_rdma_server_mw_region_register_failures_total", "counter",
-    "Registrations of a receive chunk or RAM-arena extent for memory "
-    "windows that failed (tried again after 10 s)",
+    "Registrations of a RAM-arena extent for memory windows that failed "
+    "(tried again after 10 s)",
     mw_regions_.RegisterFailures());
   s += "# HELP dfkv_rdma_server_grant_register_seconds Time GET grants spent "
        "authorizing the client's READ: an exact MR, or a window bind\n";

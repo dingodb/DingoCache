@@ -1976,7 +1976,8 @@ bool KvNodeServer::RamPinnedHitForKey(const BlockKey& key, uint64_t offset,
     return false;
   if (!hit.in_arena || hit.len == 0) return false;
   *out = PreparedRead::Ready(hit.ptr, hit.len, hit.value_len, true, nullptr,
-                            0, this, hit.TransferToken(), &FinishPullRamRead);
+                            0, this, hit.TransferToken(), &FinishPullRamRead,
+                            hit.allocated_bytes);
   return true;
 }
 

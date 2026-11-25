@@ -406,13 +406,6 @@ size_t RecvSegmentPool::TrimIdle(uint64_t idle_ms) {
 
 void RecvSegmentPool::FreeUnlinked(
     std::vector<std::unique_ptr<Chunk>>* chunks) {
-  for (auto& chunk : *chunks) {
-    if (release_hook_ && !release_hook_(chunk->segment.get())) {
-      // The hook could not take its registrations off: kept, never freed.
-      (void)chunk.release();
-      kept_chunks_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
   chunks->clear();
 }
 

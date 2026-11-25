@@ -641,8 +641,9 @@ void RcEndpoint::Close() {
   // (Soft-RoCE: the QP's destruction then waits for it). Nothing a window
   // covered is released before the endpoint is gone.
   // A deallocation can fail on a live QP in the middle of a transfer
-  // (EBUSY): then the QP goes first and the deallocation is tried once
-  // more; only a second failure aborts.
+  // (EBUSY). Move the QP to ERR before retrying: destroying it with a bound
+  // window can itself wait on rxe. A failed transition remains fail-closed:
+  // do not free storage whose DMA revocation is still unproven.
   std::vector<ibv_mw*> refused;
   for (auto* mw : windows_) {
     const int error = g_window_dealloc_seam ? g_window_dealloc_seam(mw)
@@ -653,10 +654,12 @@ void RcEndpoint::Close() {
   window_rkeys_.clear();
   if (!refused.empty() && qp_) {
     ibv_qp_attr attr{};
-    // Destroying a QP with a live window bound can wait for that window
-    // on rxe. Reaching ERR first stops its work so the window can go.
     attr.qp_state = IBV_QPS_ERR;
-    ibv_modify_qp(qp_, &attr, IBV_QP_STATE);
+    // Soft-RoCE can wait for a live window during QP destruction, so end its
+    // work before retrying deallocation. Transition failure stays fail-closed:
+    // this helper never treats an unproven revocation as a release.
+    RequireVerbsRelease(ctx_, ibv_modify_qp(qp_, &attr, IBV_QP_STATE),
+                        "ibv_modify_qp(QP to ERR)");
     for (int round = 0; round < 10 && !refused.empty(); ++round) {
       if (round != 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
       refused.erase(std::remove_if(refused.begin(), refused.end(),
@@ -1311,7 +1314,13 @@ ibv_mr* RcEndpoint::RegisterBindRegion(void* base, size_t size) {
 }
 
 int RcEndpoint::DeregisterBindRegion(ibv_mr* mr) {
-  return mr ? ibv_dereg_mr(mr) : 0;
+  if (!mr) return 0;
+  const int error = ibv_dereg_mr(mr);
+  // Never turn an underegistered region into a prose warning: the anchor owns
+  // RAM past this point. Ordinary failures fail closed; a proven gone device
+  // follows the same exception as the rest of the teardown.
+  RequireVerbsRelease(mr->context, error, "ibv_dereg_mr(window region)");
+  return 0;
 }
 
 int RcEndpoint::QpAccessFlags() const {

@@ -225,27 +225,62 @@ class RdmaServer {
                                                            int rail);
   // Server memory windows (DFKV_RDMA_SERVER_MW; design in
   // docs/design/server-memory-windows.md). A revoked GET range: what held
-  // it (a staging lease, an arena pin) until its quarantine ends.
+  // it (its RAM-arena pin) until its quarantine ends.
+  // Capacity held for one admitted window before its range is quarantined.
+  // Moving into a quarantine entry transfers it: exactly one of reserved or
+  // actual bytes is charged for its whole life. Destruction cancels only an
+  // unconverted reservation, so bind fallback and slot reset are safe.
+  class MwReservation {
+   public:
+    MwReservation() = default;
+    ~MwReservation();
+    MwReservation(const MwReservation&) = delete;
+    MwReservation& operator=(const MwReservation&) = delete;
+    MwReservation(MwReservation&& other) noexcept;
+    MwReservation& operator=(MwReservation&& other) noexcept;
+    bool held() const { return server_ != nullptr; }
+    uint64_t bytes() const noexcept { return bytes_; }
+
+   private:
+    friend class RdmaServer;
+    MwReservation(RdmaServer* server, uint64_t bytes)
+        : server_(server), bytes_(bytes) {}
+    void Convert();
+    void Cancel();
+    RdmaServer* server_ = nullptr;
+    uint64_t bytes_ = 0;
+  };
   struct MwQuarantined {
+    MwReservation reservation;  // capacity held since authorization
     rdma::RecvSegmentPool::Lease lease;
     PreparedRead read;
     size_t data_len = 0;
     double read_elapsed_sec = 0.0;
-    uint64_t bytes = 0;  // counted against the quarantine cap
-    // GET-grant bytes outstanding on the rail as the window went: what the
-    // port could still have to send ahead of a READ in flight.
+    uint64_t bytes = 0;  // equals the reservation's original held bytes
+    // Optional diagnostic metadata for the admission estimate. The range is
+    // actually retained for mw_max_us_, never an extrapolated backlog.
     uint64_t rail_bytes = 0;
     const char* at = nullptr;  // the range (test hook)
   };
-  // The bind-only region [at, at+len) lies in on `rail` (an arena extent,
-  // or the chunk of `lease`), if registered; nullptr otherwise, which
-  // starts its registration.
-  ibv_mr* MwRegionFor(size_t rail, const char* at, size_t len,
-                      const rdma::RecvSegmentPool::Lease& lease);
-  // A grant holding held_bytes, with rail_bytes of GET grants outstanding
-  // on its rail (its own included), may use a window: its quarantine fits
-  // the maximum and the quarantined bytes the cap.
-  bool MwQuarantineAllows(uint64_t rail_bytes, uint64_t held_bytes) const;
+  // [at, at+len) lies in the RAM arena (the only memory GET grants bind
+  // windows on).
+  bool MwInArena(const char* at, size_t len) const;
+  // The bind-only region (an arena extent) [at, at+len) lies in on `rail`,
+  // if registered; nullptr otherwise, which starts its registration. The
+  // range must be in the arena (MwInArena).
+  ibv_mr* MwRegionFor(size_t rail, const char* at, size_t len);
+  // Atomically reserves held_bytes while checking the maximum for this
+  // snapshot. The cap charges live bound grants as reserved plus actually
+  // quarantined bytes, so concurrent admissions cannot overshoot it.
+  // No reservation is taken when MW is off or the range cannot be admitted.
+  // The claim must follow the bind into its slot; a bind failure cancels it.
+  MwReservation MwReserveQuarantine(uint64_t rail_bytes, uint64_t held_bytes);
+  void MwReleaseReservation(uint64_t bytes);
+  // The outstanding rail-byte snapshot to use at a successful window bind.
+  // Includes this grant; outside an atomic read it is deliberately an upper
+  // bound when other connections admit or retire meanwhile.
+  uint64_t MwRailSnapshot(const std::atomic<uint64_t>& rail_bytes,
+                          uint64_t grant_bytes) const;
   // The quarantine of a range revoked with rail_bytes of GET grants
   // outstanding on its rail: twice the time the port needs to send them,
   // plus the margin, never below the floor.
@@ -456,6 +491,9 @@ class RdmaServer {
   size_t mw_extent_bytes_ = 0;
   rdma::BindRegionRegistry mw_regions_;
   std::mutex mw_quarantine_mu_;
+  // Bound grants not yet converted to quarantine. Reserved + actual is the
+  // cap; this is intentionally not part of the quarantined-bytes gauge.
+  uint64_t mw_reserved_bytes_ = 0;  // under mw_quarantine_mu_
   std::multimap<uint64_t, MwQuarantined> mw_quarantine_;  // by end, us
   std::atomic<uint64_t> mw_quarantine_bytes_{0};
   std::atomic<uint64_t> mw_binds_{0}, mw_invalidations_{0},
