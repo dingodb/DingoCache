@@ -255,7 +255,8 @@ class PreparedRead {
       ReadLease lease, char* staging, size_t staging_cap, void* owner,
       uint64_t token, FinishFn finish, bool source_registered = false,
       char* fallback = nullptr, size_t fallback_cap = 0,
-      std::shared_ptr<void> post_read_hold = {}) noexcept {
+      std::shared_ptr<void> post_read_hold = {},
+      size_t pin_bytes = 0) noexcept {
     PreparedRead read;
     read.status_ = Status::kOk;
     read.needs_io_ = lease.aligned_len != 0;
@@ -276,6 +277,7 @@ class PreparedRead {
     read.active_ = true;
     read.lease_ = std::move(lease);
     read.post_read_hold_ = std::move(post_read_hold);
+    read.pin_bytes_ = pin_bytes;
     return read;
   }
   static PreparedRead Ready(const char* data, size_t payload_len,

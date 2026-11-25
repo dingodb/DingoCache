@@ -11323,6 +11323,26 @@ TEST(RdmaVerbs, ADeviceNothingHoldsIsOpenedAgain) {
   EXPECT_EQ(rdma::RcEndpoint::DeviceOpens(), held_opens);
 }
 
+// A failed verbs release is never an ignored success. Only a disassociated
+// context lifts the fail-closed guard, and that exception is accounted for.
+TEST(RdmaRelease, OrdinaryErrorsAbortButAProvenGoneDeviceIsCounted) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  DeviceRebuildOn on;
+  rdma::RcEndpoint ep;
+  ASSERT_TRUE(ep.Open(nullptr, 64 * 1024, 1));
+  ibv_context* ctx = ep.context_for_test();
+  const uint64_t prior = rdma::DeadReleaseFailures();
+
+  ASSERT_EXIT((rdma::RequireVerbsReleaseForTest(ctx, 0, "ordinary-bug")),
+              ::testing::KilledBySignal(SIGABRT), "unsafe resource release");
+
+  rdma::SetReleaseFaultsForTest({{}, []() { return ENODEV; }, {}});
+  rdma::RequireVerbsReleaseForTest(ctx, ENODEV,
+                                   "ibv_dereg_mr(window region)");
+    EXPECT_EQ(rdma::DeadReleaseFailures(), prior + 1);
+  rdma::SetReleaseFaultsForTest({});
+}
+
 // TRN-29 (docs/design/rdma-device-reset.md): a rail whose device was reset.
 // No device is ever reset here: a seam reports DEVICE_FATAL, or fails Opens
 // with ENODEV, as a reset would.
