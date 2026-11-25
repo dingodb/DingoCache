@@ -102,7 +102,7 @@ vllm serve <model> \
 ```
 
 vLLM supplies the exact runtime `model_name` and combines it with the
-source-controlled `vllm-multiwr-v4` namespace.
+source-controlled `vllm-multiwr-v5` namespace.
 
 ### 2.2 打开 telemetry
 **只认环境变量**(连接器内部 `configure({})`,**不会**去读 `kv_connector_extra_config`),

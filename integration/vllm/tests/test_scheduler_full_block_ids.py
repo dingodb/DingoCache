@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.v1.core.kv_cache_utils import BlockHash
 
 from dfkv_vllm.data import LoadSpec, RequestTracker
 from dfkv_vllm.scheduler import DfkvStoreScheduler
@@ -369,7 +370,9 @@ def test_same_step_preemption_keeps_new_allocation_and_load(async_pending, cache
 def test_load_admission_parks_request_level_layouts(
     monkeypatch, group_kinds, load_async, parked,
 ):
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    import torch
+
+    from _cache_api import cache_group, full_attention_spec, mamba_spec
     from dfkv_vllm import scheduler as scheduler_module
 
     client = MagicMock()
@@ -381,10 +384,19 @@ def test_load_admission_parks_request_level_layouts(
         scheduler_module, "resolve_kv_cache_block_sizes", lambda *args: (4, 4),
     )
     groups = [
-        SimpleNamespace(kv_cache_spec=(
-            object.__new__(FullAttentionSpec) if kind == "full" else object()
-        ))
-        for kind in group_kinds
+        cache_group(
+            [f"layer{index}"],
+            (
+                full_attention_spec(
+                    block_size=4, num_kv_heads=1, head_size=1, dtype=torch.uint8
+                )
+                if kind == "full"
+                else mamba_spec(
+                    block_size=4, shapes=((1,),), dtypes=(torch.uint8,)
+                )
+            ),
+        )
+        for index, kind in enumerate(group_kinds)
     ]
     scheduler = DfkvStoreScheduler(
         SimpleNamespace(
@@ -395,7 +407,11 @@ def test_load_admission_parks_request_level_layouts(
         ),
         SimpleNamespace(kv_cache_groups=groups, transfer_groups=groups),
     )
-    request = SimpleNamespace(request_id="load", num_tokens=16, block_hashes=[])
+    request = SimpleNamespace(
+        request_id="load",
+        num_tokens=16,
+        block_hashes=[BlockHash(bytes([index])) for index in range(1, 5)],
+    )
     client.lookup.return_value = (8, 0)
     assert scheduler.get_num_new_matched_tokens(request, 0) == (8, parked)
     client.lookup.return_value = (0, 0)

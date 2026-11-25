@@ -17,9 +17,10 @@ import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, MLAAttentionSpec
+from _cache_api import cache_group, mamba_spec, mla_attention_spec
 
 from dfkv_vllm import scheduler as scheduler_module
+from dfkv_vllm.cache_api import group_block_size
 from dfkv_vllm.coordinator import (
     DfkvStoreCoordinator,
     ExternalCachedBlockPool,
@@ -65,15 +66,15 @@ def _hashes(tokens=PROMPT):
 
 
 def _groups():
-    state = MambaSpec(
+    state = mamba_spec(
         block_size=HASH, shapes=((16,),), dtypes=(torch.uint8,),
         mamba_cache_mode="align",
     )
-    mla = MLAAttentionSpec(
+    mla = mla_attention_spec(
         block_size=LCM, num_kv_heads=1, head_size=1, dtype=torch.uint8,
     )
-    return [KVCacheGroupSpec([f"kda{g}"], state) for g in STATE_GROUPS] + [
-        KVCacheGroupSpec(["mla"], mla)
+    return [cache_group([f"kda{g}"], state) for g in STATE_GROUPS] + [
+        cache_group(["mla"], mla)
     ]
 
 
@@ -145,7 +146,7 @@ def _databases(rank, fill):
         for block in range(NUM_BLOCKS):
             ctypes.memset(ctypes.addressof(pool) + block * BYTES, fill(g, block), BYTES)
         db = ChunkedTokenDatabase(
-            _metadata(g, rank), group.kv_cache_spec.block_size, hash_block_size=HASH,
+            _metadata(g, rank), group_block_size(group), hash_block_size=HASH,
         )
         db.set_seg_layout([(ctypes.addressof(pool), BYTES, BYTES)])
         pools.append(pool)
@@ -179,7 +180,7 @@ def _lookup(store, token_len=B, partial=True, hashes=None):
     worker = SimpleNamespace(
         coord=_coord(partial),
         token_dbs=[
-            SimpleNamespace(metadata=_metadata(g), block_size=group.kv_cache_spec.block_size)
+            SimpleNamespace(metadata=_metadata(g), block_size=group_block_size(group))
             for g, group in enumerate(groups)
         ],
         client=store, tp_size=TP, num_kv_head=1, _kv_cache_groups=groups,
@@ -192,7 +193,7 @@ def _stored_checkpoint(boundary=B, *, states_at=(), skip=()):
     """Every object a hit at ``boundary`` needs, on every rank, minus skip."""
     hashes = _hashes()
     store = _Store()
-    view = _coord().block_hashes_for_spec(hashes, _groups()[ATTN].kv_cache_spec)
+    view = _coord().block_hashes_for_group(hashes, _groups()[ATTN])
     objects = [(ATTN, r, view[i]) for r in range(DCP) for i in range(boundary // LCM)]
     objects += [(ATTN, r, hashes[boundary // HASH - 1]) for r in range(DCP)]
     for c in (boundary, *states_at):
@@ -243,7 +244,7 @@ def test_store_mask_and_disabled_masks_are_unchanged():
 @needs_fine_grained
 def test_coordinator_converges_on_the_checkpoint():
     coord, hashes = _coord(), _hashes()
-    view = coord.block_hashes_for_spec(hashes, _groups()[ATTN].kv_cache_spec)
+    view = coord.block_hashes_for_group(hashes, _groups()[ATTN])
     exists = {(ATTN, bytes(view[i])) for i in range(19)}
     exists.add((ATTN, bytes(hashes[B // HASH - 1])))
     states = {(g, bytes(hashes[B // HASH - 1])) for g in STATE_GROUPS}
@@ -287,7 +288,7 @@ def test_lookup_falls_back_to_the_grid_checkpoint(missing, fallback):
 @needs_fine_grained
 def test_lookup_requires_every_dcp_namespace_of_a_whole_block():
     hashes = _hashes()
-    view = _coord().block_hashes_for_spec(hashes, _groups()[ATTN].kv_cache_spec)
+    view = _coord().block_hashes_for_group(hashes, _groups()[ATTN])
     store, _ = _stored_checkpoint(skip={(ATTN, 3, view[7])})
     assert _lookup(store) == 0
     # A second probe covers only the first block not stored whole.

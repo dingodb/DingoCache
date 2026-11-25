@@ -108,7 +108,7 @@ block-token and layer geometry, group, and replicated topology sizes.
 Connector-specific shape/stride fields feed the deterministic 64-bit layout
 fingerprint.
 
-The source-controlled layout IDs are `sglang-hicache/raw-v1`, `vllm-multiwr-v4`,
+The source-controlled layout IDs are `sglang-hicache/raw-v1`, `vllm-multiwr-v5`,
 and `lmcache/raw-v1`. Model/revision strings are preserved verbatim. Operators
 cannot alias namespaces through configuration: an identity-bearing schema
 change requires code review and a layout-ID bump, which deliberately starts a

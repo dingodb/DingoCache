@@ -4,7 +4,7 @@ import threading
 import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+from _cache_api import cache_group, full_attention_spec
 
 from dfkv_vllm.coordinator import DfkvStoreCoordinator
 from dfkv_vllm.data import ChunkedTokenDatabase, KeyMetadata, LoadSpec, ReqMeta
@@ -30,11 +30,11 @@ def test_receive_completion_waits_for_the_owning_gpu(monkeypatch, request_level_
         )
         database = ChunkedTokenDatabase(metadata, block_size=64, hash_block_size=64)
         database.set_seg_layout([(pool.data_ptr(), 64, 64)])
-        spec = FullAttentionSpec(
+        spec = full_attention_spec(
             block_size=64, num_kv_heads=1, head_size=1,
             head_size_v=0, dtype=torch.uint8,
         )
-        coordinator = DfkvStoreCoordinator([KVCacheGroupSpec(["kv"], spec)], 64, 64)
+        coordinator = DfkvStoreCoordinator([cache_group(["kv"], spec)], 64, 64)
 
         class PendingDeviceWrite:
             def batch_get_auto_sg(self, keys, pointers, capacities):

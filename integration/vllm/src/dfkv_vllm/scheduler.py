@@ -23,6 +23,7 @@ from vllm.v1.request import Request
 
 from ._determinism import ensure_deterministic_block_hashing
 from ._telemetry import config as _tcfg
+from .cache_api import manager_api, store_group_ids
 from .coordinator import partial_hash_hits_enabled
 from .data import (
     LoadSpec,
@@ -119,6 +120,22 @@ class DfkvStoreScheduler:
         self._partial_hash_hits = partial_hash_hits_enabled(
             kv_cache_config, self._block_size
         )
+        self._manager_groups = manager_api(kv_cache_config)
+        self._num_hash_lookahead_tokens = (
+            getattr(vllm_config, "num_hash_lookahead_tokens", 0)
+            if self._manager_groups
+            else 0
+        )
+        self._retention_interval = getattr(
+            kv_cache_config, "prefix_cache_retention_interval", None
+        )
+        self._finished_lookahead_metas: dict[str, ReqMeta] = {}
+        self._finished_partial_tail_metas: dict[str, ReqMeta] = {}
+        self._store_group_ids = store_group_ids(kv_cache_config)
+        self._store_index_by_engine_group = {
+            engine_id: store_index
+            for store_index, engine_id in enumerate(self._store_group_ids)
+        }
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
@@ -145,6 +162,7 @@ class DfkvStoreScheduler:
         if (
             request.request_id in self._failed_load_req_ids
             or getattr(request, "skip_reading_prefix_cache", False)
+            or getattr(request, "skip_reading_external_kv", False)
         ):
             self.client.discard(request.request_id)
             self.load_specs.pop(request.request_id, None)
@@ -154,7 +172,17 @@ class DfkvStoreScheduler:
         # validated hit can select different recurrent-state checkpoint keys.
         # Partial hash hits land on hash blocks inside a scheduler block.
         align = self._hash_block_size if self._partial_hash_hits else self._block_size
-        token_len = (request.num_tokens - 1) // align * align
+        if getattr(self, "_manager_groups", False):
+            from vllm.v1.kv_cache_interface import get_reusable_prefix_length
+
+            token_len = get_reusable_prefix_length(
+                request.num_tokens,
+                num_hash_lookahead_tokens=getattr(self, "_num_hash_lookahead_tokens", 0),
+                alignment_tokens=align,
+            )
+            token_len = min(token_len, len(request.block_hashes) * align)
+        else:
+            token_len = (request.num_tokens - 1) // align * align
         requested_ttl = _requested_retention_ttl(request)
         # A local partial hit ends inside a block that core copies on write;
         # an external load into the same block would race that copy.
@@ -215,6 +243,14 @@ class DfkvStoreScheduler:
         # Parking admission is independent of whether the worker overlaps I/O.
         return need_to_allocate, self.load_async or self.request_level_loads
 
+    def _select_store_blocks(
+        self, block_ids: tuple[list[int], ...]
+    ) -> tuple[list[int], ...]:
+        store_ids = getattr(
+            self, "_store_group_ids", tuple(range(len(block_ids)))
+        )
+        return tuple(block_ids[index] for index in store_ids)
+
     def update_state_after_alloc(
         self,
         request: Request,
@@ -222,7 +258,8 @@ class DfkvStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
-        local_block_ids = blocks.get_block_ids()
+        all_block_ids = blocks.get_block_ids()
+        local_block_ids = self._select_store_blocks(all_block_ids)
 
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         self._unfinished_request_ids.add(request.request_id)
@@ -366,6 +403,10 @@ class DfkvStoreScheduler:
                 request_tracker,
                 self._block_size,
                 with_token_ids=self._kv_events,
+                hash_block_size=(
+                    self._hash_block_size if getattr(self, "_manager_groups", False) else None
+                ),
+                num_hash_lookahead_tokens=getattr(self, "_num_hash_lookahead_tokens", 0),
                 load_spec=load_spec,
                 skip_save=force_skip_save,
                 block_hashes=request_real.block_hashes,
@@ -408,6 +449,10 @@ class DfkvStoreScheduler:
                     request_tracker,
                     self._block_size,
                     with_token_ids=self._kv_events,
+                    hash_block_size=(
+                        self._hash_block_size if getattr(self, "_manager_groups", False) else None
+                    ),
+                    num_hash_lookahead_tokens=getattr(self, "_num_hash_lookahead_tokens", 0),
                     load_spec=load_spec,
                     skip_save=force_skip_save,
                     block_hashes=request_real.block_hashes,
@@ -465,12 +510,18 @@ class DfkvStoreScheduler:
                     )
                 request_tracker.token_len = new_len
                 if has_new_blocks:
-                    request_tracker.update(new_block_ids)
+                    request_tracker.update(
+                        self._select_store_blocks(new_block_ids)
+                    )
 
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
                     with_token_ids=self._kv_events,
+                    hash_block_size=(
+                        self._hash_block_size if getattr(self, "_manager_groups", False) else None
+                    ),
+                    num_hash_lookahead_tokens=getattr(self, "_num_hash_lookahead_tokens", 0),
                     load_spec=None,
                     skip_save=force_skip_save,
                     block_hashes=unfinished_req.block_hashes,
@@ -507,6 +558,10 @@ class DfkvStoreScheduler:
                     request_tracker,
                     self._block_size,
                     with_token_ids=self._kv_events,
+                    hash_block_size=(
+                        self._hash_block_size if getattr(self, "_manager_groups", False) else None
+                    ),
+                    num_hash_lookahead_tokens=getattr(self, "_num_hash_lookahead_tokens", 0),
                     load_spec=load_spec,
                     skip_save=None,
                     block_hashes=unfinished_req.block_hashes,
@@ -515,6 +570,19 @@ class DfkvStoreScheduler:
                     meta.add_request(req_meta)
 
         self._attach_state_blocks(meta, scheduler_output)
+        # Finish-time sources were registered before the normal finished-ID
+        # cleanup. They carry independent block/hash snapshots and must not be
+        # discarded with the request's live scheduler state.
+        for name in (
+            "_finished_partial_tail_metas",
+            "_finished_lookahead_metas",
+        ):
+            queue = getattr(self, name, None)
+            if not queue:
+                continue
+            for req_meta in queue.values():
+                meta.add_request(req_meta)
+            queue.clear()
         self._allocated_req_ids.clear()
         for req_meta in meta.requests:
             retention = self._retention.get(req_meta.req_id)
@@ -526,6 +594,12 @@ class DfkvStoreScheduler:
         """Prompt length whose partial tail a SAVE may publish (partial hash
         hits only)."""
         return request.num_prompt_tokens if self._partial_hash_hits else None
+
+    def _store_index(self, engine_group_id: int) -> int | None:
+        mapping = getattr(self, "_store_index_by_engine_group", None)
+        if mapping is None:
+            return engine_group_id
+        return mapping.get(engine_group_id)
 
     def _attach_state_blocks(
         self, meta: DfkvStoreConnectorMetadata, scheduler_output: SchedulerOutput
@@ -556,7 +630,10 @@ class DfkvStoreScheduler:
             saving.add(req_meta.req_id)
             blocks: dict[int, dict[int, int]] = {}
             for group_id, block_id, boundary in offloads.get(req_meta.req_id, ()):
-                blocks.setdefault(group_id, {})[boundary] = block_id
+                store_index = self._store_index(group_id)
+                if store_index is None:
+                    continue
+                blocks.setdefault(store_index, {})[boundary] = block_id
                 if boundary % self._block_size:
                     misaligned += 1
             req_meta.state_blocks = blocks
@@ -581,8 +658,9 @@ class DfkvStoreScheduler:
                 continue
             blocks = {}
             for group_id, block_id, boundary in entries:
-                if boundary % self._block_size:
-                    blocks.setdefault(group_id, {})[boundary] = block_id
+                store_index = self._store_index(group_id)
+                if store_index is not None and boundary % self._block_size:
+                    blocks.setdefault(store_index, {})[boundary] = block_id
             if not blocks:
                 continue
             tracker.has_pending_offload = True
@@ -622,12 +700,101 @@ class DfkvStoreScheduler:
             self._block_size,
         )
 
+    def register_finished_lookahead_save(
+        self,
+        request: Request,
+        block_ids: tuple[list[int], ...],
+    ) -> None:
+        """Queue KV whose lookahead hash appears only at request completion."""
+        if (
+            getattr(self, "_num_hash_lookahead_tokens", 0) <= 0
+            or self.kv_role == "kv_consumer"
+        ):
+            return
+        tracker = self._request_trackers.get(request.request_id)
+        if tracker is None or not any(block_ids):
+            return
+        block_ids = self._select_store_blocks(block_ids)
+        in_flight = (
+            request.num_in_flight_tokens - request.num_stale_output_tokens
+        )
+        completed = request.num_computed_tokens - in_flight
+        tracker.token_len = min(completed, tracker.prefill_end_tokens)
+        if tracker.token_ids is not None:
+            # The last eligible block needs the following L tokens in its
+            # BlockStored payload as well as the tokens it covers itself.
+            tracker.token_ids = request.all_token_ids[
+                : tracker.token_len + self._num_hash_lookahead_tokens
+            ]
+        req_meta = ReqMeta.from_request_tracker(
+            tracker,
+            self._block_size,
+            with_token_ids=self._kv_events,
+            block_hashes=request.block_hashes,
+            num_prompt_tokens=self._tail_prompt_tokens(request),
+            hash_block_size=self._hash_block_size,
+            num_hash_lookahead_tokens=self._num_hash_lookahead_tokens,
+        )
+        if req_meta is None:
+            return
+        req_meta.block_ids = tuple(group.copy() for group in block_ids)
+        retention = self._retention.get(request.request_id)
+        if retention is not None:
+            req_meta.retain_ttl_s = retention[1]
+        self._finished_lookahead_metas[request.request_id] = req_meta
+
+    def register_finished_partial_tail(
+        self,
+        request: Request,
+        block_ids: tuple[list[int], ...],
+        partial_tail_offloads: list[tuple[int, int, int]],
+    ) -> bool:
+        """Accept exact finish-time recurrent-state sources before cleanup."""
+        if self.kv_role == "kv_consumer" or not partial_tail_offloads:
+            return False
+        tracker = self._request_trackers.get(request.request_id)
+        if tracker is None or not any(block_ids):
+            return False
+        block_ids = self._select_store_blocks(block_ids)
+        state_blocks: dict[int, dict[int, int]] = {}
+        for group_id, block_id, boundary in partial_tail_offloads:
+            store_index = self._store_index(group_id)
+            if (
+                store_index is None
+                or block_id <= 0
+                or boundary <= 0
+                or (
+                    tracker.prefill_end_tokens > 0
+                    and boundary > tracker.prefill_end_tokens
+                )
+            ):
+                return False
+            state_blocks.setdefault(store_index, {})[boundary] = block_id
+        req_meta = ReqMeta(
+            req_id=request.request_id,
+            token_len_chunk=0,
+            block_ids=tuple(group.copy() for group in block_ids),
+            block_hashes=list(request.block_hashes),
+            can_save=True,
+            state_blocks=state_blocks,
+            num_prompt_tokens=self._tail_prompt_tokens(request),
+            prefill_end_tokens=tracker.prefill_end_tokens,
+            num_hash_lookahead_tokens=getattr(self, "_num_hash_lookahead_tokens", 0),
+        )
+        retention = self._retention.get(request.request_id)
+        if retention is not None:
+            req_meta.retain_ttl_s = retention[1]
+        tracker.has_pending_offload = True
+        self._finished_partial_tail_metas[request.request_id] = req_meta
+        return True
+
     def request_finished(
         self,
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Determine whether to delay freeing blocks for async save."""
+        self.register_finished_lookahead_save(request, block_ids)
         self.client.discard(request.request_id)
         self._failed_load_req_ids.discard(request.request_id)
         self.load_specs.pop(request.request_id, None)

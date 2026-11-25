@@ -58,7 +58,7 @@ def _worker(n_chunks: int, states_at: set[int]):
         LCM,
         # Attention: every chunk; state: the candidate's last chunk only.
         load_mask=lambda _b, n: [[True] * (n // LCM), [False] * (n // LCM - 1) + [True]],
-        block_hashes_for_spec=lambda b, _spec: b,
+        block_hashes_for_group=lambda b, _spec: b,
     )
     worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
     worker.client = _Ring(present)
@@ -111,7 +111,7 @@ class LookupBackoff(unittest.TestCase):
         worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
         worker.client = ring
         worker.coord = fake_coordinator(
-            LCM, load_mask=load_mask, block_hashes_for_spec=lambda b, _s: b)
+            LCM, load_mask=load_mask, block_hashes_for_group=lambda b, _s: b)
         worker.token_dbs = [SimpleNamespace(block_size=LCM, metadata=_md(0))]
         worker._kv_cache_groups = [SimpleNamespace(kv_cache_spec=object())]
         worker.tp_size = 1

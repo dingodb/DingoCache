@@ -15,6 +15,7 @@ import os
 import sys
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -56,23 +57,36 @@ class MambaSpec:
 class UniformTypeKVCacheSpecs:
     def __init__(self, **specs) -> None:
         self.kv_cache_specs = specs
+        self.block_size = 16
 
 
 class SaveFenceIsDefaultDeny(unittest.TestCase):
     def setUp(self) -> None:
+        # The implementation imports legacy policy classes from the actual
+        # vLLM interface module, not from dfkv_vllm.worker's namespace.
         for name, value in (
             ("FullAttentionSpec", FullAttentionSpec),
             ("MLAAttentionSpec", MLAAttentionSpec),
             ("MambaSpec", MambaSpec),
             ("UniformTypeKVCacheSpecs", UniformTypeKVCacheSpecs),
-            ("_SAVE_ASYNC_SPEC_TYPES", (FullAttentionSpec, MLAAttentionSpec)),
         ):
-            p = patch.object(worker_module, name, value)
+            p = patch.object(
+                __import__("vllm.v1.kv_cache_interface", fromlist=[name]),
+                name,
+                value,
+            )
             p.start()
             self.addCleanup(p.stop)
+        p = patch.object(worker_module, "MLAAttentionSpec", MLAAttentionSpec)
+        p.start()
+        self.addCleanup(p.stop)
+
+    @staticmethod
+    def _group(spec):
+        return SimpleNamespace(kv_cache_spec=spec, layer_names=("layer",))
 
     def fenced(self, spec) -> bool:
-        return worker_module._save_needs_step_fence(spec)
+        return worker_module._save_needs_step_fence(self._group(spec))
 
     def test_full_attention_is_saved_asynchronously(self) -> None:
         self.assertFalse(self.fenced(FullAttentionSpec()))

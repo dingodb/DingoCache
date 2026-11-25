@@ -52,15 +52,15 @@ from vllm.distributed import (
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
-from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     maybe_convert_block_hash,
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec, FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec,
-    MambaSpec, MLAAttentionSpec, UniformTypeKVCacheSpecs,
+    AttentionSpec,
+    KVCacheConfig,
+    MLAAttentionSpec,
 )
 
 # dfkv: get_dp_engine_index replaces mooncake_utils.get_mooncake_dp_engine_index;
@@ -74,11 +74,20 @@ from .client_ranks import (
     resolve_client_ranks,
     should_create_client,
 )
+from .cache_api import (
+    cache_group_view,
+    group_block_size,
+    is_mamba_group,
+    logical_bytes_per_block,
+    manager_api,
+    prefix_cacheable,
+    resolve_dcp_group,
+    store_group_ids,
+    store_groups,
+)
 from .coordinator import (
     DfkvStoreCoordinator,
     ExternalCachedBlockPool,
-    _prefix_cacheable,
-    _unwrap_spec,
     partial_hash_hits_enabled,
 )
 from .data import (
@@ -167,45 +176,34 @@ class _KeyStripeIdentity:
     stripe_step: int
 
 
-def _effective_cache_spec(spec, dcp_size: int):
-    """Use the running engine's DCP normalization, including wrapped specs."""
-    resolver = getattr(kv_cache_utils, "resolve_dcp_kv_cache_spec", None)
-    if resolver is not None:
-        return resolver(spec, dcp_size)
-    if dcp_size == 1 or not isinstance(spec, AttentionSpec):
-        return spec
-    return dataclasses.replace(spec, block_size=spec.block_size * dcp_size)
+def _save_needs_step_fence(group) -> bool:
+    """Whether this group's SAVE sources may change in the next model step.
 
-
-# Spec types whose blocks vLLM keeps with a request until it finishes (its
-# FullAttentionManager never frees or rewrites them while the request runs):
-# their SAVE may run past the step. Exact types: a subclass can bring its own
-# manager (RSWA, sink attention) and is fenced until it is reviewed.
-_SAVE_ASYNC_SPEC_TYPES = (FullAttentionSpec, MLAAttentionSpec)
-
-
-def _save_needs_step_fence(spec) -> bool:
-    """Whether a group's SAVE has to finish before the next model step.
-
-    Default deny: only full attention whose blocks stay with the request may
-    be saved asynchronously. Everything else -- recurrent state, windows,
-    chunked local attention, and any spec type this connector does not know
-    -- may be freed, reused or rewritten while the request still runs, and an
-    asynchronous PUT would then store bytes of another request under a valid
-    key.
+    Full-attention managers retain their blocks until the request finishes.
+    On the modern API the manager is the source of that guarantee; on legacy
+    engines the exact policy-typed specs carry it. Unknown layouts stay fenced.
     """
-    specs = (
-        spec.kv_cache_specs.values()
-        if isinstance(spec, UniformTypeKVCacheSpecs)
-        else (spec,)
-    )
+    view = cache_group_view(group)
+    if view.manager_config is not None:
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+        return (
+            view.manager_cls is not FullAttentionManager
+            or any(
+                type(spec) not in (AttentionSpec, MLAAttentionSpec)
+                for _, spec in view.layer_specs
+            )
+        )
+
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
     return any(
-        type(inner) not in _SAVE_ASYNC_SPEC_TYPES
+        type(spec) not in (FullAttentionSpec, MLAAttentionSpec)
         or any(
-            getattr(inner, field, None) is not None
+            getattr(spec, field, None) is not None
             for field in ("sliding_window", "attention_chunk_size", "rswa_window")
         )
-        for inner in specs
+        for _, spec in view.layer_specs
     )
 
 
@@ -280,8 +278,8 @@ def _resolve_model_revision(extra_config: Any, model_config: Any) -> str:
     return model_identity
 
 
-def _cache_group_layout(groups: Sequence[KVCacheGroupSpec]) -> str:
-    """Bind cached bytes to full per-group geometry, not only block size."""
+def _cache_group_layout(groups: Sequence) -> str:
+    """Bind cached bytes to geometry and the manager's allocation policy."""
     def encode(value):
         if isinstance(value, torch.dtype):
             return str(value)
@@ -291,16 +289,43 @@ def _cache_group_layout(groups: Sequence[KVCacheGroupSpec]) -> str:
             return value.value
         raise TypeError(f"Unsupported cache-spec value: {type(value).__qualname__}")
 
-    return json.dumps(
-        [
-            {
+    def qualified(value: type) -> str:
+        return f"{value.__module__}.{value.__qualname__}"
+
+    entries = []
+    for group in groups:
+        if not manager_api(group):
+            # Keep the legacy geometry projection byte-for-byte stable. v5
+            # carries the generation/layout migration independently.
+            entries.append({
                 "layers": sorted(group.layer_names),
                 "spec_type": type(group.kv_cache_spec).__qualname__,
                 "spec": dataclasses.asdict(group.kv_cache_spec),
                 "is_eagle_group": group.is_eagle_group,
-            }
-            for group in groups
-        ],
+            })
+            continue
+        view = cache_group_view(group)
+        entries.append({
+            "schema": "manager-config-v1",
+            "layers": sorted(group.layer_names),
+            "block_size": view.block_size,
+            "dcp_sharded": group.dcp_sharded,
+            "host_resident": group.host_resident,
+            "enable_kv_transfer": group.enable_kv_transfer,
+            "manager": qualified(view.manager_cls),
+            "manager_params": dataclasses.asdict(view.manager_config.params),
+            "specs": [
+                {
+                    "layer": layer,
+                    "spec_type": qualified(type(spec)),
+                    "spec": dataclasses.asdict(spec),
+                }
+                for layer, spec in view.layer_specs
+            ],
+            "logical_bytes_per_block": logical_bytes_per_block(view),
+        })
+    return json.dumps(
+        entries,
         sort_keys=True,
         separators=(",", ":"),
         default=encode,
@@ -340,6 +365,22 @@ def _byte_order_layout_fields(
     return fields
 
 
+def _dcp_group_rank(
+    global_rank: int, dcp_size: int, group_ranks: tuple[int, ...] | None
+) -> int:
+    """Resolve rank_in_group from real membership when main exposes it."""
+    if group_ranks is not None:
+        try:
+            return group_ranks.index(global_rank)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"global rank {global_rank} is absent from DCP group {group_ranks}"
+            ) from exc
+    # Legacy vLLM and small test stand-ins without group metadata retain the
+    # original PCP x TP transpose-order formula.
+    return global_rank % dcp_size
+
+
 def _key_stripe_identity(
     *,
     tp_rank: int,
@@ -350,18 +391,25 @@ def _key_stripe_identity(
     dcp_size: int,
     num_kv_heads: int,
     use_mla: bool,
+    dcp_group_ranks: tuple[int, ...] | None = None,
+    dcp_global_rank_base: int = 0,
 ) -> _KeyStripeIdentity:
     """Map a vLLM TP/PCP/DCP rank to its key namespace and store stripe.
 
-    vLLM forms DCP groups after transposing the ``PCP x TP`` rank grid, so
-    DCP rank is ``(tp_rank * pcp_size + pcp_rank) % dcp_size``.  Workers with
-    the same TP-head, PCP, and DCP key coordinate are payload replicas.  They
-    split that namespace's chunks by their position in that actual replica
-    set; raw TP parity is not a replica identity when DCP is enabled.
+    Main sorts global ranks inside each DCP group; group membership, not a
+    modulo shortcut, determines rank_in_group and the replica order.
     """
-    replica_step = tp_size // num_kv_heads if num_kv_heads < tp_size else 1
+    # Attention-free Mamba models report zero KV heads. There is no head
+    # replication step to derive; their state sharding is selected by group.
+    replica_step = (
+        tp_size // num_kv_heads if 0 < num_kv_heads < tp_size else 1
+    )
     key_tp_rank = tp_rank // replica_step if replica_step > 1 else tp_rank
-    expected_dcp_rank = (tp_rank * pcp_size + pcp_rank) % dcp_size
+    expected_dcp_rank = _dcp_group_rank(
+        dcp_global_rank_base + tp_rank * pcp_size + pcp_rank,
+        dcp_size,
+        dcp_group_ranks,
+    )
     if dcp_rank != expected_dcp_rank:
         raise RuntimeError(
             "vLLM DCP rank does not match the PCP x TP group layout: "
@@ -379,7 +427,11 @@ def _key_stripe_identity(
                 else candidate
             )
             == key_tp_rank
-            and (candidate * pcp_size + pcp_rank) % dcp_size == dcp_rank
+            and _dcp_group_rank(
+                dcp_global_rank_base + candidate * pcp_size + pcp_rank,
+                dcp_size,
+                dcp_group_ranks,
+            ) == dcp_rank
         )
     ]
     stripe_idx = replica_ranks.index(tp_rank)
@@ -403,6 +455,8 @@ def _key_namespaces(
     num_kv_heads: int,
     use_mla: bool,
     tp_sharded: bool,
+    dcp_group_ranks: tuple[int, ...] | None = None,
+    dcp_global_rank_base: int = 0,
 ) -> tuple[tuple[int, int, int], ...]:
     """Distinct ``(tp_rank, pcp_rank, dcp_rank)`` key coordinates that the
     ``TP x PCP`` workers of one PP stage write for a cache group.
@@ -413,7 +467,11 @@ def _key_namespaces(
     namespaces: dict[tuple[int, int, int], None] = {}
     for pcp_rank in range(pcp_size):
         for tp_rank in range(tp_size):
-            dcp_rank = (tp_rank * pcp_size + pcp_rank) % dcp_size
+            dcp_rank = _dcp_group_rank(
+                dcp_global_rank_base + tp_rank * pcp_size + pcp_rank,
+                dcp_size,
+                dcp_group_ranks,
+            )
             if not tp_sharded:
                 tp_rank = _key_stripe_identity(
                     tp_rank=tp_rank,
@@ -424,6 +482,8 @@ def _key_namespaces(
                     dcp_size=dcp_size,
                     num_kv_heads=num_kv_heads,
                     use_mla=use_mla,
+                    dcp_group_ranks=dcp_group_ranks,
+                    dcp_global_rank_base=dcp_global_rank_base,
                 ).tp_rank
             namespaces[(tp_rank, pcp_rank, dcp_rank)] = None
     return tuple(namespaces)
@@ -452,14 +512,18 @@ def _logical_block_ids(
     block_ids: Sequence[int],
 ) -> list[int]:
     # Full allocator tables may include future, uncomputed blocks. Select by
-    # logical position, not from their tail. Only an actually compact state
-    # table maps its entries consecutively onto selected mask positions.
+    # logical position, not from their tail. A mask with no selected blocks
+    # needs no table at all (modern Mamba uses boundary-only offloads).
+    positions = [index for index, selected in enumerate(mask) if selected]
+    if not positions:
+        return [-1] * len(mask)
+    # Only an actually compact state table maps its entries consecutively onto
+    # selected mask positions.
     if len(block_ids) >= len(mask):
         return [
             int(block_ids[index]) if selected else -1
             for index, selected in enumerate(mask)
         ]
-    positions = [index for index, selected in enumerate(mask) if selected]
     if len(block_ids) != len(positions):
         raise ValueError(
             f"block table has {len(block_ids)} ids for "
@@ -1077,7 +1141,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             # Within each lcm region only per-spec relevant chunks are loaded
             # (e.g., SWA or linear attn), so mask out irrelevant chunks
-            store_masks = self.coord.store_mask(token_len)
+            store_masks = (
+                self.coord.store_mask(token_len)
+                if req_meta.prefill_end_tokens is None
+                else self.coord.store_mask(
+                    token_len,
+                    num_prompt_tokens=req_meta.prefill_end_tokens,
+                )
+            )
             starts: list[int] = []
             ends: list[int] = []
             keys: list[bytes] = []
@@ -1319,6 +1390,17 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         if req_meta.token_ids is not None
                         else None
                     )
+                    lookahead = req_meta.num_hash_lookahead_tokens
+                    event_kwargs = {}
+                    if lookahead and req_meta.token_ids is not None:
+                        # An event for a lookahead-dependent hash must carry
+                        # both the block tokens and the following L tokens.
+                        if e + lookahead <= len(req_meta.token_ids):
+                            event_kwargs["lookahead_token_ids"] = [
+                                req_meta.token_ids[e : e + lookahead]
+                            ]
+                        else:
+                            token_ids = []
                     stored_event = BlockStored(
                         block_hashes=[new_block_hashes[idx]],
                         parent_block_hash=(
@@ -1331,7 +1413,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         lora_id=None,
                         medium="cpu",
                         lora_name=None,
-                        group_idx=g_idx,
+                        group_idx=db.metadata.group_id,
+                        **event_kwargs,
                     )
                     stored_events.append(stored_event)
 
@@ -2157,8 +2240,16 @@ class DfkvStoreWorker:
         self.pp_rank = pipeline_rank(
             parallel_config.rank, self.tp_size, self.pcp_size, self.pp_size
         )
-        self.dcp_size = get_dcp_group().world_size
-        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        dcp_group = get_dcp_group()
+        self.dcp_size = dcp_group.world_size
+        self.dcp_rank = dcp_group.rank_in_group if self.dcp_size > 1 else 0
+        group_ranks = getattr(dcp_group, "ranks", None)
+        self._dcp_group_ranks = (
+            tuple(group_ranks) if group_ranks is not None else None
+        )
+        self._dcp_global_rank_base = (
+            parallel_config.rank - self.tp_rank * self.pcp_size - self.pcp_rank
+        )
         self.affinity_rank = physical_affinity_rank(
             local_rank=self.local_rank,
             tp_rank=self.tp_rank,
@@ -2264,31 +2355,36 @@ class DfkvStoreWorker:
             dcp_size=self.dcp_size,
             num_kv_heads=self.num_kv_head,
             use_mla=self.use_mla,
+            dcp_group_ranks=getattr(self, "_dcp_group_ranks", None),
+            dcp_global_rank_base=getattr(self, "_dcp_global_rank_base", 0),
         )
         self.head_or_tp_rank = key_stripe.tp_rank
         self.dcp_rank = key_stripe.dcp_rank
         self.stripe_idx = key_stripe.stripe_idx
         self.stripe_step = key_stripe.stripe_step
+        self._store_group_ids = store_group_ids(kv_cache_config)
+        groups = store_groups(kv_cache_config)
         # Mamba/KDA states are TP-sharded even when attention uses a replicated
-        # MLA latent. UniformTypeKVCacheSpecs must be classified by inner spec.
+        # MLA latent. Packed groups are classified across their distinct specs.
         self._tp_sharded_groups = frozenset(
             g_idx
-            for g_idx, group in enumerate(kv_cache_config.kv_cache_groups)
-            if isinstance(_unwrap_spec(group.kv_cache_spec), MambaSpec)
-            and _prefix_cacheable(group.kv_cache_spec)
+            for g_idx, group in enumerate(groups)
+            if is_mamba_group(group) and prefix_cacheable(group)
         )
         # KV events: how many TP workers share one stored copy of a group's
         # block. Replicated payloads are striped across their replica set, so
         # one worker reports each block; TP-sharded state needs every worker.
-        self.group_tp_replication_factors = tuple(
-            1 if g_idx in self._tp_sharded_groups else key_stripe.stripe_step
-            for g_idx in range(len(kv_cache_config.kv_cache_groups))
-        )
-        self._kv_cache_groups: list[KVCacheGroupSpec] = [
-            dataclasses.replace(
-                group, kv_cache_spec=_effective_cache_spec(group.kv_cache_spec, self.dcp_size)
+        replication_factors = [1] * (max(self._store_group_ids, default=-1) + 1)
+        for g_idx, engine_group_id in enumerate(self._store_group_ids):
+            replication_factors[engine_group_id] = (
+                1 if g_idx in self._tp_sharded_groups else key_stripe.stripe_step
             )
-            for group in kv_cache_config.kv_cache_groups
+        self.group_tp_replication_factors = tuple(replication_factors)
+        self._kv_cache_groups = [
+            resolve_dcp_group(group, self.dcp_size) for group in groups
+        ]
+        self._kv_cache_group_views = [
+            cache_group_view(group) for group in self._kv_cache_groups
         ]
         # Groups whose SAVE sources the next model step may change: recurrent
         # state is updated or copied into blocks, windows free blocks that are
@@ -2297,9 +2393,8 @@ class DfkvStoreWorker:
         # the request until vLLM is told the save is done.
         self._fenced_store_groups = frozenset(
             g_idx
-            for g_idx, group in enumerate(self._kv_cache_groups)
-            if _prefix_cacheable(group.kv_cache_spec)
-            and _save_needs_step_fence(group.kv_cache_spec)
+            for g_idx, view in enumerate(self._kv_cache_group_views)
+            if view.prefix_cacheable and _save_needs_step_fence(view)
         )
 
         # CLIENT_RANKS (issue #111): converge store-side dfkv clients onto a
@@ -2373,7 +2468,10 @@ class DfkvStoreWorker:
         _model_revision = _resolve_model_revision(extra, model_config)
         _cache_dtype = str(
             getattr(self.cache_config, "cache_dtype", "unknown"))
-        _group_layout = _cache_group_layout(kv_cache_config.kv_cache_groups)
+        _group_layout = _cache_group_layout(self._kv_cache_groups)
+        _logical_bytes_per_block = [
+            logical_bytes_per_block(view) for view in self._kv_cache_group_views
+        ]
         key_namespace = canonical_namespace(
             model_identity,
             VLLM_RAW_LAYOUT.decode("ascii"),
@@ -2397,6 +2495,9 @@ class DfkvStoreWorker:
                 "pcp_size": self.pcp_size,
                 "dcp_size": self.dcp_size,
                 "group_layout": _group_layout,
+                "logical_bytes_per_block": json.dumps(
+                    _logical_bytes_per_block, separators=(",", ":")
+                ),
                 "kv_cache_layout": getattr(kv_cache_config, "kv_cache_layout", None),
                 **_byte_order_layout_fields(
                     parallel_config,
@@ -2493,8 +2594,9 @@ class DfkvStoreWorker:
         self.kv_connector_stats = DfkvStoreConnectorStats()
 
         self._kv_cache_config = kv_cache_config
+        manager_groups = manager_api(kv_cache_config)
         spec_cfg = getattr(vllm_config, "speculative_config", None)
-        use_eagle = bool(
+        use_eagle = not manager_groups and bool(
             spec_cfg.use_eagle()
             if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
             else False
@@ -2507,6 +2609,14 @@ class DfkvStoreWorker:
             enable_partial_hash_hits=partial_hash_hits_enabled(
                 kv_cache_config, self.block_size
             ),
+            num_hash_lookahead_tokens=(
+                getattr(vllm_config, "num_hash_lookahead_tokens", 0)
+                if manager_groups
+                else 0
+            ),
+            retention_interval=getattr(
+                kv_cache_config, "prefix_cache_retention_interval", None
+            ),
         )
         # One ChunkedTokenDatabase per group; addresses populated in
         # register_kv_caches once the kv-cache layout is known.
@@ -2514,7 +2624,7 @@ class DfkvStoreWorker:
             ChunkedTokenDatabase(
                 dataclasses.replace(
                     self.metadata,
-                    group_id=g_idx,
+                    group_id=self._store_group_ids[g_idx],
                     # Old state objects used attention's collapsed rank
                     # coordinates. Keep them outside the corrected state pool,
                     # including legacy numeric GQA/DCP coordinate collisions.
@@ -2525,9 +2635,9 @@ class DfkvStoreWorker:
                         else self.head_or_tp_rank
                     ),
                 ),
-                g.kv_cache_spec.block_size,
+                group_block_size(g),
                 hash_block_size=self.hash_block_size,
-                cacheable=_prefix_cacheable(g.kv_cache_spec),
+                cacheable=prefix_cacheable(g),
             )
             for g_idx, g in enumerate(self._kv_cache_groups)
         ]
@@ -2655,8 +2765,8 @@ class DfkvStoreWorker:
         # semantic layer name so independently constructed producer/consumer
         # mappings gather and scatter the same ordered byte stream.
         for layer_name in sorted(kv_caches):
-            g_idx = layer_to_group[layer_name]
-            if not self.token_dbs[g_idx].cacheable:
+            g_idx = layer_to_group.get(layer_name)
+            if g_idx is None or not self.token_dbs[g_idx].cacheable:
                 continue
             tensors = _layer_tensors(kv_caches[layer_name])
             if len(tensors) > 1:
@@ -3092,10 +3202,11 @@ class DfkvStoreWorker:
                 dcp_size=db.metadata.dcp_size,
                 num_kv_heads=self.num_kv_head,
                 use_mla=db.metadata.tp_rank < 0,
-                tp_sharded=isinstance(
-                    _unwrap_spec(self._kv_cache_groups[g_idx].kv_cache_spec),
-                    MambaSpec,
-                ),
+                tp_sharded=is_mamba_group(
+                getattr(self, "_kv_cache_group_views", self._kv_cache_groups)[g_idx]
+            ),
+                dcp_group_ranks=getattr(self, "_dcp_group_ranks", None),
+                dcp_global_rank_base=getattr(self, "_dcp_global_rank_base", 0),
             )
 
         # A key is its namespace's prefix, the hash field and the suffix;
@@ -3132,8 +3243,8 @@ class DfkvStoreWorker:
                 short = list(short_masks[g_idx])
                 if short == list(long_masks[g_idx])[: len(short)]:
                     continue
-                group_hashes = self.coord.block_hashes_for_spec(
-                    block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
+                group_hashes = self.coord.block_hashes_for_group(
+                    block_hashes, self._kv_cache_groups[g_idx]
                 )
                 namespaces = group_namespaces(g_idx)
                 for chunk_id in range(min(hit // db.block_size, len(group_hashes))):
@@ -3175,8 +3286,8 @@ class DfkvStoreWorker:
                 mask = load_masks[g_idx]
                 if not mask:
                     continue
-                group_hashes = self.coord.block_hashes_for_spec(
-                    block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
+                group_hashes = self.coord.block_hashes_for_group(
+                    block_hashes, self._kv_cache_groups[g_idx]
                 )
                 # Key metadata carries this group's CP geometry; a negative
                 # tp_rank is exactly the canonical replicated-MLA coordinate.
@@ -3280,19 +3391,19 @@ class DfkvStoreWorker:
             if token_len <= 0:
                 return 0
             cacheable = sorted(
-                g for _, group_ids, _ in coord.attention_groups for g in group_ids
+                g for entry in coord.attention_groups for g in entry.group_ids
             )
             state_groups = [
                 g for g in cacheable
-                if isinstance(
-                    _unwrap_spec(self._kv_cache_groups[g].kv_cache_spec), MambaSpec
+                if is_mamba_group(
+                    getattr(self, "_kv_cache_group_views", self._kv_cache_groups)[g]
                 )
             ]
             attention_groups = [g for g in cacheable if g not in state_groups]
             block_sizes = {g: self.token_dbs[g].block_size for g in cacheable}
             views = {
-                g: coord.block_hashes_for_spec(
-                    block_hashes, self._kv_cache_groups[g].kv_cache_spec
+                g: coord.block_hashes_for_group(
+                    block_hashes, self._kv_cache_groups[g]
                 )
                 for g in attention_groups
             }
@@ -3314,6 +3425,8 @@ class DfkvStoreWorker:
                         num_kv_heads=self.num_kv_head,
                         use_mla=db.metadata.tp_rank < 0,
                         tp_sharded=g_idx in state_groups,
+                        dcp_group_ranks=getattr(self, "_dcp_group_ranks", None),
+                        dcp_global_rank_base=getattr(self, "_dcp_global_rank_base", 0),
                     ):
                         keys.append(object_key(g_idx, h, tp, pcp, dcp))
                         owners.append((g_idx, h))

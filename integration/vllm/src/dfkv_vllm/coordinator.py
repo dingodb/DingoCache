@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-group persistence and restoration masks for DfkvStoreConnector."""
 
-from typing import cast
+import dataclasses
+from typing import NamedTuple, cast
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -11,16 +12,69 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     KVCacheBlock,
 )
-from vllm.v1.core.single_type_kv_cache_manager import (
-    SingleTypeKVCacheManager,
+
+from .cache_api import (
+    CacheGroupView,
+    cache_group_view,
+    group_block_size,
+    is_full_attention,
+    prefix_cacheable as _prefix_cacheable,
 )
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheGroupSpec,
-    KVCacheSpec,
-    UniformTypeKVCacheSpecs,
-)
-from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+
+class _AttentionGroup(NamedTuple):
+    view: CacheGroupView
+    group_ids: list[int]
+
+
+def _coverage_config(config):
+    """Match core's external-store SWA replay coverage, if configured."""
+    if config is None:
+        return None
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+    if (
+        isinstance(config.params, SlidingWindowManager.Params)
+        and config.params.extra_retained_tokens
+    ):
+        return config.replace_params(
+            sliding_window=(
+                config.params.sliding_window + config.params.extra_retained_tokens
+            ),
+            extra_retained_tokens=0,
+        )
+    return config
+
+
+def _find_hit_blocks(
+    group: _AttentionGroup,
+    *,
+    block_hashes,
+    max_length: int,
+    block_pool: BlockPool,
+    alignment_tokens: int,
+    drop_eagle_block: bool = False,
+):
+    """Call the running engine's manager without hiding either signature."""
+    view = group.view
+    kwargs = dict(
+        block_hashes=block_hashes,
+        max_length=max_length,
+        kv_cache_group_ids=group.group_ids,
+        block_pool=block_pool,
+        alignment_tokens=alignment_tokens,
+    )
+    if view.manager_config is not None:
+        kwargs.update(
+            block_size=view.block_size,
+            manager_config=view.manager_config,
+        )
+    else:
+        kwargs.update(
+            kv_cache_spec=view.registry_spec,
+            drop_eagle_block=drop_eagle_block,
+        )
+    return view.manager_cls.find_longest_cache_hit(**kwargs)
 
 # Dummy placeholder hash for store_mask's template computation.
 _DUMMY_BLOCK_HASH = BlockHash(b"\x00" * 32)
@@ -99,18 +153,20 @@ def _prefix_cacheable(spec):
 
 class DfkvStoreCoordinator:
     """Build per-group cache masks using the running engine's managers."""
+
     def __init__(
         self,
-        kv_cache_groups: list[KVCacheGroupSpec],
+        kv_cache_groups: list,
         scheduler_block_size: int,
         hash_block_size: int,
         use_eagle: bool = False,
         enable_partial_hash_hits: bool = False,
+        num_hash_lookahead_tokens: int = 0,
+        retention_interval: int | None = None,
     ) -> None:
-
+        views = [cache_group_view(group) for group in kv_cache_groups]
         participating = [
-            (_prefix_cacheable(g.kv_cache_spec), g.kv_cache_spec.block_size)
-            for g in kv_cache_groups
+            (view.prefix_cacheable, view.block_size) for view in views
         ]
         assert all(
             size % hash_block_size == 0
@@ -126,15 +182,22 @@ class DfkvStoreCoordinator:
             f"hash_block_size ({hash_block_size})"
         )
         assert all(
-            scheduler_block_size % g.kv_cache_spec.block_size == 0
-            for g in kv_cache_groups
+            scheduler_block_size % view.block_size == 0
+            for view in views
+            if view.prefix_cacheable
         ), "scheduler_block_size must be a multiple of each group's block_size"
         self.kv_cache_groups = kv_cache_groups
+        self._views = views
+        self._manager_api = bool(views and views[0].manager_config is not None)
         self.hash_block_size = hash_block_size
         self.lcm_block_size = scheduler_block_size
-        self.use_eagle = use_eagle
-        # Core's decision: whether hits land on the hash block, below the
-        # scheduler block. Regular saves stay on the scheduler block grid.
+        # Modern engines prove draft KV with lookahead hashes instead of
+        # dropping a trailing block. Legacy engines keep the old indication.
+        self.use_eagle = use_eagle and not self._manager_api
+        self.num_hash_lookahead_tokens = (
+            num_hash_lookahead_tokens if self._manager_api else 0
+        )
+        self.retention_interval = retention_interval if self._manager_api else None
         self.enable_partial_hash_hits = enable_partial_hash_hits
         self.hit_alignment = (
             hash_block_size if enable_partial_hash_hits else scheduler_block_size
@@ -142,35 +205,39 @@ class DfkvStoreCoordinator:
         self._verify_and_split_kv_cache_groups()
 
     def _verify_and_split_kv_cache_groups(self) -> None:
-        """Group equal specs and resolve their engine-owned managers."""
-        attention_groups: list[
-            tuple[KVCacheSpec, list[int], type[SingleTypeKVCacheManager]]
-        ] = []
-        for i, g in enumerate(self.kv_cache_groups):
-            spec = _unwrap_spec(g.kv_cache_spec)
-            if not _prefix_cacheable(g.kv_cache_spec):
-                continue
-            manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
-            assert manager_cls is not None, (
-                f"No manager registered for KVCacheSpec {spec}"
-            )
-            for existing_spec, group_ids, existing_cls in attention_groups:
-                if existing_spec == spec:
-                    assert manager_cls is existing_cls
-                    group_ids.append(i)
-                    break
-            else:
-                attention_groups.append((spec, [i], manager_cls))
+        """Resolve the same joint lookups as the running engine core."""
+        attention_groups: list[_AttentionGroup] = []
+        if self._manager_api:
+            from vllm.v1.kv_cache_interface import prefix_lookup_groups
+
+            for lookup in prefix_lookup_groups(self.kv_cache_groups):
+                first = dataclasses.replace(
+                    self._views[lookup.group_ids[0]],
+                    manager_config=_coverage_config(
+                        self._views[lookup.group_ids[0]].manager_config
+                    ),
+                )
+                attention_groups.append(_AttentionGroup(first, lookup.group_ids))
+        else:
+            for index, view in enumerate(self._views):
+                if not view.prefix_cacheable:
+                    continue
+                for existing in attention_groups:
+                    if existing.view.registry_spec == view.registry_spec:
+                        assert existing.view.manager_cls is view.manager_cls
+                        existing.group_ids.append(index)
+                        break
+                else:
+                    attention_groups.append(_AttentionGroup(view, [index]))
         self.attention_groups = attention_groups
         self.eagle_attn_group_indices: set[int] = {
             i
-            for i, (_, group_ids, _) in enumerate(self.attention_groups)
+            for i, (_, group_ids) in enumerate(self.attention_groups)
             if self.use_eagle
             and any(self.kv_cache_groups[gid].is_eagle_group for gid in group_ids)
         }
         if self.use_eagle and not self.eagle_attn_group_indices:
             self.eagle_attn_group_indices = set(range(len(self.attention_groups)))
-
 
     def load_mask(
         self,
@@ -183,11 +250,59 @@ class DfkvStoreCoordinator:
             aligned, drop_eagle=False, alignment=self.hit_alignment
         )
 
-    def store_mask(self, aligned_token_len: int) -> tuple[list[bool], ...]:
-        """Persist only stable context, never a volatile draft/lookahead tail."""
+    def store_mask(
+        self, aligned_token_len: int, *, num_prompt_tokens: int | None = None
+    ) -> tuple[list[bool], ...]:
+        """Persist stable blocks using the running engine's retention policy."""
+        if self._manager_api:
+            return self._modern_store_mask(
+                aligned_token_len, num_prompt_tokens=num_prompt_tokens
+            )
         return self._cache_mask(
             aligned_token_len, drop_eagle=True, alignment=self.lcm_block_size
         )
+
+    def _modern_store_mask(
+        self, aligned_token_len: int, *, num_prompt_tokens: int | None
+    ) -> tuple[list[bool], ...]:
+        if aligned_token_len == 0:
+            return tuple([] for _ in self.kv_cache_groups)
+        assert aligned_token_len % self.lcm_block_size == 0
+        from vllm.v1.core.kv_cache_coordinator import replay_boundaries
+        from .cache_api import is_mamba_group
+
+        replay = (
+            ()
+            if num_prompt_tokens is None
+            else replay_boundaries(
+                num_prompt_tokens,
+                num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
+            )
+        )
+        masks: list[list[bool]] = [[] for _ in self.kv_cache_groups]
+        for index, view in enumerate(self._views):
+            if not view.prefix_cacheable:
+                continue
+            end_block = aligned_token_len // view.block_size
+            if is_mamba_group(view):
+                # Modern core exports recurrent states only through exact
+                # boundary hand-offs, never by position in the live table.
+                masks[index] = [False] * end_block
+                continue
+            mask = view.manager_cls.reachable_block_mask(
+                start_block=0,
+                end_block=end_block,
+                alignment_tokens=self.lcm_block_size,
+                block_size=view.block_size,
+                manager_config=_coverage_config(view.manager_config),
+                retention_interval=self.retention_interval,
+                reachable_boundaries=replay,
+                dcp_world_size=1,
+            )
+            masks[index] = (
+                [True] * end_block if mask is None else mask
+            )
+        return tuple(masks)
 
     def _cache_mask(
         self,
@@ -208,26 +323,25 @@ class DfkvStoreCoordinator:
         )
         block_pool = _TemplateBlockPool(hash_block_size=self.hash_block_size)
         masks: list[list[bool]] = [[] for _ in self.kv_cache_groups]
-        for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
-            # Fine-grained managers probe interior hash boundaries, so they
-            # take the raw hash-block list and view whole blocks themselves.
+        for index, group in enumerate(self.attention_groups):
             hashes = (
                 dummy_hashes
                 if alignment < self.lcm_block_size
-                else self.block_hashes_for_spec(dummy_hashes, spec)
+                else self._block_hashes_for_size(dummy_hashes, group.view.block_size)
             )
             hit_blocks = _unwrap_hit_blocks(
-                manager_cls.find_longest_cache_hit(
+                _find_hit_blocks(
+                    group,
                     block_hashes=hashes,
                     max_length=aligned_token_len,
-                    kv_cache_group_ids=group_ids,
                     block_pool=cast(BlockPool, block_pool),
-                    kv_cache_spec=spec,
-                    drop_eagle_block=drop_eagle and idx in self.eagle_attn_group_indices,
                     alignment_tokens=alignment,
+                    drop_eagle_block=(
+                        drop_eagle and index in self.eagle_attn_group_indices
+                    ),
                 )
             )
-            for group_id, blocks in zip(group_ids, hit_blocks, strict=True):
+            for group_id, blocks in zip(group.group_ids, hit_blocks, strict=True):
                 masks[group_id] = [
                     block is not block_pool.null_block for block in blocks
                 ]
@@ -241,38 +355,32 @@ class DfkvStoreCoordinator:
     ) -> int:
         """Hash-block-granular hit length over ``block_pool``.
 
-        Converges the registered managers as vLLM core's
-        ``HybridKVCacheCoordinator`` does (ported from the Mooncake store
-        connector); requires ``enable_partial_hash_hits``. No Eagle block is
-        dropped, matching ``load_mask``.
+        Converges managers as the core coordinator does. Modern lookahead
+        hashes already prove draft boundaries; no API-era EAGLE block drop
+        is applied here on either engine generation.
         """
         groups = sorted(
             self.attention_groups,
-            key=lambda g: not isinstance(g[0], FullAttentionSpec),
+            key=lambda group: not is_full_attention(group.view),
         )
-        is_simple_hybrid = len(groups) == 2 and isinstance(
-            groups[0][0], FullAttentionSpec
-        )
+        is_simple_hybrid = len(groups) == 2 and is_full_attention(groups[0].view)
         full_attention_hits: dict[int, int] = {}
         hit_length = max_length
         while True:
             curr_hit_length = hit_length
-            for idx, (spec, group_ids, manager_cls) in enumerate(groups):
-                if idx in full_attention_hits:
-                    # A full-attention hit only shrinks with the bound.
-                    curr_hit_length = min(curr_hit_length, full_attention_hits[idx])
+            for index, group in enumerate(groups):
+                if index in full_attention_hits:
+                    curr_hit_length = min(curr_hit_length, full_attention_hits[index])
                     continue
-                _, curr_hit_length = manager_cls.find_longest_cache_hit(
+                _, curr_hit_length = _find_hit_blocks(
+                    group,
                     block_hashes=block_hashes,
                     max_length=curr_hit_length,
-                    kv_cache_group_ids=group_ids,
                     block_pool=cast(BlockPool, block_pool),
-                    kv_cache_spec=spec,
-                    drop_eagle_block=False,
                     alignment_tokens=self.hash_block_size,
                 )
-                if isinstance(spec, FullAttentionSpec):
-                    full_attention_hits[idx] = curr_hit_length
+                if is_full_attention(group.view):
+                    full_attention_hits[index] = curr_hit_length
             if curr_hit_length >= hit_length:
                 break
             hit_length = curr_hit_length
@@ -281,16 +389,19 @@ class DfkvStoreCoordinator:
         return hit_length
 
     def partial_tail_boundary(self, num_prompt_tokens: int) -> int | None:
-        """The prompt's recurrent-state checkpoint when it ends inside a
-        scheduler block, else None.
-
-        Mirrors core's ``get_mamba_prefill_checkpoint_position``: vLLM hands
-        off the state there, and a resend can hit at most up to it.
-        """
+        """Return the prompt's recurrent-state checkpoint inside an LCM block."""
         if not self.enable_partial_hash_hits:
             return None
         hbs = self.hash_block_size
-        if self.use_eagle:
+        if self._manager_api:
+            from vllm.v1.kv_cache_interface import get_reusable_prefix_length
+
+            boundary = get_reusable_prefix_length(
+                num_prompt_tokens,
+                num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
+                alignment_tokens=hbs,
+            )
+        elif self.use_eagle:
             boundary = num_prompt_tokens // hbs * hbs - hbs
         else:
             boundary = (num_prompt_tokens - 1) // hbs * hbs
@@ -298,18 +409,18 @@ class DfkvStoreCoordinator:
             return None
         return boundary
 
-    def block_hashes_for_spec(
-        self, block_hashes: list[BlockHash], spec: KVCacheSpec
+    def _block_hashes_for_size(
+        self, block_hashes: list[BlockHash], block_size: int
     ) -> BlockHashList:
-        if spec.block_size == self.hash_block_size:
+        if block_size == self.hash_block_size:
             return block_hashes
         return BlockHashListWithBlockSize(
-            block_hashes, self.hash_block_size, spec.block_size
+            block_hashes, self.hash_block_size, block_size
         )
 
-
-
-def _unwrap_spec(spec: KVCacheSpec) -> KVCacheSpec:
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        return next(iter(spec.kv_cache_specs.values()))
-    return spec
+    def block_hashes_for_group(
+        self, block_hashes: list[BlockHash], group
+    ) -> BlockHashList:
+        return self._block_hashes_for_size(
+            block_hashes, group_block_size(group)
+        )

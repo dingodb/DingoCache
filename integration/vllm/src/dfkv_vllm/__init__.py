@@ -9,7 +9,7 @@
         "lib":"/path/to/libdfkv.so"}}'
 
 The exact model identity comes from vLLM and is bound to the source-controlled
-``vllm-multiwr-v4`` layout ID; operator namespace aliases are rejected.
+``vllm-multiwr-v5`` layout ID; operator namespace aliases are rejected.
 """
 from .dfkv_client import DfkvDeviceClient
 

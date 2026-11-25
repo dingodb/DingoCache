@@ -28,7 +28,7 @@ import torch  # noqa: F401  (spec dtype; provided by the runtime image)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+from _cache_api import cache_group, full_attention_spec
 
 from dfkv_vllm.coordinator import DfkvStoreCoordinator
 from dfkv_vllm.data import KeyMetadata, PoolKey
@@ -85,13 +85,13 @@ class _RecordingClient:
 def _run_lookup(
     md: KeyMetadata, store: set[bytes], hashes: list[BlockHash]
 ) -> tuple[int, list[bytes]]:
-    spec = FullAttentionSpec(
+    spec = full_attention_spec(
         block_size=BLOCK,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.bfloat16,
     )
-    groups = [KVCacheGroupSpec([f"layer{i}" for i in range(43)], spec)]
+    groups = [cache_group([f"layer{i}" for i in range(43)], spec)]
     coord = DfkvStoreCoordinator(
         groups, scheduler_block_size=BLOCK, hash_block_size=BLOCK
     )

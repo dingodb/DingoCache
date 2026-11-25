@@ -26,21 +26,21 @@ from vllm.v1.core.kv_cache_utils import (
 
 logger = init_logger(__name__)
 
-# Bind full cache-spec geometry and stable draft context to a new identity.
-# Older payloads may have incompatible indexer layouts or volatile draft tails;
+# Bind cache layout, manager policy and stable draft/lookahead semantics to a
+# new identity. Older payloads may have incompatible layouts or draft tails;
 # they must cold-miss rather than enter the current restore path.
-VLLM_RAW_LAYOUT = b"vllm-multiwr-v4"
+VLLM_RAW_LAYOUT = b"vllm-multiwr-v5"
 
 
 def requires_request_level_loads(kv_cache_config) -> bool:
     """Use request identities when physical groups cannot share a block grid."""
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from .cache_api import is_full_attention
 
     groups = getattr(
         kv_cache_config, "transfer_groups", kv_cache_config.kv_cache_groups
     )
     return len(groups) > 1 or any(
-        not isinstance(group.kv_cache_spec, FullAttentionSpec) for group in groups
+        not is_full_attention(group) for group in groups
     )
 
 def key_diagnostic_label(key: bytes) -> str:
@@ -518,6 +518,10 @@ class ReqMeta:
     # a hybrid model into its mutable-source groups, which the model step
     # waits for, and the rest, which it does not.
     save_groups: frozenset[int] | None = None
+    # Prompt and lookahead policy needed by manager-owned STORE masks and
+    # BlockStored events. Zero/None retain the legacy metadata behavior.
+    prefill_end_tokens: int | None = None
+    num_hash_lookahead_tokens: int = 0
 
     @staticmethod
     def from_request_tracker(
@@ -528,6 +532,8 @@ class ReqMeta:
         block_hashes: list[BlockHash] | None = None,
         num_prompt_tokens: int | None = None,
         with_token_ids: bool = True,
+        hash_block_size: int | None = None,
+        num_hash_lookahead_tokens: int = 0,
     ) -> "ReqMeta | None":
         """Create ReqMeta from a RequestTracker.
 
@@ -541,12 +547,31 @@ class ReqMeta:
 
         chunk_boundary = cdiv(tracker.num_saved_tokens + 1, block_size) * block_size
         num_tokens_to_save = input_token_len // block_size * block_size
+        if hash_block_size is not None:
+            # Lookahead hashes can trail computed KV by L tokens. Never move
+            # the durable watermark over a key the engine has not emitted.
+            num_tokens_to_save = min(
+                num_tokens_to_save,
+                len(block_hashes) * hash_block_size // block_size * block_size,
+            )
 
         publish_tail = (
             num_prompt_tokens is not None
             and not tracker.partial_tail_sent
             and 0 < num_prompt_tokens <= input_token_len
         )
+        if hash_block_size is not None and num_prompt_tokens is not None:
+            from vllm.v1.kv_cache_interface import get_reusable_prefix_length
+
+            boundary = get_reusable_prefix_length(
+                num_prompt_tokens,
+                num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+                alignment_tokens=hash_block_size,
+            )
+            publish_tail = publish_tail and boundary > 0 and (
+                boundary % block_size != 0
+                and boundary <= len(block_hashes) * hash_block_size
+            )
         skip_save = skip_save or (
             num_tokens_to_save < chunk_boundary and not publish_tail
         )
@@ -596,6 +621,8 @@ class ReqMeta:
             num_prompt_tokens=(
                 num_prompt_tokens if publish_tail and not skip_save else None
             ),
+            prefill_end_tokens=tracker.prefill_end_tokens or num_prompt_tokens,
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
 
 

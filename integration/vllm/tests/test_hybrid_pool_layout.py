@@ -10,10 +10,7 @@ import torch
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from vllm.v1.kv_cache_interface import (  # noqa: E402
-    FullAttentionSpec,
-    KVCacheGroupSpec,
-)
+from _cache_api import cache_group, full_attention_spec  # noqa: E402
 
 
 from dfkv_vllm.data import (  # noqa: E402
@@ -158,14 +155,14 @@ def test_invalid_segment_layout_fails_closed():
 
 
 def test_cross_layer_registration_uses_real_group_zero_layer(monkeypatch):
-    spec = FullAttentionSpec(
+    spec = full_attention_spec(
         block_size=16,
         num_kv_heads=1,
         head_size=4,
         dtype=torch.float16,
     )
     groups = [
-        KVCacheGroupSpec(["model.layers.0.self_attn"], spec),
+        cache_group(["model.layers.0.self_attn"], spec),
     ]
     db = ChunkedTokenDatabase(_METADATA, block_size=16)
     registered = []
@@ -214,14 +211,14 @@ def test_cross_layer_registration_uses_real_group_zero_layer(monkeypatch):
 
 
 def test_cross_layer_registration_rejects_group_without_layer_names():
-    spec = FullAttentionSpec(
+    spec = full_attention_spec(
         block_size=16,
         num_kv_heads=1,
         head_size=4,
         dtype=torch.float16,
     )
     worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
-    worker._kv_cache_groups = [KVCacheGroupSpec([], spec)]
+    worker._kv_cache_groups = [cache_group([], spec)]
 
     with pytest.raises(RuntimeError, match="group 0 has no real layer names"):
         worker.register_cross_layers_kv_caches(
