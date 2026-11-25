@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.43.0 — 2026-11-25
+
 - Server, failed disks (STO-16 follow-up): a disk excluded from takeover (it
   kept a key of another disk the start could not remove) no longer counts
   toward `DFKV_DEGRADED_MIN_DISKS` once a disk has failed. With every
