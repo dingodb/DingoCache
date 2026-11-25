@@ -122,6 +122,7 @@ std::atomic<uint64_t> g_lease_read_mr_active{0};
 std::atomic<uint64_t> g_cq_completions{0};
 std::function<bool()> g_window_alloc_seam;  // test seam, see header
 std::function<int(ibv_mw*)> g_window_dealloc_seam;  // test seam, see header
+std::function<void(ibv_mw*)> g_window_bind_observer;  // test seam, see header
 std::atomic<uint64_t> g_cq_errors{0};
 
 
@@ -1293,6 +1294,11 @@ void RcEndpoint::SetWindowDeallocSeamForTest(std::function<int(ibv_mw*)> seam) {
   g_window_dealloc_seam = std::move(seam);
 }
 
+void RcEndpoint::SetWindowBindObserverForTest(
+    std::function<void(ibv_mw*)> observer) {
+  g_window_bind_observer = std::move(observer);
+}
+
 bool RcEndpoint::AllocWindows(size_t n) {
   if (!pd_ || !windows_.empty()) return false;
   for (size_t i = 0; i < n; ++i) {
@@ -1328,6 +1334,7 @@ bool RcEndpoint::PostBindWindow(size_t i, ibv_mr* region, const void* addr,
   wr.bind_mw.bind_info.length = len;
   wr.bind_mw.bind_info.mw_access_flags = IBV_ACCESS_REMOTE_READ;
   if (ibv_post_send(qp_, &wr, &bad) != 0) return false;
+  if (g_window_bind_observer) g_window_bind_observer(windows_[i]);
   // The window's current key, which the next bind must name (Soft-RoCE
   // refuses a bind that names an older one); a posted bind does not update
   // it as ibv_bind_mw does.

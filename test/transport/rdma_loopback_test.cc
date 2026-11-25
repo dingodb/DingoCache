@@ -13539,18 +13539,41 @@ TEST(RdmaServerMw, ARefusedWindowDeallocationIsRetriedBeforeTheQpGoes) {
   ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
   ScopedEnv grant("DFKV_RDMA_GRANT_TIMEOUT_MS", "300");
   SmallRamTier ram_env;
-  std::atomic<int> refused{0};
-  rdma::RcEndpoint::SetWindowDeallocSeamForTest([&](ibv_mw*) {
-    refused.fetch_add(1);
-    return EBUSY;
+  // Reject the initial close deallocation and its post-ERR retry for the
+  // bound window, then use the real verb. A permanent refusal would destroy
+  // the QP while the provider still considers that window bound: on rxe that
+  // blocks this bounded test for about 50 seconds. It is not a valid recovery
+  // expectation: production's fail-closed rule cannot discard ownership just
+  // to satisfy an always-failing injection.
+  std::mutex refused_mu;
+  std::unordered_map<ibv_mw*, int> refusals;
+  ibv_mw* last_bind_mw = nullptr;
+  ibv_mw* bound_mw = nullptr;
+  rdma::RcEndpoint::SetWindowBindObserverForTest([&](ibv_mw* mw) {
+    std::lock_guard<std::mutex> lk(refused_mu);
+    last_bind_mw = mw;
+  });
+  rdma::RcEndpoint::SetWindowDeallocSeamForTest([&](ibv_mw* mw) {
+    // The bind observer, not an rkey heuristic, identifies this exact bound
+    // grant. Unbound/preallocated MWs must release normally and never consume
+    // this grant's transient failures.
+    std::lock_guard<std::mutex> lk(refused_mu);
+    if (mw != bound_mw) return ibv_dealloc_mw(mw);
+    if (refusals[mw]++ < 2) return EBUSY;
+    return ibv_dealloc_mw(mw);
   });
   struct Restore {
-    ~Restore() { rdma::RcEndpoint::SetWindowDeallocSeamForTest(nullptr); }
+    ~Restore() {
+      rdma::RcEndpoint::SetWindowDeallocSeamForTest(nullptr);
+      rdma::RcEndpoint::SetWindowBindObserverForTest(nullptr);
+    }
   } restore;
   MwEvents events;
   BeforeStart seam([&](RdmaServer& server) {
     RdmaServerTestPeer::SetMwEvents(
         server, [&](const char* name, const void* at) { events.Note(name, at); });
+    RdmaServerTestPeer::SetBeforeEndpointTeardown(
+        &server, [&] { events.Note("teardown", nullptr); });
   });
   RdmaNode node("mw-dealloc-retry");
   if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
@@ -13562,15 +13585,36 @@ TEST(RdmaServerMw, ARefusedWindowDeallocationIsRetriedBeforeTheQpGoes) {
     ASSERT_TRUE(peer.Open(node));
     rdma::DynamicPullReady ready;
     ASSERT_TRUE(PrepareWindowed(node, peer, key, 0, value.size(), &ready));
+    {
+      // PrepareWindowed returns only after an actual windowed grant is admitted.
+      // Freeze that exact final bind: any earlier setup/candidate bind or other
+      // connection must not be mistaken for the live grant being torn down.
+      std::lock_guard<std::mutex> lk(refused_mu);
+      bound_mw = last_bind_mw;
+      rdma::RcEndpoint::SetWindowBindObserverForTest(nullptr);
+      ASSERT_NE(bound_mw, nullptr);
+    }
     const void* at = reinterpret_cast<const void*>(ready.address);
     const auto closed = std::chrono::steady_clock::now();
     peer.Close();  // never released: the grant timeout closes it
-    ASSERT_TRUE(events.WaitFor(at, "released", 5000));
+    ASSERT_TRUE(events.WaitFor(nullptr, "teardown", 2000));
+    ASSERT_TRUE(events.WaitFor(at, "quarantined", 2000));
+    ASSERT_TRUE(events.WaitFor(at, "released", 3000));
     EXPECT_LT(std::chrono::steady_clock::now() - closed,
-              std::chrono::seconds(3))
+              std::chrono::seconds(2))
         << "the close waited on the bound window";
+    const auto life = events.For(at);
+    ASSERT_EQ(life.size(), 2u);
+    EXPECT_EQ(life[0].name, "quarantined");
+    EXPECT_EQ(life[1].name, "released");
+    std::lock_guard<std::mutex> lk(refused_mu);
+    // One windowed grant is held by this connection. Two injected refusals
+    // precede its real deallocation after QP-to-ERR transition. This counts
+    // all attempts by the selected bound MW, not just refused attempts: two
+    // EBUSY returns followed by the real verbs invocation.
+    ASSERT_EQ(refusals.size(), 1u);
+    EXPECT_EQ(refusals.begin()->second, 3);
   }
-  EXPECT_GE(refused.load(), 1);
   // The server goes on serving.
   PinnedPullPeer again;
   ASSERT_TRUE(again.Open(node));

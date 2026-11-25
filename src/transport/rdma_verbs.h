@@ -511,6 +511,9 @@ class RcEndpoint {
   // Test seam: replaces Close()'s first deallocation of each window (the
   // retry after the QP's destruction is real); nonzero fails it.
   static void SetWindowDeallocSeamForTest(std::function<int(ibv_mw*)> seam);
+  // Test seam: observes the exact window after its bind was posted. No bind
+  // semantics change; the callback is absent in production.
+  static void SetWindowBindObserverForTest(std::function<void(ibv_mw*)> observer);
   void set_num_qp(size_t n) { num_qp_ = n > 0 ? n : 1; }
   size_t num_qp() const { return num_qp_; }
   // The QP's access flags as the device reports them; -1 if it cannot say.
