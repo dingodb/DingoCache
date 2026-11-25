@@ -295,11 +295,9 @@ TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
     std::string value(4097, '\0');
     for (size_t i = 0; i < value.size(); ++i)
       value[i] = static_cast<char>('a' + (i % 23));
-    AlignedBuffer seed(value.size());
-    std::memcpy(seed.data(), value.data(), value.size());
-    ASSERT_EQ(server.CacheDirectForKey(
-                  Key(92), seed.data(), value.size(), seed.size()),
-              Status::kOk);
+    ASSERT_EQ(server.ProcessRequestForKey(
+                  static_cast<uint8_t>(WireOp::kCache), Key(92), 0,
+                  value.size(), value.data(), value.size(), nullptr), Status::kOk);
     AlignedBuffer staging(1 << 20);
 
     PreparedRead read =

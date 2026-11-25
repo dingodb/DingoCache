@@ -213,6 +213,7 @@ if(DFKV_BUILD_TESTS)
   file(GLOB_RECURSE DFKV_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/*_test.cc)
   # rdma_loopback_test needs the RDMA transport/server symbols -> RDMA build only.
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
+  list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_mw_test.cc)
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_lease_loopback_test.cc)
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_lease_client_test.cc)
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/qp_depth_negotiation_test.cc)
