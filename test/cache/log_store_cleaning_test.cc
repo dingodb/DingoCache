@@ -15,6 +15,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
@@ -124,12 +125,24 @@ TEST(LogStoreCleaner, APinnedOldestSegmentDoesNotStallTheCleaner) {
     if (st == Status::kOk && id % 3 != 2)
       EXPECT_EQ(s.Retain(Key(id), 600, 0, now), kProtectedNew) << id;
   }
-  const auto st = s.GetStats();
+  // Background cleanup starts when the producer crosses the watermark; on
+  // a sanitizer run the producer can finish the short loop before the cleaner
+  // gets a scheduling opportunity. Wait for the first reclaimed segment while
+  // keeping the pinned-oldest record and protected-value expectations.
+  bool reclaimed = false;
+  std::optional<LogStore::Stats> st;
+  for (int i = 0; i < 2000; ++i) {
+    st = s.GetStats();
+    reclaimed = st->segments_reclaimed - st->inline_reclaims > 0;
+    if (reclaimed) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(reclaimed)
+      << "the cleaner did not advance while the oldest segment was pinned";
   RecordProperty("cache_full", static_cast<int>(cache_full));
-  RecordProperty("skipped_pins", static_cast<int>(st.victims_skipped_pins));
-  EXPECT_GT(st.segments_reclaimed - st.inline_reclaims, 0u)
-      << "the cleaner reclaimed nothing while the oldest segment was pinned";
-  EXPECT_EQ(st.protected_evictions, 0u);
+  RecordProperty("skipped_pins", static_cast<int>(st->victims_skipped_pins));
+  EXPECT_EQ(st->protected_evictions, 0u);
+
   fs::remove_all(dir);
 }
 
