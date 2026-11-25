@@ -13447,13 +13447,18 @@ TEST(RdmaServerMw, ArenaPinBudgetSurvivesEarlyStagingRelease) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv mw("DFKV_RDMA_SERVER_MW", "1");
   ScopedEnv cap("DFKV_RDMA_SERVER_MW_QUARANTINE_BYTES", "8388608");
-  RdmaNode node("mw-pin-budget", 1024 * 1024);
-  if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
+  // This test concerns the allocation retained by a RAM arena. Do not mistake
+  // its absence for the provider lacking type-2B windows and silently skip it.
+  SmallRamTier ram_env;
   MwEvents events;
   BeforeStart seam([&](RdmaServer& server) {
     RdmaServerTestPeer::SetMwEvents(
         server, [&](const char* name, const void* at) { events.Note(name, at); });
   });
+  // Install the observation hook before RdmaNode::Start: the grant's release
+  // may complete during Start, before Promote or PinnedPullPeer::Open.
+  RdmaNode node("mw-pin-budget", 1024 * 1024);
+  if (MwMode(*node.rsrv) != 1) GTEST_SKIP() << kNoWindows;
   const BlockKey key = ToBlockKey(SelfHdr(), "pin-budget-tiny");
   const std::string value(1, 'v');
   ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
@@ -13467,9 +13472,19 @@ TEST(RdmaServerMw, ArenaPinBudgetSurvivesEarlyStagingRelease) {
   ASSERT_TRUE(PrepareWindowed(node, peer, key, 0, value.size(), &ready));
   ASSERT_TRUE(peer.Release(key, ready));
   const void* at = reinterpret_cast<const void*>(ready.address);
-  ASSERT_TRUE(events.WaitFor(at, "released", 2000));
+  const bool released = events.WaitFor(at, "released", 2000);
+  if (!released) {
+    ADD_FAILURE() << "no release event, MW metrics:\n" << node.rsrv->MetricsText();
+    for (const auto& event : events.events)
+      ADD_FAILURE() << "event=" << event.name << " at=" << event.at
+                    << " (range=" << at << ")";
+    for (const auto& event : events.For(at))
+      ADD_FAILURE() << "range-event=" << event.name;
+  }
+  ASSERT_TRUE(released);
   EXPECT_EQ(RdmaServerTestPeer::MwReservedBytes(*node.rsrv), 0u);
-  EXPECT_EQ(MwCounter(*node.rsrv, "dfkv_rdma_server_mw_quarantine_bytes"), before);
+  const long after = MwCounter(*node.rsrv, "dfkv_rdma_server_mw_quarantine_bytes");
+  EXPECT_EQ(after, before) << "before=" << before << " after=" << after;
 }
 
 
