@@ -503,8 +503,6 @@ class KVClient {
   std::mutex absent_remove_mu_;
   std::map<std::string, std::set<std::string>> absent_removes_;
   std::map<std::string, uint64_t> absent_returned_;  // id -> when it came back
-  // Returned members whose PeerHealth cooldown the first retry may end.
-  std::set<std::string> absent_cooldown_reset_;
   size_t absent_removes_queued_ = 0;
   size_t absent_remove_cap_ = 4096;
   std::atomic<uint64_t> absent_dropped_grace_{0}, absent_dropped_bound_{0},

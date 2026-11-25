@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+
+- Client, absent grace: a member's return to the view ends its PeerHealth
+  cooldown (once, as a probe answer) in every client, not only in one with
+  REMOVEs queued for it. A reader that had cooled the member before it
+  vanished skipped it until its backoff ended (up to 30 s); its next read
+  now goes to the member (CLI-36).
 - Client: previous-owner read-back (CLI-02 stage B), behind
   `DFKV_RING_READBACK_MS` (default 0 = off; MDS discovery only; needs the
   nodes' recent-REMOVE memory). Within the window after a write-ring change

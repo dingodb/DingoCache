@@ -456,6 +456,34 @@ TEST_P(AbsentGrace, TheRetryIsNotSkippedByTheCooldownTheAbsenceStarted) {
   EXPECT_EQ(Metric(client, "dfkv_client_ring_absent_removes_dropped_total"), "0");
 }
 
+// The return is a probe answer in every client, not only one with REMOVEs
+// to retry: a reader that cooled the member before it vanished reads it at
+// once when it is back, instead of waiting out the backoff.
+TEST_P(AbsentGrace, AReaderWithoutQueuedRemovesReadsAReturnedMemberAtOnce) {
+  ScopedEnv grace("DFKV_RING_ABSENT_GRACE_MS", "60000");
+  ScopedEnv busy("DFKV_PEER_BAD_GRACE_MS", "1");
+  ScopedEnv cooldown("DFKV_PEER_COOLDOWN_MS", "60000");
+  KVClient client({}, kNs, &t);
+  client.SetMembers(View(kIds));
+  const std::string v(16, 'v');
+  const auto keys = KeysOwnedBy("b", 2, "reader-");
+  for (const auto& key : keys) ASSERT_TRUE(client.Put(key, v.data(), v.size()));
+  t.down.insert(Addr("b"));
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));  // past the busy grace
+  std::string out(v.size(), '\0');
+  EXPECT_FALSE(client.Get(keys[0], &out[0], out.size()));  // b cools down
+  ASSERT_NE(client.MetricsSnapshot().find("dfkv_client_peer_marked_bad_total 1"),
+            std::string::npos)
+      << "b did not cool down; the test proves nothing";
+  client.SetMembers(View({"a", "c"}));  // b vanishes: absent
+  t.down.clear();
+  client.SetMembers(View(kIds));        // and is back, its data kept
+  EXPECT_EQ(Metric(client, "dfkv_client_ring_absent_removes_retried_total"), "0")
+      << "this reader had REMOVEs queued; the test proves nothing";
+  EXPECT_TRUE(client.Get(keys[1], &out[0], out.size()))
+      << "the returned member was still skipped as cooling";
+}
+
 // A member back but still failing keeps its REMOVEs: they are sent again at
 // each tick until confirmed.
 TEST_P(AbsentGrace, AnUnconfirmedRetryIsSentAgainAtTheNextTick) {

@@ -820,7 +820,6 @@ void KVClient::QueueAbsentRemove(const std::string& id,
 void KVClient::DropAbsentRemoves(const std::string& id) {
   std::lock_guard<std::mutex> lk(absent_remove_mu_);
   absent_returned_.erase(id);
-  absent_cooldown_reset_.erase(id);
   const auto it = absent_removes_.find(id);
   if (it == absent_removes_.end()) return;
   absent_removes_dropped_.fetch_add(it->second.size(),
@@ -830,16 +829,28 @@ void KVClient::DropAbsentRemoves(const std::string& id) {
 }
 
 void KVClient::NoteAbsentReturned(const std::string& id, bool returned) {
+  const uint64_t now = NowMs();
+  if (returned) {
+    // Its return to the view is as good as a probe answer, in every client:
+    // end the cooldown its failures during the absence started, so that the
+    // next request (a read, or the REMOVE retry below) is the trial instead
+    // of waiting out the backoff. Once per incident, as any probe answer.
+    std::string addr;
+    {
+      std::lock_guard<std::mutex> lk(ring_mu_);
+      const auto it = addr_.find(id);
+      if (it != addr_.end()) addr = it->second;
+    }
+    if (!addr.empty()) health_.MarkProbeAlive(addr, now);
+  }
   std::lock_guard<std::mutex> lk(absent_remove_mu_);
   if (!returned) {
     // Gone again: its REMOVEs wait for the next return.
     absent_returned_.erase(id);
-    absent_cooldown_reset_.erase(id);
     return;
   }
   if (absent_removes_.count(id) == 0) return;
-  absent_returned_[id] = NowMs();
-  absent_cooldown_reset_.insert(id);
+  absent_returned_[id] = now;
 }
 
 void KVClient::RetryAbsentRemoves() {
@@ -847,7 +858,6 @@ void KVClient::RetryAbsentRemoves() {
   struct Work {
     std::string id;
     std::vector<std::string> keys;
-    bool reset_cooldown;
   };
   std::vector<Work> work;
   {
@@ -867,16 +877,14 @@ void KVClient::RetryAbsentRemoves() {
         it = absent_returned_.erase(it);
         continue;
       }
-      const bool reset = absent_cooldown_reset_.erase(it->first) != 0;
       work.push_back({it->first,
                       std::vector<std::string>(queued->second.begin(),
-                                               queued->second.end()),
-                      reset});
+                                               queued->second.end())});
       absent_removes_.erase(queued);
       ++it;
     }
   }
-  for (auto& [id, keys, reset_cooldown] : work) {
+  for (auto& [id, keys] : work) {
     std::string addr;
     {
       std::lock_guard<std::mutex> lk(ring_mu_);
@@ -885,11 +893,8 @@ void KVClient::RetryAbsentRemoves() {
     }
     std::vector<char> ok(keys.size(), 0);
     if (!addr.empty()) {
-      // Its return to the view is as good as a probe answer: on the first
-      // send after the return, end the cooldown its failures during the
-      // absence started, so that this REMOVE is the trial instead of
-      // waiting out the backoff. Later sends take PeerHealth as it is.
-      if (reset_cooldown) health_.MarkProbeAlive(addr, now);
+      // The return ended its cooldown (NoteAbsentReturned): the first
+      // send is the trial; later sends take PeerHealth as it is.
       // To the member itself, wherever the ring now routes the keys.
       RouteTo to(addr);
       if (t_->pipelined()) {
