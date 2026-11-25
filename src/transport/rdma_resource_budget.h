@@ -29,7 +29,7 @@ inline ResourceRequest AdaptiveBudgetTarget(size_t nodes,
                                             size_t endpoints_per_pool,
                                             size_t depth, uint64_t slot_bytes,
                                             size_t floor_endpoints) {
-  constexpr size_t kMaxEndpoints = 65536;  // EnvBoundedInt upper bound parity
+  constexpr size_t kMaxEndpoints = 65536;  // ReadBoundedInt upper bound parity
   const size_t per_pool = endpoints_per_pool ? endpoints_per_pool : 1;
   const size_t lanes =
       per_pool > kMaxEndpoints / 2 ? kMaxEndpoints : 2 * per_pool;

@@ -3,6 +3,12 @@
 ## Unreleased
 
 
+- RDMA client: `DFKV_RDMA_CONNECT_MS` and `DFKV_RDMA_IO_MS` above 2^31-1
+  resolved to a negative or zero timeout (the number was cast to an int);
+  they now resolve to the default, with the warning they already gave. The
+  client's numeric RDMA settings are read through the shared setting parser
+  (TRN-30); every other value, and every warning, is as before.
+
 - RDMA client: a rail recovers from a device reset without a restart
   (TRN-29, `DFKV_RDMA_DEVICE_REBUILD`, off by default). A firmware or PCI
   reset or a driver reload leaves the device's contexts dead; a transport
