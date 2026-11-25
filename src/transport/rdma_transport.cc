@@ -559,6 +559,16 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   enomem_until_us_ =
       std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
   rail_devices_.resize(devs_.size());
+  device_rebuild_ = rdma::DeviceRebuildEnabled();
+  rail_generation_ = std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
+  rail_stale_ = std::make_unique<std::atomic<uint8_t>[]>(devs_.size());
+  device_suspects_ =
+      std::make_unique<std::atomic<uint64_t>[]>(devs_.size() * 2);
+  device_rebuilds_ = std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
+  for (size_t rail = 0; rail < devs_.size(); ++rail)
+    rail_generation_[rail].store(rdma::DeviceGeneration(devs_[rail]));
+  rebuild_not_before_us_.assign(devs_.size(), 0);
+  rebuild_backoff_ms_.assign(devs_.size(), 0);
   if (const char* primary = std::getenv("DFKV_RDMA_PRIMARY_DEV");
       primary && *primary) {
     const auto found = std::find(devs_.begin(), devs_.end(), primary);
@@ -858,7 +868,8 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
     port_watcher_ = std::make_unique<rdma::PortWatcher>(devs_);
     port_active_.assign(devs_.size(), 1);
   }
-  if (keepalive_ms_ > 0 || data_pool_max_ > pool_max_ || port_watcher_) {
+  if (keepalive_ms_ > 0 || data_pool_max_ > pool_max_ || port_watcher_ ||
+      device_rebuild_) {
     // Recovery probes run on this thread, so application operations go to a
     // healthy rail first.
     rail_policy_->SetProbeAfterHealthy(true);
@@ -867,11 +878,16 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
 }
 
 RdmaTransport::~RdmaTransport() {
+  // The background thread first: a rail rebuild on it takes register_mu_
+  // (try_lock only), so it is joined before the lock is taken.
+  keepalive_stop_.store(true, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(keepalive_mu_);
+    keepalive_cv_.notify_all();
+  }
+  if (keepalive_thread_.joinable()) keepalive_thread_.join();
   // A declaration still registering finishes before anything goes away.
   std::lock_guard<std::mutex> declaring(register_mu_);
-  keepalive_stop_.store(true, std::memory_order_relaxed);
-  keepalive_cv_.notify_all();
-  if (keepalive_thread_.joinable()) keepalive_thread_.join();
 
   std::vector<Conn*> idle;
   {
@@ -1047,6 +1063,7 @@ void RdmaTransport::KeepaliveLoop() {
       wait_lock, std::chrono::milliseconds(tick_ms),
       [&] { return keepalive_stop_.load(std::memory_order_relaxed); })) {
     wait_lock.unlock();
+    CheckDevices();
     if (port_watcher_) CheckPorts();
     ProbeRails();
     const uint64_t now = rdma::RailPolicy::NowMicros();
@@ -1067,7 +1084,8 @@ void RdmaTransport::CheckPorts() {
     const int state = port_watcher_->State(rail);
     if (state < 0 || (state == 1) == (port_active_[rail] != 0)) continue;
     port_active_[rail] = static_cast<uint8_t>(state);
-    topology_->SetDeviceEnabled(rail, state == 1);
+    // A rail out of selection for a rebuild comes back with the rebuild.
+    topology_->SetDeviceEnabled(rail, state == 1 && !RailStale(rail));
     if (state == 1) {
       rails_port_down_.fetch_sub(1, std::memory_order_relaxed);
       DFKV_LOG_INFO("rdma: port ACTIVE again, rail back in selection dev=" +
@@ -1080,6 +1098,139 @@ void RdmaTransport::CheckPorts() {
       RetireIdleRail(rail);
     }
   }
+}
+
+bool RdmaTransport::RailStale(size_t rail) const {
+  if (!device_rebuild_ || rail >= devs_.size()) return false;
+  return rail_stale_[rail].load(std::memory_order_acquire) != 0 ||
+         rdma::DeviceGeneration(devs_[rail]) !=
+             rail_generation_[rail].load(std::memory_order_acquire);
+}
+
+void RdmaTransport::CheckDevices() {
+  if (device_checks_paused_for_test_.load(std::memory_order_relaxed)) return;
+  for (const auto& event : rdma::PollDeviceEvents()) {
+    {
+      std::lock_guard<std::mutex> lock(device_events_mu_);
+      ++device_events_[{event.device, event.event}];
+    }
+    if (!event.fatal) {
+      DFKV_LOG_INFO("rdma: device event dev=" + event.device + ": " +
+                    event.event);
+      continue;
+    }
+    DFKV_LOG_WARN("rdma: device fatal error dev=" + event.device);
+    const auto rail = std::find(devs_.begin(), devs_.end(), event.device);
+    if (rail != devs_.end())
+      device_suspects_[static_cast<size_t>(rail - devs_.begin()) * 2]
+          .fetch_add(1, std::memory_order_relaxed);
+    if (device_rebuild_) rdma::RetireDevice(event.device, event.generation);
+  }
+  if (!device_rebuild_) return;
+  const uint64_t now = rdma::RailPolicy::NowMicros();
+  for (size_t rail = 0; rail < devs_.size(); ++rail) {
+    if (keepalive_stop_.load(std::memory_order_relaxed)) return;
+    if (!RailStale(rail)) continue;
+    MarkRailStale(rail);
+    if (now < rebuild_not_before_us_[rail]) continue;
+    if (RebuildRail(rail, rdma::DeviceGeneration(devs_[rail]))) {
+      rebuild_backoff_ms_[rail] = 0;
+      rebuild_not_before_us_[rail] = 0;
+    } else {
+      // 1 s, doubling to 30 s; the wait is the background thread's tick.
+      rebuild_backoff_ms_[rail] =
+          rebuild_backoff_ms_[rail] == 0
+              ? 1000
+              : std::min<uint64_t>(rebuild_backoff_ms_[rail] * 2, 30000);
+      rebuild_not_before_us_[rail] = now + rebuild_backoff_ms_[rail] * 1000;
+    }
+  }
+}
+
+void RdmaTransport::MarkRailStale(size_t rail) {
+  if (rail_stale_[rail].exchange(1, std::memory_order_acq_rel) == 0)
+    DFKV_LOG_WARN("rdma: device of rail dev=" + devs_[rail] +
+                  " was reset; rail out of selection until it is rebuilt");
+  // Again on every tick: the port watcher, or a connection taken meanwhile,
+  // may have put it back.
+  topology_->SetDeviceEnabled(rail, false);
+  RetireIdleRail(rail);
+  std::lock_guard<std::mutex> lock(rail_devices_mu_);
+  rail_devices_[rail].reset();
+}
+
+bool RdmaTransport::RebuildRail(size_t rail, uint64_t generation) {
+  // One attempt holds register_mu_, never while waiting; a RegisterMemory
+  // (or the destructor) holding it makes this attempt wait for a later tick.
+  std::unique_lock<std::mutex> declaring(register_mu_, std::try_to_lock);
+  if (!declaring.owns_lock()) return false;
+  const std::string& dev = devs_[rail];
+  std::vector<std::pair<void*, size_t>> regions;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    regions = pools_;
+  }
+  // A transport that declared memory has an anchor per rail: a new one on
+  // the fresh context, with every declared region registered on it.
+  const bool anchored = !anchors_.empty();
+  std::unique_ptr<rdma::RcEndpoint> anchor;
+  uint64_t built_on = generation;
+  std::vector<rdma::RcEndpoint::PoolMrRegistration> registrations(
+      regions.size());
+  if (rebuild_fails_for_test_.load(std::memory_order_relaxed)) return false;
+  if (anchored) {
+    anchor = std::make_unique<rdma::RcEndpoint>();
+    anchor->set_remote_access(false);
+    if (!anchor->Open(dev.empty() ? nullptr : dev.c_str(), rdma::kV2ControlCap,
+                      1)) {
+      DFKV_LOG_WARN("rdma: rail dev=" + dev +
+                    " cannot be rebuilt yet: its device does not open");
+      return false;
+    }
+    built_on = anchor->device_generation();
+    size_t staged = 0;
+    for (; staged < regions.size(); ++staged) {
+      // A large pool must not hold the destructor's join for seconds.
+      if (keepalive_stop_.load(std::memory_order_relaxed)) break;
+      if (!anchor->StagePoolMr(regions[staged].first, regions[staged].second,
+                               /*remote_write=*/false,
+                               &registrations[staged]))
+        break;
+    }
+    if (staged != regions.size()) {
+      while (staged != 0) {
+        --staged;
+        anchor->RollbackPoolMr(&registrations[staged]);
+      }
+      DFKV_LOG_WARN("rdma: rail dev=" + dev +
+                    " not rebuilt: registering its memory failed");
+      return false;
+    }
+  }
+  {
+    rdma::RetiredPoolMrs retired;
+    std::unique_ptr<rdma::RcEndpoint> old;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (anchored) {
+        for (auto& registration : registrations)
+          anchor->CommitPoolMr(&registration, retired.get());
+        old = std::move(anchors_[rail]);
+        anchors_[rail] = std::move(anchor);
+      }
+      rail_generation_[rail].store(built_on, std::memory_order_release);
+    }
+    retired.Deregister();
+    old.reset();  // the old context's last references go with it
+  }
+  declaring.unlock();
+  rail_stale_[rail].store(0, std::memory_order_release);
+  if (port_watcher_) port_watcher_->Reopen(rail);
+  if (!port_watcher_ || port_active_[rail]) topology_->SetDeviceEnabled(rail, true);
+  device_rebuilds_[rail].fetch_add(1, std::memory_order_relaxed);
+  DFKV_LOG_INFO("rdma: rail dev=" + dev + " rebuilt on its reset device (" +
+                std::to_string(regions.size()) + " regions registered)");
+  return true;
 }
 
 void RdmaTransport::ProbeRails() {
@@ -2295,10 +2446,35 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       // The device is gone or was reset: stop holding its context, so it
       // closes once this rail's endpoints are gone and a later Open opens
       // the device again instead of reusing the dead context.
-      std::lock_guard<std::mutex> lock(rail_devices_mu_);
-      if (ridx < rail_devices_.size()) rail_devices_[ridx].reset();
+      {
+        std::lock_guard<std::mutex> lock(rail_devices_mu_);
+        if (ridx < rail_devices_.size()) rail_devices_[ridx].reset();
+      }
+      device_suspects_[ridx * 2 + 1].fetch_add(1, std::memory_order_relaxed);
+      // TRN-29: the binding the rail was built on is retired (if no one did
+      // yet), and the background thread rebuilds the rail.
+      if (device_rebuild_ &&
+          rdma::RetireDevice(dev, rail_generation_[ridx].load(
+                                      std::memory_order_acquire)))
+        keepalive_cv_.notify_all();
     }
     Destroy(conn, rdma::RailCompletion::kRailFailure);
+    result.failure = AcquireFailure::kLocalRail;
+    return result;
+  }
+  // TRN-29: an Open can land on a context newer than the one this rail was
+  // rebuilt on (another transport saw the reset first, and this one's
+  // background thread has not yet). Such a connection would have no
+  // registration of this transport's memory: it is dropped, the rail leaves
+  // selection until rebuilt, and the operation goes to another rail.
+  if (device_rebuild_ &&
+      conn->ep.device_generation() !=
+          rail_generation_[ridx].load(std::memory_order_acquire)) {
+    ::close(fd);
+    Destroy(conn, rdma::RailCompletion::kAdmission);
+    rail_stale_[ridx].store(1, std::memory_order_release);
+    topology_->SetDeviceEnabled(ridx, false);
+    keepalive_cv_.notify_all();
     result.failure = AcquireFailure::kLocalRail;
     return result;
   }
@@ -2675,11 +2851,19 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
   // rail. Opening fewer than all rails is a rejected transaction: publishing
   // the declaration would otherwise make the gauge and future connections lie.
   // anchors_ is only used here, under register_mu_.
+  // A rail whose device was reset (TRN-29) is skipped, its slot left
+  // empty: its rebuild registers every published region on the new context.
   std::vector<std::unique_ptr<rdma::RcEndpoint>> new_anchors;
   std::vector<rdma::RcEndpoint*> rails;
   if (anchors_.empty()) {
     new_anchors.reserve(devs_.size());
-    for (const auto& device : devs_) {
+    for (size_t rail = 0; rail < devs_.size(); ++rail) {
+      const std::string& device = devs_[rail];
+      if (RailStale(rail)) {
+        rails.push_back(nullptr);
+        new_anchors.push_back(nullptr);
+        continue;
+      }
       auto endpoint = std::make_unique<rdma::RcEndpoint>();
       endpoint->set_remote_access(false);
       if (!endpoint->Open(device.empty() ? nullptr : device.c_str(),
@@ -2702,7 +2886,8 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
       return false;
     }
     rails.reserve(anchors_.size());
-    for (auto& endpoint : anchors_) rails.push_back(endpoint.get());
+    for (size_t rail = 0; rail < anchors_.size(); ++rail)
+      rails.push_back(RailStale(rail) ? nullptr : anchors_[rail].get());
   }
 
   // Stage every rail, one after another (registering rails at once was
@@ -2713,14 +2898,15 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
   for (; staged < rails.size(); ++staged) {
     // Local access only: since v2.31 servers never WRITE into client
     // memory (GET is a client READ of server staging).
-    if (!rails[staged]->StagePoolMr(base, size, /*remote_write=*/false,
+    if (rails[staged] &&
+        !rails[staged]->StagePoolMr(base, size, /*remote_write=*/false,
                                     &registrations[staged]))
       break;
   }
   if (staged != rails.size()) {
     while (staged != 0) {
       --staged;
-      rails[staged]->RollbackPoolMr(&registrations[staged]);
+      if (rails[staged]) rails[staged]->RollbackPoolMr(&registrations[staged]);
     }
     mr_registration_rejections_.fetch_add(1, std::memory_order_relaxed);
     DFKV_LOG_ERROR(
@@ -2745,7 +2931,8 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
       for (const auto& entry : *idle) idle_count += entry.second.size();
     unusable.reserve(idle_count);
     for (size_t rail = 0; rail < rails.size(); ++rail)
-      rails[rail]->CommitPoolMr(&registrations[rail], retired.get());
+      if (rails[rail])
+        rails[rail]->CommitPoolMr(&registrations[rail], retired.get());
     if (!new_anchors.empty()) anchors_ = std::move(new_anchors);
     // Idle pooled endpoints have no in-flight WRs, so they can safely adopt
     // the new generation now and release their superseded same-base cache
@@ -3223,6 +3410,36 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_op_deadline_expired_total counter\n";
   s += "dfkv_rdma_client_op_deadline_expired_total " +
        std::to_string(op_deadline_expired_.load(std::memory_order_relaxed)) + "\n";
+  // TRN-29: device resets.
+  s += "# HELP dfkv_rdma_client_async_events_total Device async events read (IBV_EVENT_*)\n";
+  s += "# TYPE dfkv_rdma_client_async_events_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(device_events_mu_);
+    for (const auto& [key, count] : device_events_)
+      s += "dfkv_rdma_client_async_events_total{dev=\"" + key.first +
+           "\",event=\"" + key.second + "\"} " + std::to_string(count) + "\n";
+  }
+  s += "# HELP dfkv_rdma_client_device_suspect_total Signals that a rail's device was reset: DEVICE_FATAL, or an endpoint Open that failed with ENODEV or EIO\n";
+  s += "# TYPE dfkv_rdma_client_device_suspect_total counter\n";
+  s += "# HELP dfkv_rdma_client_device_dead Rails out of selection until rebuilt on their reset device (DFKV_RDMA_DEVICE_REBUILD)\n";
+  s += "# TYPE dfkv_rdma_client_device_dead gauge\n";
+  s += "# HELP dfkv_rdma_client_device_rebuilds_total Rails rebuilt on a reset device (DFKV_RDMA_DEVICE_REBUILD)\n";
+  s += "# TYPE dfkv_rdma_client_device_rebuilds_total counter\n";
+  for (size_t rail = 0; rail < devs_.size(); ++rail) {
+    const std::string dev = "{dev=\"" + devs_[rail] + "\"";
+    s += "dfkv_rdma_client_device_suspect_total" + dev + ",reason=\"fatal\"} " +
+         std::to_string(device_suspects_[rail * 2].load(std::memory_order_relaxed)) + "\n";
+    s += "dfkv_rdma_client_device_suspect_total" + dev + ",reason=\"open\"} " +
+         std::to_string(device_suspects_[rail * 2 + 1].load(std::memory_order_relaxed)) + "\n";
+    s += "dfkv_rdma_client_device_dead" + dev + "} " +
+         std::to_string(RailStale(rail) ? 1 : 0) + "\n";
+    s += "dfkv_rdma_client_device_rebuilds_total" + dev + "} " +
+         std::to_string(device_rebuilds_[rail].load(std::memory_order_relaxed)) + "\n";
+  }
+  s += "# HELP dfkv_rdma_client_dead_release_failures_total Releases (dereg, dealloc, close) that failed on a device proven gone and were dropped instead of aborting (DFKV_RDMA_DEVICE_REBUILD)\n";
+  s += "# TYPE dfkv_rdma_client_dead_release_failures_total counter\n";
+  s += "dfkv_rdma_client_dead_release_failures_total " +
+       std::to_string(rdma::DeadReleaseFailures()) + "\n";
   s += "# HELP dfkv_rdma_client_rail_refusals_total Peer rails charged as failed because the peer closed a bootstrap on them, took one on another rail, and closed a confirming dial on them again (it does not serve that device)\n";
   s += "# TYPE dfkv_rdma_client_rail_refusals_total counter\n";
   s += "dfkv_rdma_client_rail_refusals_total " +

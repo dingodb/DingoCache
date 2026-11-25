@@ -209,15 +209,12 @@ chosen context and controls what the confirming verb returns.
   another rail (or fails as local-rail with one rail), and B rebuilds on its
   next tick.
 
-**Soft-RoCE, CI only.** A dedicated device, `rxe2` on its own dummy netdev,
-never `rxe0`/`rxe1` that the other tests use. The CI job script deletes and
-re-adds the link around the test, with a `trap` that restores it on any exit;
-the test binary never touches links. The test runs in its own step, serially
-(not alongside the other loopback tests), and only when `GITHUB_ACTIONS=true`
-and `DFKV_RDMA_RESET_TEST_DEV` names `rxe2`; it refuses any other name. It
-checks the real ENODEV path and that releases on the disassociated rxe
-context succeed or are proven dead. Whether rxe delivers DEVICE_FATAL on link
-delete is found out there; the design does not depend on it.
+**Soft-RoCE: not possible.** rxe cannot disassociate a context: `rdma link
+delete` blocks until every context of the device closes, so a live reset
+can't be exercised on Soft-RoCE (seen in CI: the delete waited for the test
+process until it exited). The seam tests are the proof; a real
+disassociation needs a driver with disassociate support (mlx5), and no real
+HCA is reset for a test.
 
 ## 8. Out of scope
 

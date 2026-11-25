@@ -3,6 +3,21 @@
 ## Unreleased
 
 
+- RDMA client: a rail recovers from a device reset without a restart
+  (TRN-29, `DFKV_RDMA_DEVICE_REBUILD`, off by default). A firmware or PCI
+  reset or a driver reload leaves the device's contexts dead; a transport
+  that registered memory held the dead context, so the rail stayed broken
+  until the process restarted. With the switch on, `IBV_EVENT_DEVICE_FATAL`
+  or an endpoint Open failing with ENODEV/EIO retires the device's binding,
+  the rail leaves the transport's selection, and the background thread
+  rebuilds it on a fresh context with every declared region registered
+  again, then puts it back. A release that fails on a context proven
+  disassociated is counted (`dfkv_rdma_client_dead_release_failures_total`)
+  instead of aborting; anything short of proof still aborts. With the
+  switch off the signals are only counted (`dfkv_rdma_client_async_events_total`,
+  `dfkv_rdma_client_device_suspect_total`). Client only; servers still need
+  a restart after a device reset. Design: docs/design/rdma-device-reset.md.
+
 - Client, absent grace: a member's return to the view ends its PeerHealth
   cooldown (once, as a probe answer) in every client, not only in one with
   REMOVEs queued for it. A reader that had cooled the member before it

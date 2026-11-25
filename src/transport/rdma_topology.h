@@ -166,6 +166,9 @@ class PortWatcher {
   PortWatcher& operator=(const PortWatcher&) = delete;
   // 1 ACTIVE, 0 not ACTIVE, -1 unknown (no context, or the query failed).
   int State(size_t index) const;
+  // Opens the rail's device again (TRN-29: after a reset its context is
+  // dead and every query fails). Called from the thread that calls State.
+  void Reopen(size_t index);
   // Test seam: when set, answers State instead of the device.
   using StateFn = int (*)(const std::string& name);
   static std::atomic<StateFn>& OverrideForTest();
