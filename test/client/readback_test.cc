@@ -43,6 +43,7 @@ class NodesTransport final : public Transport {
   std::map<std::string, std::map<Key, std::string>> store;
   std::map<std::string, int> reads, removes, writes;
   std::set<std::string> down;             // every op fails
+  std::set<std::string> invalid;          // reads answer kInvalid
   std::set<std::string> failing_removes;  // REMOVEs fail, the rest serves
 
   static Key K(const BlockKey& key) { return {key.digest_hi, key.digest_lo}; }
@@ -64,6 +65,7 @@ class NodesTransport final : public Transport {
     std::lock_guard<std::mutex> lk(mu);
     ++reads[node];
     if (down.count(node)) return Status::kIOError;
+    if (invalid.count(node)) return Status::kInvalid;
     const auto& values = store[node];
     const auto it = values.find(K(key));
     if (it == values.end()) return Status::kNotFound;
@@ -76,6 +78,7 @@ class NodesTransport final : public Transport {
                 uint64_t* value_len) override {
     std::lock_guard<std::mutex> lk(mu);
     if (down.count(node)) return Status::kIOError;
+    if (invalid.count(node)) return Status::kInvalid;
     const auto& values = store[node];
     const auto it = values.find(K(key));
     if (it == values.end()) return Status::kNotFound;
@@ -87,6 +90,7 @@ class NodesTransport final : public Transport {
     std::lock_guard<std::mutex> lk(mu);
     ++reads[node];
     if (down.count(node)) return Status::kIOError;
+    if (invalid.count(node)) return Status::kInvalid;
     *exist = store[node].count(K(key)) != 0;
     return Status::kOk;
   }
@@ -281,6 +285,16 @@ const std::vector<std::string> kOld = {"a", "b", "c", "d", "e"};  // before f jo
 struct RbEnv {
   ScopedEnv readback{"DFKV_RING_READBACK_MS", "60000"};
 };
+// Keep A open beyond B's generic held-ring window, so these tests exercise
+// the dedicated absent-owner route rather than the generic previous owner.
+struct AbsentRbEnv {
+  explicit AbsentRbEnv(bool rewrite = false)
+      : rewrite{"DFKV_RING_READBACK_REWRITE", rewrite ? "1" : "0"} {}
+  ScopedEnv readback{"DFKV_RING_READBACK_MS", "60"};
+  ScopedEnv grace{"DFKV_RING_ABSENT_GRACE_MS", "60000"};
+  ScopedEnv rewrite;
+};
+const std::vector<std::string> kWithoutD = {"a", "b", "c", "e", "f"};
 std::unique_ptr<KVClient> OpenOn(NodesTransport* t,
                                  const std::vector<std::string>& ids) {
   auto c = std::make_unique<KVClient>(
@@ -314,6 +328,14 @@ class ReadBack : public ::testing::TestWithParam<bool> {
     std::lock_guard<std::mutex> lk(t.mu);
     return t.asked[Addr(id)];
   }
+  int AgesAsked(const std::string& id) {
+    std::lock_guard<std::mutex> lk(t.mu);
+    return t.ages_asked[Addr(id)];
+  }
+  int Reads(const std::string& id) {
+    std::lock_guard<std::mutex> lk(t.mu);
+    return t.reads[Addr(id)];
+  }
 };
 
 INSTANTIATE_TEST_SUITE_P(TcpAndPipelined, ReadBack, ::testing::Bool());
@@ -325,7 +347,7 @@ TEST_P(ReadBack, AMissAfterAnOwnerChangeIsReadBackFromThePreviousOwner) {
   auto c = OpenOn(&t, kOld);
   c->SetMembers(View(kIds));
   const std::string v(16, 'v');
-  const auto keys = MovedToF(6, "rb-");
+  const auto keys = MovedToF(7, "rb-");
   for (const auto& key : keys) Store(PrevOwner(key), key, v);
   std::string out(v.size(), '\0');
   EXPECT_TRUE(c->Get(keys[0], &out[0], out.size()));
@@ -335,6 +357,9 @@ TEST_P(ReadBack, AMissAfterAnOwnerChangeIsReadBackFromThePreviousOwner) {
   std::string auto_out(64, '\0');
   EXPECT_TRUE(c->GetAuto(keys[2], &auto_out[0], auto_out.size(), &len));
   EXPECT_EQ(len, v.size());
+  std::string string_out = "not cleared by a miss";
+  EXPECT_TRUE(c->GetAuto(keys[6], &string_out));
+  EXPECT_EQ(string_out, v);
   std::vector<std::string> outs(3, std::string(v.size(), '\0'));
   std::vector<KvGetItem> items;
   for (size_t i = 0; i < 3; ++i) items.push_back({keys[3 + i], &outs[i][0], v.size()});
@@ -413,6 +438,261 @@ TEST_P(ReadBack, TheAskSetIsTheFirstSuccessorsWithoutTheOwner) {
   for (const auto& id : kIds)
     EXPECT_EQ(Asked(id), want.count(id) ? 1 : 0) << id;
   EXPECT_TRUE(want.count(PrevOwner(key)));
+}
+
+// Once the generic held-ring B window has expired, the live process whose
+// membership record vanished remains available only through guarded B. All
+// scalar and batched read forms use it, including std::string GetAuto.
+TEST_P(ReadBack, AbsentOwnerAfterHeldWindowServesEveryReadForm) {
+  AbsentRbEnv env(true);
+  auto c = OpenOn(&t, kIds);
+  c->SetMembers(View(kWithoutD));
+  const auto keys = KeysOwnedBy("d", 7, "absent-forms-", kIds);
+  const std::string v = "variable-absent-value";
+  for (const auto& key : keys) Store("d", key, v);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ASSERT_EQ(Metric(*c, "dfkv_client_readback_window_active"), "0");
+  ASSERT_EQ(Metric(*c, "dfkv_client_ring_absent_members"), "1");
+
+  std::string out(v.size(), '\0');
+  EXPECT_TRUE(c->Get(keys[0], &out[0], out.size()));
+  EXPECT_EQ(out, v);
+  EXPECT_TRUE(c->Exist(keys[1]));
+  std::string string_out;
+  EXPECT_TRUE(c->GetAuto(keys[2], &string_out));
+  EXPECT_EQ(string_out, v);
+  size_t len = 0;
+  EXPECT_TRUE(c->GetAuto(keys[3], &out[0], out.size(), &len));
+  EXPECT_EQ(len, v.size());
+
+  std::vector<std::string> batch_out(2, std::string(v.size(), '\0'));
+  std::vector<KvGetItem> items{
+      {keys[4], &batch_out[0][0], v.size()},
+      {keys[5], &batch_out[1][0], v.size()}};
+  for (bool hit : c->BatchGet(items)) EXPECT_TRUE(hit);
+  std::vector<size_t> lens;
+  for (bool hit : c->BatchGetAuto(items, &lens)) EXPECT_TRUE(hit);
+  ASSERT_EQ(lens.size(), 2u);
+  EXPECT_EQ(lens[0], v.size());
+  EXPECT_EQ(lens[1], v.size());
+  for (bool hit : c->BatchExist({keys[4], keys[5], keys[6]})) EXPECT_TRUE(hit);
+
+  EXPECT_EQ(Reads("d"), 11);
+  EXPECT_EQ(AgesAsked("d"), GetParam() ? 7 : 11)
+      << "pipelining groups each operation; TCP plans each scalar key";
+  EXPECT_EQ(Asked("d"), 0) << "rewrite-enabled B must use op 26";
+  EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"hit\"}"),
+            "11");
+}
+
+// An absent member's stale bytes are never read when any M answer is known
+// removal, unknown, invalid (no memory), or a request failure.
+TEST_P(ReadBack, AbsentOwnerMRefusalsNeverReadStaleBytes) {
+  struct Case {
+    NodesTransport::Memory memory;
+    bool removed;
+    const char* reason;
+  };
+  int n = 0;
+  for (const Case& cs : {Case{NodesTransport::kMemory, true, "removed"},
+                         Case{NodesTransport::kUnknown, false, "unknown"},
+                         Case{NodesTransport::kNoMemory, false, "unknown"},
+                         Case{NodesTransport::kFail, false, "unknown"}}) {
+    NodesTransport tt(GetParam());
+    AbsentRbEnv env;
+    auto c = OpenOn(&tt, kIds);
+    c->SetMembers(View(kWithoutD));
+    const std::string key =
+        KeysOwnedBy("d", 1, "absent-refuse-" + std::to_string(n++) + "-",
+                    kIds)[0];
+    {
+      std::lock_guard<std::mutex> lk(tt.mu);
+      tt.store[Addr("d")][K(key)] = "stale-value";
+      tt.memory[Addr("d")] = cs.memory;
+      if (cs.removed) tt.removed_here[Addr("d")].insert(K(key));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::string out(16, '\0');
+    EXPECT_FALSE(c->Get(key, &out[0], out.size())) << cs.reason;
+    std::lock_guard<std::mutex> lk(tt.mu);
+    EXPECT_EQ(tt.reads[Addr("d")], 0) << cs.reason;
+    EXPECT_EQ(tt.asked[Addr("d")], 1) << cs.reason;
+    EXPECT_EQ(Metric(*c, std::string("dfkv_client_readback_reads_total{result=\"refused_") +
+                             cs.reason + "\"}"),
+              "1");
+  }
+}
+
+// A removal older than H is invisible to op 25/26. Unlike an ordinary warm
+// return, an absent owner is not read through any other route, so once its
+// whole absence is older than H the guarded destination must fail closed.
+TEST_P(ReadBack, AbsentOwnerOlderThanHorizonRefusesWithoutAnyTable) {
+  AbsentRbEnv env(true);
+  auto c = OpenOn(&t, kIds);
+  c->SetMembers(View(kWithoutD));
+  const std::string key = KeysOwnedBy("d", 1, "absent-old-", kIds)[0];
+  const std::string v(16, 's');
+  Store("d", key, v);  // reachable stale copy after a removal outside H
+  c->AgeAbsentForTest("d", 11000);  // H = 60 + 10 * 1000 = 10060 ms
+  {
+    std::lock_guard<std::mutex> lk(t.mu);
+    t.removed_here[Addr("d")].insert(K(key));
+    t.removed_at[Addr("d")][K(key)] = RawMsExact() - 30000;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ASSERT_EQ(Metric(*c, "dfkv_client_readback_window_active"), "0");
+  std::string out(v.size(), '\0');
+  EXPECT_FALSE(c->Get(key, &out[0], out.size()));
+  EXPECT_EQ(Reads("d"), 0);
+  EXPECT_EQ(AgesAsked("d"), 0);
+  EXPECT_EQ(Asked("d"), 0);
+  EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"refused_unknown\"}"),
+            "1");
+}
+
+// With W, a rewrite at the absent owner sufficiently after every REMOVE is
+// readable; a write inside the guard is not, and no second read is attempted.
+TEST_P(ReadBack, AbsentOwnerRewriteAgesUseTheSharedGuard) {
+  AbsentRbEnv env(true);
+  auto c = OpenOn(&t, kIds);
+  c->SetMembers(View(kWithoutD));
+  const auto keys = KeysOwnedBy("d", 2, "absent-rewrite-", kIds);
+  for (const auto& key : keys) Store("d", key, "rewritten");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  {
+    std::lock_guard<std::mutex> lk(t.mu);
+    const double now = RawMsExact();
+    const std::string x0 = Successors(keys[0], kIds)[2];
+    const std::string x1 = Successors(keys[1], kIds)[2];
+    t.removed_at[Addr(x0)][K(keys[0])] = now - 5000;
+    t.written_at[Addr("d")][K(keys[0])] = now - 2000;
+    t.removed_at[Addr(x1)][K(keys[1])] = now - 5000;
+    t.written_at[Addr("d")][K(keys[1])] = now - 4500;
+  }
+  std::string out(9, '\0');
+  EXPECT_TRUE(c->Get(keys[0], &out[0], out.size()));
+  EXPECT_EQ(out, "rewritten");
+  EXPECT_FALSE(c->Get(keys[1], &out[0], out.size()));
+  EXPECT_EQ(Reads("d"), 1);
+  EXPECT_EQ(AgesAsked("d"), 2);
+  EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"hit_rewritten\"}"),
+            "1");
+  EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"refused_removed\"}"),
+            "1");
+}
+
+// Mixed releases fail closed for the absent route too: an older op-25-only
+// remover cannot order its REMOVE, and a P without W cannot prove a rewrite.
+TEST_P(ReadBack, AbsentOwnerMixedReleasesFailClosedWithoutARead) {
+  for (const bool p_without_w : {false, true}) {
+    NodesTransport tt(GetParam());
+    AbsentRbEnv env(true);
+    auto c = OpenOn(&tt, kIds);
+    c->SetMembers(View(kWithoutD));
+    const std::string key = KeysOwnedBy(
+        "d", 1, std::string("absent-mixed-") + (p_without_w ? "w-" : "op-"),
+        kIds)[0];
+    const std::string x = Successors(key, kIds)[2];
+    {
+      std::lock_guard<std::mutex> lk(tt.mu);
+      const double now = RawMsExact();
+      tt.store[Addr("d")][K(key)] = "rewritten";
+      tt.removed_here[Addr(x)].insert(K(key));
+      tt.removed_at[Addr(x)][K(key)] = now - 5000;
+      tt.written_at[Addr("d")][K(key)] = now - 1000;
+      if (p_without_w) tt.w_off.insert(Addr("d"));
+      else tt.no_ages.insert(Addr(x));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::string out(9, '\0');
+    EXPECT_FALSE(c->Get(key, &out[0], out.size())) << p_without_w;
+    std::lock_guard<std::mutex> lk(tt.mu);
+    EXPECT_EQ(tt.reads[Addr("d")], 0);
+    EXPECT_EQ(tt.ages_asked[Addr("d")], 1);
+    if (!p_without_w) {
+      EXPECT_EQ(tt.ages_asked[Addr(x)], 1);
+      EXPECT_EQ(tt.asked[Addr(x)], 1) << "op 25 fallback was not used";
+    }
+    EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"refused_removed\"}"),
+              "1");
+  }
+}
+
+// Owner hits and every non-not-found owner outcome stop before M. A genuine
+// read-back length mismatch still sets the namespace guard for later reads.
+TEST_P(ReadBack, AbsentOwnerRequiresAPlainNotFoundAndChecksLength) {
+  AbsentRbEnv env;
+  auto c = OpenOn(&t, kIds);
+  c->SetMembers(View(kWithoutD));
+  const auto keys = KeysOwnedBy("d", 6, "absent-control-", kIds);
+  for (const auto& key : keys) Store("d", key, "12345678");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::string out(8, '\0');
+
+  const std::string hit_owner = Successors(keys[0], kWithoutD)[0];
+  Store(hit_owner, keys[0], "12345678");
+  EXPECT_TRUE(c->Get(keys[0], &out[0], out.size()));
+  EXPECT_EQ(Asked("d"), 0);
+  EXPECT_EQ(Reads("d"), 0);
+
+  const std::string invalid_owner = Successors(keys[1], kWithoutD)[0];
+  t.invalid.insert(Addr(invalid_owner));
+  std::string string_out = "unchanged";
+  EXPECT_FALSE(c->GetAuto(keys[1], &string_out));
+  EXPECT_TRUE(string_out.empty());
+  EXPECT_EQ(Asked("d"), 0);
+  EXPECT_EQ(Reads("d"), 0);
+  t.invalid.erase(Addr(invalid_owner));
+
+  Store(Successors(keys[2], kWithoutD)[0], keys[2], "123456789");
+  EXPECT_FALSE(c->Get(keys[2], &out[0], out.size()))
+      << "an owner length mismatch must not fall through to the absent owner";
+  EXPECT_EQ(Asked("d"), 0);
+  EXPECT_EQ(Reads("d"), 0);
+
+  const std::string io_owner = Successors(keys[3], kWithoutD)[0];
+  t.down.insert(Addr(io_owner));
+  string_out = "unchanged";
+  EXPECT_FALSE(c->GetAuto(keys[3], &string_out));
+  EXPECT_TRUE(string_out.empty());
+  EXPECT_EQ(Asked("d"), 0);
+  EXPECT_EQ(Reads("d"), 0);
+  t.down.erase(Addr(io_owner));
+
+  Store("d", keys[4], "123456789");
+  EXPECT_FALSE(c->GetAuto(keys[4], &string_out, 8));
+  EXPECT_TRUE(string_out.empty());
+  EXPECT_EQ(Reads("d"), 1);
+  EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"miss\"}"),
+            "1");
+  EXPECT_FALSE(c->Get(keys[5], &out[0], out.size()));
+  EXPECT_EQ(Reads("d"), 1);
+  EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"refused_length\"}"),
+            "1");
+}
+
+// Further view churn does not turn a warm record return into a read-back:
+// once d rejoins, its ordinary owner hit asks no M/W table and adds no B hit.
+TEST_P(ReadBack, AbsentWarmReturnAfterFPlusOneChangesIsOrdinaryRead) {
+  AbsentRbEnv env(true);
+  auto c = OpenOn(&t, kIds);
+  const std::string key = KeysOwnedBy("d", 1, "absent-return-", kIds)[0];
+  Store("d", key, "warm-record");
+  c->SetMembers(View(kWithoutD));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  for (int i = 0; i < 4; ++i)  // F + 1 at the default F = 3
+    c->SetMembers(View(kWithoutD, i % 2 == 0 ? std::set<std::string>{"a"}
+                                            : std::set<std::string>{}));
+  c->SetMembers(View(kIds));
+  ASSERT_EQ(Metric(*c, "dfkv_client_ring_absent_members"), "0");
+  std::string out;
+  EXPECT_TRUE(c->GetAuto(key, &out));
+  EXPECT_EQ(out, "warm-record");
+  EXPECT_EQ(Reads("d"), 1);
+  EXPECT_EQ(AgesAsked("d"), 0);
+  EXPECT_EQ(Asked("d"), 0);
+  EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"hit\"}"),
+            "0");
 }
 
 // Any other asked node's 2 (unknown, no memory, a failed request) or 1

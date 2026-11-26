@@ -1,7 +1,8 @@
 # Unavailable owners: absent grace, cooldown reroute, recent-REMOVE memory, read-back
 
-Status: design revision 12 is implemented by this change (CLI-35 W);
-stages A, C, M and B were implemented earlier. Each mechanism sits behind its own switch, off by default; none changes a released
+Status: design revision 12 (CLI-35 W) and absent-owner B (CLI-34) are
+implemented; stages A, C, M and the other B routes were implemented earlier.
+Each mechanism sits behind its own switch, off by default; none changes a released
 binary. A and C are client-side only. The recent-REMOVE memory (M) adds one
 wire op and server state; B depends on M and does not ship without it.
 
@@ -70,8 +71,9 @@ REMOVEs to the new owner only, so the absent member may hold removed copies
 ### 3.1 A: absent grace (`DFKV_RING_ABSENT_GRACE_MS`, default 0 = off)
 
 A member that disappears from the adopted view is kept as *absent* for the
-grace period, then dropped: no writes and no reads; REMOVE and RETAIN reach
-it; its unconfirmed REMOVEs are retried when it returns.
+grace period, then dropped: no writes and no ordinary reads; REMOVE and
+RETAIN reach it; its unconfirmed REMOVEs are retried when it returns. Only
+B may read it, after the shared M/W and safety checks.
 
 - **Its own ring.** An absent member is looked up on the view's members plus
   the absent ones, separately from the drain ring (the view's members,
@@ -106,9 +108,9 @@ it; its unconfirmed REMOVEs are retried when it returns.
   at each tick, with PeerHealth as it is, for up to one grace after the
   return, then dropped and counted. A PUT that reaches the returned member
   before a later retry can be deleted by it: a miss, never a stale value. An absent
-  member's RETAIN answer does not stand for the key (no read finds that copy
-  until the member returns).
-- **No read after a miss.** See §3 above: reading an absent member is B's.
+  member's RETAIN answer does not stand for the key (no ordinary read finds
+  that copy until the member returns).
+- **No ordinary read after a miss.** See §3 above: reading an absent member is B's.
 - **Warm return with unconfirmed REMOVEs.** A member that returns serves
   copies whose REMOVE it did not confirm: this client's (racing the retry, or
   dropped by the retry queue's bound) and other clients' (which never sent
@@ -407,11 +409,13 @@ For a window after a key's owner changed, a GET or EXIST that misses at the
 current owner may ask the previous owner once.
 
 - **Absent owners.** With A on, a miss whose full-ring owner is absent asks
-  the absent member under the same rules (M asked, gate passing), as a
-  previous owner. Absent-owner read-back: not in this stage (stage B's code
-  reads back only from the held ring's owner and an ended episode's
-  substitute; an absence that starts or ends is a write-ring change like
-  any other).
+  the absent member under the same rules (M/W asked, gate, cooling and
+  length passing), as a previous owner. A valid held-ring owner or ended
+  episode's substitute takes precedence; this dedicated route remains after
+  that window expires only while `now - absent_since < H`. An older absence
+  is refused as unknown without reading: M/W cannot exclude a REMOVE older
+  than H, and an absent member has no ordinary-read route that could make
+  such an older value safe.
 - **Owner changes.** Every write-ring change this client adopts (a member
   added or removed, a drain or an absence starting or ending) keeps the write
   ring before it for the window; a C episode is a per-member change (keys of
@@ -455,8 +459,7 @@ current owner may ask the previous owner once.
     O);
   - K has a previous owner P ≠ O: its owner on the write ring held for an
     open window (the window of the last adopted change, not held, §above;
-    or a C episode that ended within the window), or its absent owner (A;
-    not in this stage);
+    or a C episode that ended within the window), or its absent owner (A);
   - the registry gate is open (§3.2), and S is not growing;
   - the namespace has counted no length mismatch (§2);
   - P is not in cooldown in this client (asking a cooling P is skipped,
@@ -955,7 +958,7 @@ removed afterwards.
 ## 8. Stages
 
 1. This design.
-2. A (timer, bound, planned-leave rule, REMOVE rule; no read after a miss)
+2. A (timer, bound, planned-leave rule, REMOVE rule; no ordinary read after a miss)
    with tests and metrics.
 3. C with REMOVE fan-out, the registry gate and tests.
 4. M on the server (table, coverage, `kRemovedWithin`) with tests, including

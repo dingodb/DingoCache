@@ -176,9 +176,11 @@
   `dfkv_client_readback_reads_total{result}`,
   `dfkv_client_readback_changes_refused_total{reason}`,
   `dfkv_client_readback_window_active`,
-  `dfkv_client_readback_memory_short_total{reason}`. Absent-owner read-back (design
-  §3.4): not in this stage. Off, no
-  `kRemovedWithin` is sent and every read is unchanged.
+  `dfkv_client_readback_memory_short_total{reason}`. An absent owner (design
+  §3.4) is a read-back destination too when no held-ring or episode owner takes
+  precedence; it uses the same gate, cooling, length and M/W fail-closed
+  checks, and is refused once the absence reaches H because older REMOVEs
+  cannot be checked. Off, no `kRemovedWithin` is sent and every read is unchanged.
 
 - Server: recent-REMOVE memory (CLI-02 stage M), behind
   `DFKV_REMOVE_MEMORY_MS` (default 0 = off, up to 3600000). A node records

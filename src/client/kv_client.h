@@ -246,6 +246,8 @@ class KVClient {
   // without an MDS (the registry answers then come from OnRegistry).
   void UseRegistryGateForTest(int poll_ms);
   uint64_t RecentKeepMsForTest() const;
+  // Move an absent member's existing start timestamp `age_ms` into the past.
+  void AgeAbsentForTest(const std::string& id, uint64_t age_ms);
   // A view the member poller saw (admitted or not): kept as a recent ring.
   void NoteSeenView(const std::vector<MemberInfo>& placement);
 
@@ -380,7 +382,7 @@ class KVClient {
   bool GetAutoDirect(const std::string& key, std::string* out,
                      size_t max_bytes);
   bool GetAutoDirectRouted(const std::string& key, std::string* out,
-                           size_t max_bytes);
+                           size_t max_bytes, ItemStatus* status);
   bool GetAutoDirect(const std::string& key, void* out, size_t cap,
                      size_t* out_len, ItemStatus* status = nullptr);
   bool GetAutoDirectRouted(const std::string& key, void* out, size_t cap,
@@ -507,8 +509,9 @@ class KVClient {
   std::atomic<bool> any_draining_{false};
   // Absent grace (DFKV_RING_ABSENT_GRACE_MS; 0 = off). A member that
   // vanishes from an admitted view is kept absent until its grace passes
-  // (TickAbsent) or it returns: no writes and no reads; REMOVE and RETAIN
-  // reach it; its unconfirmed REMOVEs are retried when it returns.
+  // (TickAbsent) or it returns: no writes and no ordinary reads (only
+  // checked read-back); REMOVE and RETAIN reach it; its unconfirmed
+  // REMOVEs are retried when it returns.
   // absent_ring_ is the view's members plus the absent ones (empty while
   // none is absent); a key it gives to an absent member has that member as
   // one more owner, beside the write owner and a drainer (full_ring_). At most
@@ -537,12 +540,13 @@ class KVClient {
   // The drainer of a key: its full-ring owner's address if that member
   // drains, else "".
   std::string DrainRoute(const std::string& key) const;
-  // The absent owner of a key: its owner on absent_ring_ if that member is
-  // absent (its address; `id` receives its id), else "". Only REMOVE and
-  // RETAIN go there: an absent member's copy may be one a REMOVE from a
-  // client that never saw the member did not reach, so reading it is a
-  // read-back (a later stage, under its rules).
-  std::string AbsentRoute(const std::string& key, std::string* id) const;
+  // absent owner of a key: its owner on absent_ring_ if that member is
+  // absent (its address; `id` receives its id), else "". REMOVE and RETAIN
+  // go there directly; an ordinary read does not. Its copy may be one a
+  // REMOVE from a client that never saw the member did not reach, so only
+  // PlanReadBack may read it, after the shared M/W and safety checks.
+  std::string AbsentRoute(const std::string& key, std::string* id,
+                          uint64_t* since_ms = nullptr) const;
   struct AbsentPart {
     std::string id, addr;
     std::vector<size_t> index;  // into the keys
