@@ -17,6 +17,32 @@
   `dfkv_ram_ack_backpressure_waits_total`, `_wait_timeouts_total`,
   `_wait_microseconds_total`. `dfkv_ram_ack_backpressure_total` counts each
   refused PUT once, after any wait.
+- Server and client: rewrite after REMOVE (CLI-35), behind
+  `DFKV_WRITE_MEMORY_ENTRIES` (server, 0 = off; needs
+  `DFKV_REMOVE_MEMORY_MS`) and `DFKV_RING_READBACK_REWRITE` (client, 0 = off;
+  needs `DFKV_RING_READBACK_MS`). A node remembers how long ago it
+  acknowledged each recent PUT and answers a new op, `kRemovedWithinAges`
+  (26, TCP and RDMA): the ages of each key's latest REMOVE and PUT, on its
+  `CLOCK_MONOTONIC_RAW`. With W on, per-key locks order each PUT/REMOVE with
+  the op-26 evidence read, including within one millisecond. The read-back
+  then also reads back a key removed
+  at an asked node if the previous owner's write followed every reported
+  REMOVE, compared through the client's own request times with a clock-rate
+  bound of 1000 ppm and a 1 s pause guard. The node clears the memory when
+  `CLOCK_REALTIME` or `CLOCK_BOOTTIME` moves against the raw clock by more
+  than 1 s within the window. Nodes without the op, or without the memory,
+  get the old rule. The recent-REMOVE memory's ages move from
+  `CLOCK_MONOTONIC` to `CLOCK_MONOTONIC_RAW` (its answers do not change).
+  For hosts whose clocks keep running through pauses only (DEPLOY §4c-6).
+  New `dfkv_write_memory_entries`, `dfkv_write_memory_dropped_total`,
+  `dfkv_write_memory_cleared_total{reason}`,
+  `dfkv_client_readback_reads_total{result="hit_rewritten"}`.
+  The effective config printout reflects clamped/dependent M/W/rewrite
+  settings after resolution. W's timestamp checks advance each shard even
+  when nonempty, preventing a stale per-shard watermark from losing the
+  same-millisecond PUT/REMOVE ordering. The unused internal C++ server-only
+  `KvNodeServer::CacheDirectBatchForKeys` wrapper is removed because it would
+  bypass W admission/publication; the client C ABI is unchanged.
 
 ## 2.44.0 — 2026-11-26
 

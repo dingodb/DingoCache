@@ -394,4 +394,33 @@ TEST(ClientEnv, AClientLoadedWithGarbageKeepsWorkingAndReportsEachNameOnce) {
   fs::remove_all(dir);
 }
 
+TEST(ClientEnv, ReadbackRewriteConfigReportsItsResolvedSwitch) {
+  struct Case {
+    const char* readback_ms;
+    const char* fanout;
+    const char* rewrite;
+    const char* expected;
+  };
+  const Case cases[] = {{"", "", "", "0"},
+                        {"60000", "", "", "0"},
+                        {"60000", "", "1", "1"},
+                        {"", "", "1", "0"},
+                        {"60000", "2", "1", "0"}};
+  for (const Case& c : cases) {
+    ScopedEnv readback("DFKV_RING_READBACK_MS", c.readback_ms);
+    ScopedEnv fanout("DFKV_RING_REMOVE_FANOUT", c.fanout);
+    ScopedEnv rewrite("DFKV_RING_READBACK_REWRITE", c.rewrite);
+    config_dump::ResetForTest();
+    const std::string log = LogOf([] {
+      dfkv_client_t client = OpenClient("n=127.0.0.1:1", nullptr);
+      ASSERT_NE(client, nullptr);
+      config_dump::Emit("client");
+      dfkv_close(client);
+    });
+    EXPECT_EQ(Recorded(log, "DFKV_RING_READBACK_REWRITE"), c.expected)
+        << log;
+  }
+  config_dump::ResetForTest();
+}
+
 }  // namespace

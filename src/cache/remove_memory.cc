@@ -45,6 +45,8 @@ std::unique_ptr<RemoveMemory> RemoveMemory::FromEnv(uint64_t now_ms) {
                   std::to_string(kMaxEntries) + "; using " +
                   std::to_string(clamped));
     entries = clamped;
+    config_dump::RecordResolved("DFKV_REMOVE_MEMORY_ENTRIES",
+                                std::to_string(entries));
   }
   DFKV_LOG_INFO("remove memory: on (" + std::to_string(window) + " ms, " +
                 std::to_string(entries) + " entries)");
@@ -187,6 +189,54 @@ uint64_t RemoveMemory::Query(uint64_t tenant_hash, const char* digests,
     answers_[answer].fetch_add(1, std::memory_order_relaxed);
   }
   return covered;
+}
+
+uint64_t RemoveMemory::QueryAges(uint64_t tenant_hash, const char* digests,
+                                 size_t count, uint64_t age_ms,
+                                 uint64_t now_ms, uint32_t* out) {
+  std::lock_guard<std::mutex> lk(mu_);
+  return QueryAgesLocked(tenant_hash, digests, count, age_ms,
+                         NowLocked(now_ms), out);
+}
+
+uint64_t RemoveMemory::QueryAgesLocked(uint64_t tenant_hash, const char* digests,
+                                       size_t count, uint64_t age_ms,
+                                       uint64_t now_ms, uint32_t* out) {
+  ExpireLocked(now_ms);
+  const uint64_t since =
+      now_ms > covered_since_ms_ ? now_ms - covered_since_ms_ : 0;
+  const uint64_t covered = std::min(since, window_ms_);
+  const bool known = age_ms <= covered;
+  for (size_t i = 0; i < count; ++i) {
+    uint32_t age = kAgeUnknown;
+    if (known) {
+      const char* d = digests + i * 16;
+      const BlockKey key{net::GetU64(d), net::GetU64(d + 8), tenant_hash};
+      const uint32_t pos = index_.empty() ? kEmpty : index_[SlotLocked(key)];
+      age = kAgeNone;
+      if (pos != kEmpty && now_ms - ring_[pos].at <= age_ms)
+        age = static_cast<uint32_t>(
+            std::min<uint64_t>(now_ms - ring_[pos].at, kAgeUnknown - 1));
+    }
+    out[i] = age;
+    // dfkv_removed_within_queries_total is the per-key op-25 metric. Op 26
+    // counts requests outside this table, not these keys a second time.
+  }
+  return covered;
+}
+
+void RemoveMemory::Clear(uint64_t now_ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  now_ms = NowLocked(now_ms);
+  head_ = size_ = 0;
+  std::fill(index_.begin(), index_.end(), kEmpty);
+  live_ = 0;
+  covered_since_ms_ = std::max(covered_since_ms_, now_ms);
+}
+
+void RemoveMemory::AdvanceTo(uint64_t now_ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  NowLocked(now_ms);
 }
 
 size_t RemoveMemory::Entries() {

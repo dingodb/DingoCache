@@ -12,6 +12,7 @@
 #include <tuple>
 #include <vector>
 
+#include "common/config_dump.h"
 #include "utils/net_util.h"
 
 using namespace dfkv;  // NOLINT
@@ -103,7 +104,23 @@ TEST(RemoveMemory, AFullMemoryDropsTheOldestAndKnowsLess) {
   EXPECT_EQ(m.QueriedKeys(RemoveMemory::kRemoved), 1u);
 }
 
-// Two threads read the clock before the lock: the one with the older time
+TEST(RemoveMemory, OpTwentyFiveCountsEachKeyOnce) {
+  RemoveMemory m(600000, 1024, 0);
+  m.Record(kA, 50);
+  std::vector<uint8_t> out(2);
+  const std::string digests = Digests({kA, kB});
+  EXPECT_EQ(m.Query(kA.tenant_hash, digests.data(), 2, 100, 100,
+                    out.data()), 100u);
+  EXPECT_EQ(m.QueriedKeys(RemoveMemory::kRemoved), 1u);
+  EXPECT_EQ(m.QueriedKeys(RemoveMemory::kNotRemoved), 1u);
+  EXPECT_EQ(m.QueriedKeys(RemoveMemory::kUnknown), 0u);
+  std::vector<uint32_t> ages(2);
+  m.QueryAges(kA.tenant_hash, digests.data(), 2, 100, 100,
+              ages.data());
+  EXPECT_EQ(m.QueriedKeys(RemoveMemory::kRemoved), 1u)
+      << "op-26 requests have a separate server counter, not one per key";
+}
+
 // can take the lock second. Its expiry must not take the newer record (an
 // underflow of now - at), and the answer must stay "removed".
 TEST(RemoveMemory, AnOlderClockReadingDoesNotExpireANewerRecord) {
@@ -130,6 +147,36 @@ TEST(RemoveMemory, OverflowingByOneMakesTheDroppedTimeUnknown) {
             RemoveMemory::kUnknown);
   EXPECT_EQ(Ask(m, {BlockKey{2, 2, 7}}, now - 2, now)[0],
             RemoveMemory::kRemoved);
+}
+
+TEST(RemoveMemory, EffectiveConfigReportsClampedCapacity) {
+  struct ClearEnv {
+    ~ClearEnv() {
+      ::unsetenv("DFKV_REMOVE_MEMORY_ENTRIES");
+      ::unsetenv("DFKV_REMOVE_MEMORY_MS");
+      config_dump::ResetForTest();
+    }
+  } clear;
+  ::setenv("DFKV_REMOVE_MEMORY_MS", "600000", 1);
+  for (const auto& [input, expected] :
+       {std::pair<const char*, const char*>{"1", "1024"},
+        {"67108865", "67108864"},
+        {"4096", "4096"},
+        {"", "1048576"}}) {
+    config_dump::ResetForTest();
+    testing::internal::CaptureStderr();
+    ::setenv("DFKV_REMOVE_MEMORY_ENTRIES", input, 1);
+    auto m = RemoveMemory::FromEnv(0);
+    config_dump::Emit("test");
+    const auto log = testing::internal::GetCapturedStderr();
+    EXPECT_NE(m, nullptr);
+    EXPECT_NE(log.find("DFKV_REMOVE_MEMORY_ENTRIES = " +
+                       std::string(expected) + "  ("),
+              std::string::npos)
+        << log;
+  }
+  ::unsetenv("DFKV_REMOVE_MEMORY_ENTRIES");
+  ::unsetenv("DFKV_REMOVE_MEMORY_MS");
 }
 
 TEST(RemoveMemory, OffUnlessConfigured) {

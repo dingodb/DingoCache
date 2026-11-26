@@ -2105,6 +2105,34 @@ TEST(RdmaLoopback, RemovedWithinIsAnsweredOverRdma) {
   for (size_t i = 1; i < answers.size(); ++i) EXPECT_EQ(answers[i], 0) << i;
 }
 
+// Op 26 (CLI-35) over the RDMA control lane, a direct PUT recorded in the
+// recent-PUT memory, and more keys than one request holds.
+TEST(RdmaLoopback, RemovedWithinAgesIsAnsweredOverRdma) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
+  ::setenv("DFKV_REMOVE_MEMORY_MS", "600000", 1);
+  ::setenv("DFKV_WRITE_MEMORY_ENTRIES", "65536", 1);
+  RdmaNode node("rmem-ages");
+  ::unsetenv("DFKV_REMOVE_MEMORY_MS");
+  ::unsetenv("DFKV_WRITE_MEMORY_ENTRIES");
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const std::string v(64, 'v');
+  ASSERT_TRUE(c.Remove("again"));
+  ASSERT_TRUE(c.Put("again", v.data(), v.size()));
+  std::vector<std::string> keys = {"again"};
+  for (int i = 0; i < 1500; ++i) keys.push_back("other-" + std::to_string(i));
+  std::vector<KVClient::MemoryAnswer> a;
+  ASSERT_EQ(c.RemovedWithinAges(node.addr, keys, 200, &a), Status::kOk);
+  ASSERT_EQ(a.size(), keys.size());
+  EXPECT_NE(a[0].removed_age, kRemovedAgeNone);
+  EXPECT_LE(a[0].written_age, a[0].removed_age);
+  for (size_t i = 1; i < a.size(); ++i) {
+    EXPECT_EQ(a[i].removed_age, kRemovedAgeNone) << i;
+    EXPECT_EQ(a[i].written_age, kRemovedAgeNone) << i;
+  }
+}
+
 TEST(RdmaLoopback, RemovedWithinOfANodeWithoutTheMemoryIsUnknown) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
   ::unsetenv("DFKV_REMOVE_MEMORY_MS");

@@ -49,7 +49,11 @@ enum class WireOp : uint8_t {
   kDeregister = 24,
   // Node (DFKV_REMOVE_MEMORY_MS): "was each key removed here within age_ms?"
   // (recent-REMOVE memory, CLI-02 stage M). See kRemovedWithin below.
-  kRemovedWithin = 25
+  kRemovedWithin = 25,
+  // Node (DFKV_REMOVE_MEMORY_MS, and DFKV_WRITE_MEMORY_ENTRIES for the
+  // write ages): the same question answered with ages, plus the age of each
+  // key's latest PUT (CLI-35). See kRemovedWithinAges below.
+  kRemovedWithinAges = 26
 };
 
 constexpr uint8_t kNativeProtoTcp = 6;
@@ -190,6 +194,19 @@ inline std::string EncodeRemovedWithinPayload(uint32_t age_ms,
   }
   return p;
 }
+
+// ---- kRemovedWithinAges (op 26) ----
+// The request of op 25. Ages are ms on the node's CLOCK_MONOTONIC_RAW at the
+// moment it answers. A node without the op, or without the memory, answers
+// kInvalid.
+//   reply   : u32 covered_ms | count x {u32 removed_age_ms, u32 written_age_ms}
+//             removed_age_ms: the latest REMOVE within age_ms, kAgeNone
+//             (0xFFFFFFFF) if none, kAgeUnknown (0xFFFFFFFE, every key) if
+//             age_ms reaches past what the node knows; written_age_ms: the
+//             latest acknowledged PUT, kAgeNone if none is remembered.
+constexpr uint32_t kRemovedAgeNone = 0xFFFFFFFFu;
+constexpr uint32_t kRemovedAgeUnknown = 0xFFFFFFFEu;
+constexpr size_t kRemovedWithinAgesKeyBytes = 8;
 
 // ---- kRetain (op 19) ----
 // A control op on the TCP lane and the RDMA control lane; the data path is

@@ -441,6 +441,18 @@ Status TcpTransport::RemovedWithin(const std::string& node,
                    0, count, payload.data(), payload.size(), out, 4 + count);
 }
 
+Status TcpTransport::RemovedWithinAges(const std::string& node,
+                                       uint64_t tenant_hash, uint64_t count,
+                                       const std::string& payload,
+                                       std::string* out) {
+  if (out == nullptr || count == 0 || count > kRemovedWithinMaxKeys)
+    return Status::kInvalid;
+  return RoundTrip(node, WireOp::kRemovedWithinAges,
+                   BlockKey{0, 0, tenant_hash}, 0, count, payload.data(),
+                   payload.size(), out,
+                   4 + count * kRemovedWithinAgesKeyBytes);
+}
+
 Status TcpTransport::Remove(const std::string& node, const BlockKey& key) {
   // kRemove is a key-only request (no payload), Status-only response: kOk when a
   // block was dropped, kNotFound when it was already absent (both fine for the

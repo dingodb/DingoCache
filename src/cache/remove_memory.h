@@ -60,6 +60,24 @@ class RemoveMemory {
   uint64_t Query(uint64_t tenant_hash, const char* digests, size_t count,
                  uint64_t age_ms, uint64_t now_ms, uint8_t* out);
 
+  // The same question answered with ages (kRemovedWithinAges, op 26): for
+  // each key, how many ms ago its latest record was made, kAgeNone if not
+  // within age_ms, kAgeUnknown (every key) if age_ms reaches past what is
+  // known. Expires first, as Query does. Returns CoveredMs.
+  static constexpr uint32_t kAgeNone = 0xFFFFFFFFu;
+  static constexpr uint32_t kAgeUnknown = 0xFFFFFFFEu;
+  uint64_t QueryAges(uint64_t tenant_hash, const char* digests, size_t count,
+                     uint64_t age_ms, uint64_t now_ms, uint32_t* out);
+
+  // Forgets every record; what the table knows starts at now_ms.
+  void Clear(uint64_t now_ms);
+
+  // Moves the table's time to at least now_ms: a record made after this
+  // call is stamped now_ms or later, whenever its caller read the clock.
+  void AdvanceTo(uint64_t now_ms);
+
+  uint64_t WindowMs() const { return window_ms_; }
+
   // Metrics.
   size_t Entries();
   uint64_t Dropped() const;
@@ -70,6 +88,11 @@ class RemoveMemory {
   size_t IndexSlotsForTest();
 
  private:
+  friend class WriteMemory;
+  // Caller holds mu_ and has selected an exact joint M/W snapshot time.
+  uint64_t QueryAgesLocked(uint64_t tenant_hash, const char* digests,
+                           size_t count, uint64_t age_ms, uint64_t now_ms,
+                           uint32_t* out);
   // One REMOVE: 32 bytes.
   struct Rec {
     BlockKey key;
