@@ -816,6 +816,11 @@ RamTier::PutResult RamTier::AwaitPut(
 
 void RamTier::CancelPutWaits() {
   put_waits_stopped_.store(true, std::memory_order_release);
+  // PUTs waiting at the watermark end their wait too (REQ-26).
+  {
+    std::lock_guard<std::mutex> lk(dirty_drop_mu_);
+  }
+  dirty_drop_cv_.notify_all();
   std::lock_guard<std::mutex> lk(put_wait_mu_);
   for (PutCompletion* completion : put_waiters_) {
     // Taking the waiter's mutex orders this wake-up after its check of the
@@ -891,7 +896,7 @@ RamTier::Admission RamTier::Admit(
       if (lane_full || dirty_bytes_.load(std::memory_order_relaxed) >= high) {
         // Only a NEW key may be rejected. No completion, allocation or flush
         // ownership has been created, and this is NOT a direct-disk bypass.
-        ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
+        // Counted by the caller once the PUT is refused (after any wait).
         return Admission::kBackpressure;
       }
     }
@@ -1225,19 +1230,78 @@ void RamTier::AbortReservation(
   CompletePut(state->completion, false);
 }
 
+// REQ-26: a RAM-ACK PUT of a new key refused at the dirty watermark waits,
+// up to ack_backpressure_wait_ms and the batch's put_wait_ms, for the flush to
+// bring the dirty bytes down, and is admitted again whenever they fall. The
+// key's lock is not held while it waits; it is taken again for each
+// admission, as the PUT may yet go to the disk.
+RamTier::Admission RamTier::AwaitDirtyDrop(
+    const BlockKey& key, const void* data, size_t len,
+    std::shared_ptr<PutCompletion>* completion,
+    std::unique_lock<std::mutex>* admission_lock,
+    std::chrono::steady_clock::time_point arrival, uint64_t seen) {
+  using Clock = std::chrono::steady_clock;
+  const Clock::time_point started = Clock::now();
+  Clock::time_point deadline =
+      started + std::chrono::milliseconds(opt_.ack_backpressure_wait_ms);
+  if (opt_.put_wait_ms != 0)
+    deadline = std::min(
+        deadline, (arrival == Clock::time_point{} ? started : arrival) +
+                      std::chrono::milliseconds(opt_.put_wait_ms));
+  backpressure_waits_.fetch_add(1, std::memory_order_relaxed);
+  Admission admission = Admission::kBackpressure;
+  if (before_backpressure_wait_registration_for_test_)
+    before_backpressure_wait_registration_for_test_();
+  dirty_drop_waiters_.fetch_add(1, std::memory_order_acq_rel);
+  if (after_backpressure_wait_registration_for_test_)
+    after_backpressure_wait_registration_for_test_();
+  for (;;) {
+    if (admission_lock && admission_lock->owns_lock()) admission_lock->unlock();
+    bool dropped = false;
+    {
+      std::unique_lock<std::mutex> lk(dirty_drop_mu_);
+      dropped = dirty_drop_cv_.wait_until(lk, deadline, [&] {
+        return dirty_drop_generation_.load(std::memory_order_acquire) !=
+                   seen ||
+               put_waits_stopped_.load(std::memory_order_acquire);
+      });
+    }
+    if (admission_lock) admission_lock->lock();
+    if (!dropped || put_waits_stopped_.load(std::memory_order_acquire)) break;
+    seen = dirty_drop_generation_.load(std::memory_order_acquire);
+    admission = Admit(key, data, len, /*client_ack=*/true, completion);
+    if (admission != Admission::kBackpressure) break;
+  }
+  dirty_drop_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+  backpressure_wait_us_.fetch_add(
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                Clock::now() - started)
+                                .count()),
+      std::memory_order_relaxed);
+  if (admission == Admission::kBackpressure)
+    backpressure_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+  return admission;
+}
+
 RamTier::PutResult RamTier::PutWriteBack(
     const BlockKey& key, const void* data, size_t len,
     std::unique_lock<std::mutex>* admission_lock,
     std::chrono::steady_clock::time_point arrival) {
   const bool synchronous = opt_.ack_high_watermark_pct == 0;
   std::shared_ptr<PutCompletion> completion;
-  const Admission admission =
-      Admit(key, data, len, !synchronous, &completion);
+  uint64_t seen = dirty_drop_generation_.load(std::memory_order_acquire);
+  Admission admission = Admit(key, data, len, !synchronous, &completion);
+  if (admission == Admission::kBackpressure &&
+      opt_.ack_backpressure_wait_ms != 0)
+    admission = AwaitDirtyDrop(key, data, len, &completion, admission_lock,
+                               arrival, seen);
   if (admission == Admission::kPersisted) return {Status::kOk};
   if (admission == Admission::kBypass)
     return {Status::kCacheFull, PutDisposition::kBypass};
-  if (admission == Admission::kBackpressure)
+  if (admission == Admission::kBackpressure) {
+    ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
     return {Status::kCacheFull, PutDisposition::kBackpressure};
+  }
   if (admission == Admission::kRejected) return {Status::kIOError};
   if (synchronous) {
     ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
@@ -1963,6 +2027,17 @@ void RamTier::SubDirty(uint32_t lane, uint64_t bytes) {
   // reader that sees the object leave the count (DirtyObjects, acquire).
   dirty_objects_.fetch_sub(1, std::memory_order_release);
   lane_dirty_[lane].fetch_sub(bytes, std::memory_order_relaxed);
+  // Every transition advances the generation, even one that drains the last
+  // object between a PUT's initial refusal and its waiter registration. The
+  // registration itself cannot be what makes that drop observable. Waiting
+  // PUTs then acquire the generation before retrying the dirty-byte checks.
+  dirty_drop_generation_.fetch_add(1, std::memory_order_release);
+  // The mutex closes the predicate-check/notification race. Avoid taking it
+  // or calling into the CV when nobody can be waiting.
+  if (dirty_drop_waiters_.load(std::memory_order_acquire) != 0) {
+    { std::lock_guard<std::mutex> lk(dirty_drop_mu_); }
+    dirty_drop_cv_.notify_all();
+  }
 }
 
 uint64_t RamTier::OldestDirtyAgeSeconds() const {

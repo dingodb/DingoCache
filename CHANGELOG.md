@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Server, RAM tier: a RAM-ACK PUT refused at the dirty watermark can wait
+  for the flush instead (REQ-26, `DFKV_RAM_ACK_BACKPRESSURE_WAIT_MS`, 0 by
+  default: refused at once, as before). Over the watermark (80% of the tier
+  unflushed) a PUT of a new key was answered kCacheFull, and the connectors
+  take that as not stored: measured on a 256 MiB tier after 250 MiB written,
+  a burst of 4 x 250 PUTs of 256 KiB had 625, 527 and 586 of 1000 refused in
+  three runs, though the flush cleared the backlog within tens of
+  milliseconds. With a wait of up to 50 ms none were refused, p99 4.7-6.9 ms,
+  at most 8.8 ms. The PUT
+  waits without its key's lock, is admitted again each time a value is
+  flushed, and is refused when the wait or the batch's
+  `DFKV_RAM_PUT_WAIT_MS` ends, or the server stops. New
+  `dfkv_ram_ack_backpressure_waits_total`, `_wait_timeouts_total`,
+  `_wait_microseconds_total`. `dfkv_ram_ack_backpressure_total` counts each
+  refused PUT once, after any wait.
+
 ## 2.44.0 — 2026-11-26
 
 - vLLM connector: support vLLM's manager-owned KV-cache allocation policy

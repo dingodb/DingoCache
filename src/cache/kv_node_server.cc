@@ -367,6 +367,17 @@ KvNodeServer::RamTierPlan KvNodeServer::PlanRamTier(size_t disk_count) {
   }
   config_dump::RecordResolved("DFKV_RAM_PUT_WAIT_MS",
                               std::to_string(o.put_wait_ms));
+  // REQ-26: how long a RAM-ACK PUT of a new key waits at the dirty
+  // watermark before it is refused (0 = refuse at once, as before).
+  {
+    envparse::U64Spec spec;
+    spec.fallback = o.ack_backpressure_wait_ms;
+    spec.max = 60000;
+    o.ack_backpressure_wait_ms = static_cast<uint32_t>(
+        envparse::EnvU64("DFKV_RAM_ACK_BACKPRESSURE_WAIT_MS", spec));
+  }
+  config_dump::RecordResolved("DFKV_RAM_ACK_BACKPRESSURE_WAIT_MS",
+                              std::to_string(o.ack_backpressure_wait_ms));
   config_dump::RecordResolved("DFKV_PUT_ACK_MODE",
                               plan.ack_enabled ? "ram" : "disk");
   config_dump::RecordResolved("DFKV_RAM_ACK_HIGH_WATERMARK_PCT",
@@ -1291,6 +1302,16 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_ack_backpressure_total", "counter",
            "RAM-ACK PUTs rejected at a positive dirty watermark or disk-ACKed at zero",
            ram_->AckBackpressure());
+    metric("dfkv_ram_ack_backpressure_waits_total", "counter",
+           "RAM-ACK PUTs that waited at the dirty watermark "
+           "(DFKV_RAM_ACK_BACKPRESSURE_WAIT_MS)",
+           ram_->BackpressureWaits());
+    metric("dfkv_ram_ack_backpressure_wait_timeouts_total", "counter",
+           "PUTs still refused when their wait at the dirty watermark ended",
+           ram_->BackpressureWaitTimeouts());
+    metric("dfkv_ram_ack_backpressure_wait_microseconds_total", "counter",
+           "Time PUTs spent waiting at the dirty watermark, in microseconds",
+           ram_->BackpressureWaitMicros());
     metric("dfkv_ram_parked_puts", "gauge",
            "PUTs waiting for the value that owns their key (disk-ACK PUTs waiting for its flush)",
            ram_->ParkedPuts());

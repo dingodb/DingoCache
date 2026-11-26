@@ -206,6 +206,11 @@ class RamTier {
     // one batch share it. Keep it below the clients' operation timeout: a
     // client that times out first treats the node as failed. 0 = no limit.
     uint32_t put_wait_ms = 3000;
+    // REQ-26: longest a RAM-ACK PUT of a new key waits for the dirty bytes to
+    // fall below the watermark (ack_high_watermark_pct) before it is refused
+    // with kCacheFull; also bounded by put_wait_ms from the batch's arrival.
+    // 0 = refuse at once, as before.
+    uint32_t ack_backpressure_wait_ms = 0;
     // Optional backing-index check for a key without a RAM owner, and for a
     // written RAM copy of a PUT's key. Invoked before the RAM shard lock (it
     // may wait for the disk store's lock); must be metadata-only and must not
@@ -522,6 +527,17 @@ class RamTier {
   uint64_t AckBackpressure() const {
     return ack_backpressure_.load(std::memory_order_relaxed);
   }
+  // REQ-26: PUTs that waited at the watermark, those of them still refused
+  // when the wait ended, and the time waited (microseconds).
+  uint64_t BackpressureWaits() const {
+    return backpressure_waits_.load(std::memory_order_relaxed);
+  }
+  uint64_t BackpressureWaitTimeouts() const {
+    return backpressure_wait_timeouts_.load(std::memory_order_relaxed);
+  }
+  uint64_t BackpressureWaitMicros() const {
+    return backpressure_wait_us_.load(std::memory_order_relaxed);
+  }
   // PUTs parked right now, waiting for the value that owns their key.
   size_t ParkedPuts() const {
     std::lock_guard<std::mutex> lk(put_wait_mu_);
@@ -685,6 +701,10 @@ class RamTier {
   // Tests: called with the shard lock held right after a flush that gave up
   // dropped its value.
   std::function<void()> after_drop_for_test_;
+  // Tests: called after the initial dirty-watermark refusal and before the
+  // waiter registration, so a test can drain the final object in that window.
+  std::function<void()> before_backpressure_wait_registration_for_test_;
+  std::function<void()> after_backpressure_wait_registration_for_test_;
   void ReleaseToken(uint64_t token);
   bool TryReserve(uint64_t bytes);
   bool TryReserveLarge(uint64_t bytes);
@@ -808,9 +828,23 @@ class RamTier {
   std::unique_ptr<std::atomic<uint64_t>[]> lane_dirty_;
   uint32_t LaneOf(const BlockKey& key) const;
   void Enqueue(Shard& s, QItem item);
+  Admission AwaitDirtyDrop(const BlockKey& key, const void* data, size_t len,
+                           std::shared_ptr<PutCompletion>* completion,
+                           std::unique_lock<std::mutex>* admission_lock,
+                           std::chrono::steady_clock::time_point arrival,
+                           uint64_t seen);
   void AddDirty(uint32_t lane, uint64_t bytes);
   void SubDirty(uint32_t lane, uint64_t bytes);
   std::atomic<uint64_t> ram_acks_{0}, ack_backpressure_{0};
+  // REQ-26: a PUT refused at the watermark waits here for the dirty bytes to
+  // fall. Every SubDirty transition bumps the generation, including a drain
+  // before waiter registration; the waiter count only gates CV notification.
+  std::mutex dirty_drop_mu_;
+  std::condition_variable dirty_drop_cv_;
+  std::atomic<uint64_t> dirty_drop_generation_{0};
+  std::atomic<uint32_t> dirty_drop_waiters_{0};
+  std::atomic<uint64_t> backpressure_waits_{0}, backpressure_wait_timeouts_{0},
+      backpressure_wait_us_{0};
   // PUTs parked in AwaitPut, so CancelPutWaits can wake exactly them. Lock
   // order: put_wait_mu_ before a completion's mutex.
   mutable std::mutex put_wait_mu_;

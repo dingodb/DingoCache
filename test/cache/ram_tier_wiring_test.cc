@@ -102,9 +102,11 @@ class KvNodeServerWiringTestPeer {
   static void End(KvNodeServer& server) { server.EndPut(); }
   static void SetRam(KvNodeServer& server, RamTier::FlushFn flush,
                      bool ram_ack = false, uint32_t watermark_pct = 80,
-                     uint32_t put_wait_ms = 3000) {
+                     uint32_t put_wait_ms = 3000,
+                     uint32_t backpressure_wait_ms = 0) {
     RamTier::Options options;
     options.put_wait_ms = put_wait_ms;
+    options.ack_backpressure_wait_ms = backpressure_wait_ms;
     options.bytes = 16 * 4096;
     options.large_reserve_bytes = 0;
     options.reclaim_interval_ms = 0;
@@ -118,6 +120,9 @@ class KvNodeServerWiringTestPeer {
     server.ram_ = std::make_unique<RamTier>(options, std::move(flush));
     server.ram_write_back_ = true;
     server.ram_ack_enabled_ = ram_ack;
+  }
+  static void CancelPutWaits(KvNodeServer& server) {
+    server.ram_->CancelPutWaits();
   }
   static auto LockPut(KvNodeServer& server, const BlockKey& key) {
     return std::make_unique<KvNodeServer::PutKeyLock>(server.LockPutKey(key));
@@ -852,6 +857,190 @@ TEST(RamTierWiring, DirtyWatermarkRejectsWithoutCallingDiskAndRecovers) {
   EXPECT_TRUE(server->Healthy());
   server.reset();
   fs::remove_all(dir);
+}
+
+// REQ-26: with DFKV_RAM_ACK_BACKPRESSURE_WAIT_MS a PUT of a new key refused
+// at the dirty watermark waits for the flush to bring the dirty bytes down.
+// The flush is held by a barrier: the first value fills the watermark (25%
+// of 64 KiB), and a second key's PUT then has to wait.
+namespace {
+struct WatermarkNode {
+  fs::path dir;
+  std::atomic<size_t> disk_calls{0};
+  FlushBarrier barrier;
+  std::unique_ptr<KvNodeServer> server;
+  std::string first_value = std::string(16 * 1024, 'a');
+  explicit WatermarkNode(const std::string& tag, uint32_t wait_ms,
+                         uint32_t put_wait_ms = 3000) {
+    ::unsetenv("DFKV_RAM_TIER");
+    dir = fs::temp_directory_path() / ("dfkv_bp_wait_" + tag);
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+    options.engine_factory = [this](const std::string& path, uint64_t cap) {
+      return std::make_unique<CountingStore>(path, cap, disk_calls);
+    };
+    server = KvNodeServerWiringTestPeer::Create(std::move(options));
+    KvNodeServerWiringTestPeer::SetLimit(*server, 0);
+    KvNodeServer* node = server.get();
+    KvNodeServerWiringTestPeer::SetRam(
+        *server,
+        [this, node](const BlockKey& key, char* data, size_t len, size_t) {
+          barrier.Block();
+          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len);
+        },
+        /*ram_ack=*/true, /*watermark_pct=*/25, put_wait_ms, wait_ms);
+  }
+  ~WatermarkNode() {
+    barrier.Open();
+    server.reset();
+    fs::remove_all(dir);
+  }
+  Status Put(const BlockKey& key, const std::string& value) {
+    std::string out;
+    return server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                        key, 0, 0, value.data(), value.size(),
+                                        &out);
+  }
+  long Metric(const char* name) { return MetricVal(server->MetricsText(), name); }
+};
+}  // namespace
+
+TEST(RamTierWiring, AWatermarkWaitAdmitsThePutWhenTheFlushDrains) {
+  WatermarkNode n("admit", /*wait_ms=*/5000);
+  const BlockKey first{7201, 0}, second{7202, 0};
+  ASSERT_EQ(n.Put(first, n.first_value), Status::kOk);
+  ASSERT_TRUE(n.barrier.AwaitEntry());
+  std::atomic<bool> done{false};
+  Status st = Status::kInvalid;
+  std::thread put([&] {
+    st = n.Put(second, std::string(500, 'b'));
+    done = true;
+  });
+  std::this_thread::sleep_for(100ms);
+  EXPECT_FALSE(done.load()) << "refused instead of waiting";
+  n.barrier.Open();  // the flush drains; the waiting PUT is admitted
+  put.join();
+  EXPECT_EQ(st, Status::kOk);
+  EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_waits_total"), 1);
+  EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_wait_timeouts_total"), 0);
+  EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_total"), 0);
+  EXPECT_GE(n.Metric("dfkv_ram_ack_backpressure_wait_microseconds_total"),
+            100000);
+}
+
+// The wait ends at DFKV_RAM_ACK_BACKPRESSURE_WAIT_MS, and at the batch's
+// DFKV_RAM_PUT_WAIT_MS if that comes first: then the PUT is refused.
+TEST(RamTierWiring, AWatermarkWaitIsBounded) {
+  for (const auto& [wait_ms, put_wait_ms] :
+       std::vector<std::pair<uint32_t, uint32_t>>{{150, 3000}, {5000, 150}}) {
+    SCOPED_TRACE(std::to_string(wait_ms) + "/" + std::to_string(put_wait_ms));
+    WatermarkNode n("bound" + std::to_string(wait_ms), wait_ms, put_wait_ms);
+    const BlockKey first{7211, 0}, second{7212, 0};
+    ASSERT_EQ(n.Put(first, n.first_value), Status::kOk);
+    ASSERT_TRUE(n.barrier.AwaitEntry());
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(n.Put(second, std::string(500, 'b')), Status::kCacheFull);
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    EXPECT_GE(waited, 140ms);
+    EXPECT_LT(waited, 2s);
+    EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_wait_timeouts_total"), 1);
+    EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_total"), 1);
+    EXPECT_EQ(n.disk_calls.load(), 0u) << "a refusal must not go to the disk";
+  }
+}
+
+// CacheDirectForKey's batch_arrival is the same absolute budget as the TCP
+// path: a pre-aged direct PUT gets only the remainder, and an expired batch
+// does not wait through another full watermark interval. Each terminal
+// refusal is counted once even though admission has its own wait counters.
+TEST(RamTierWiring, WatermarkWaitUsesTheRemainingDirectBatchBudget) {
+  WatermarkNode n("direct-budget", /*wait_ms=*/5000, /*put_wait_ms=*/400);
+  const BlockKey first{7211, 0}, pre_aged{7212, 0}, expired{7213, 0};
+  ASSERT_EQ(n.Put(first, n.first_value), Status::kOk);
+  ASSERT_TRUE(n.barrier.AwaitEntry());
+  std::vector<char> value(500, 'b');
+
+  auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(n.server->CacheDirectForKey(pre_aged, value.data(), value.size(),
+                                        value.size(), t0 - 300ms),
+            Status::kCacheFull);
+  auto waited = std::chrono::steady_clock::now() - t0;
+  EXPECT_GE(waited, 90ms);
+  EXPECT_LT(waited, 300ms) << "the PUT got a fresh 400 ms batch budget";
+  EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_waits_total"), 1);
+  EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_wait_timeouts_total"), 1);
+  EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_total"), 1);
+  EXPECT_EQ(n.disk_calls.load(), 0u);
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*n.server, pre_aged));
+
+  t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(n.server->CacheDirectForKey(expired, value.data(), value.size(),
+                                        value.size(), t0 - 500ms),
+            Status::kCacheFull);
+  waited = std::chrono::steady_clock::now() - t0;
+  EXPECT_LT(waited, 50ms) << "an expired batch waited again";
+  EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_waits_total"), 2);
+  EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_wait_timeouts_total"), 2);
+  EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_total"), 2);
+  EXPECT_EQ(n.disk_calls.load(), 0u);
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*n.server, expired));
+}
+
+// While a PUT waits, its key's lock is free, a GET on another thread (another
+// connection) is served, and a stop ends the wait at once.
+TEST(RamTierWiring, AWatermarkWaitHoldsNoKeyLockBlocksNoGetAndEndsAtStop) {
+  WatermarkNode n("lock", /*wait_ms=*/10000);
+  const BlockKey first{7221, 0}, second{7222, 0};
+  ASSERT_EQ(n.Put(first, n.first_value), Status::kOk);
+  ASSERT_TRUE(n.barrier.AwaitEntry());
+  std::atomic<bool> done{false};
+  Status st = Status::kInvalid;
+  std::thread put([&] {
+    st = n.Put(second, std::string(500, 'b'));
+    done = true;
+  });
+  ASSERT_TRUE(WaitFor([&] {
+    return n.Metric("dfkv_ram_ack_backpressure_waits_total") == 1;
+  }));
+  {
+    // Taken and released on the same thread (a lock is released by the
+    // thread that took it).
+    auto locked = std::async(std::launch::async, [&] {
+      auto lock = KvNodeServerWiringTestPeer::LockPut(*n.server, second);
+      return lock != nullptr;
+    });
+    EXPECT_EQ(locked.wait_for(1s), std::future_status::ready)
+        << "the waiting PUT holds its key's lock";
+  }
+  auto get = std::async(std::launch::async, [&] {
+    std::string out;
+    const Status s = n.server->ProcessRequestForKey(
+        static_cast<uint8_t>(WireOp::kRange), first, 0, 0, nullptr, 0, &out);
+    return s == Status::kOk && out == n.first_value;
+  });
+  ASSERT_EQ(get.wait_for(1s), std::future_status::ready)
+      << "a GET waited for the waiting PUT";
+  EXPECT_TRUE(get.get());
+  EXPECT_FALSE(done.load());
+  const auto t0 = std::chrono::steady_clock::now();
+  KvNodeServerWiringTestPeer::CancelPutWaits(*n.server);
+  put.join();
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, 1s);
+  EXPECT_EQ(st, Status::kCacheFull);
+}
+
+// With the default (0) the PUT is refused at once, as before.
+TEST(RamTierWiring, WithoutAWatermarkWaitTheRefusalIsImmediate) {
+  WatermarkNode n("none", /*wait_ms=*/0);
+  const BlockKey first{7231, 0}, second{7232, 0};
+  ASSERT_EQ(n.Put(first, n.first_value), Status::kOk);
+  ASSERT_TRUE(n.barrier.AwaitEntry());
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(n.Put(second, std::string(500, 'b')), Status::kCacheFull);
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, 100ms);
+  EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_waits_total"), 0);
+  EXPECT_EQ(n.Metric("dfkv_ram_ack_backpressure_total"), 1);
 }
 
 // A tenant with a node quota skips RAM write-back admission. The direct (RDMA)
