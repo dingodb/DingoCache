@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.44.0 — 2026-11-26
+
 - vLLM connector: support vLLM's manager-owned KV-cache allocation policy
   (introduced by upstream #61452) and current main while retaining the legacy
   pinned policy-typed-spec API. Groups resolve their real manager config and
@@ -19,6 +21,51 @@
   policy, each group's logical bytes per block, and draft/lookahead semantics.
   Existing objects intentionally cold-miss; no legacy reads, dual writes,
   aliases, server upgrade, ABI/wire change, or cache deletion is required.
+
+- Server, RDMA: GET grants can be bound by memory windows (RDS-09,
+  `DFKV_RDMA_SERVER_MW=1`, off by default; design in
+  `docs/design/server-memory-windows.md`). Each GET registered a memory
+  region over the value it served and deregistered it at the RELEASE, about
+  55 us per GET (220 us at 4 MiB). With the switch on, each RAM-arena
+  extent is registered once per rail, with no remote access (without a RAM
+  tier the switch does nothing, as the startup log says), and a GET of a
+  value in the RAM tier binds a type-2B window on its own connection (3.5 us) that the
+  RELEASE invalidates (3.4 us); the range is reused only after the
+  invalidation's completion and a quarantine of at least 5 ms (longer with
+  many GET bytes outstanding on the rail). Measured, one GET at a time:
+  the server's authorization of a grant 15-30 -> 1-1.5 us; GET p50 from the
+  RAM tier 221 -> 146 us at 64 KiB, 220 -> 198 us at 1 MiB, 424 -> 508 us
+  at 4 MiB (its RELEASE reply waits behind the invalidation). A GET staged
+  from disk keeps its per-grant MR: a READ of memory the disk has just
+  written by DMA is slow through any registration older than the write,
+  and fast through one made after it (RDS-29).
+  Nothing changes on the wire; clients of every version are served. A rail
+  whose device has no type-2B windows, a connection that cannot allocate
+  them, an arena extent not registered yet, a full quarantine: each uses the
+  per-grant MR, counted. Leased PUTs keep their per-grant MR. The residual
+  risk is confidentiality only, toward a client violating the protocol
+  (reading after its own RELEASE); never data corruption. On mlx5 a READ
+  accepted before the invalidation, or its retransmission, may read the
+  reused range for up to the client's transport retry horizon (about 3.7 s
+  at the defaults); the quarantine does not cover that. The default stays
+  off until it is established on real hardware whether mlx5 re-checks the
+  R_Key on a retransmitted READ. Under concurrency (4 client threads),
+  windows are faster from the RAM tier (64 KiB in batches of 8: 29000 ->
+  42000 GET/s) and as fast for GETs staged from disk (256 KiB: 5040 ->
+  5390 GET/s). New
+  `dfkv_rdma_server_mw_*` metrics and
+  `dfkv_rdma_server_grant_register_seconds` (both modes). A receive chunk
+  is now freed after the pool lock is released when it is trimmed. Quarantine
+  time uses the configured maximum hold, instead of hoping a bind-time rail
+  estimate bounds later grants; that estimate only selects a window versus a
+  per-grant MR at authorization. The byte cap accounts whole arena allocations
+  (including padding), plus temporary staging leases. Both reserved grants and
+  actual quarantine are charged under one accounting lock, with each reserved
+  amount moving unambiguously into quarantine rather than being recomputed
+  from the later data length. Concurrent admissions cannot overshoot;
+  the gauge continues to count actual quarantine only. Teardown checks the
+  QP-to-error transition before retrying refused windows; it stays fail-closed
+  when revocation cannot be proven, without assuming a provider-wide timeout.
 
 ## 2.43.0 — 2026-11-25
 
@@ -289,50 +336,6 @@
   once was slower: 620-683 ms against 411-417 ms for 1 GiB on two rails),
   and the lock is taken only to publish the new declaration, whole. A
   destroyed transport waits for a registration in flight.
-- Server, RDMA: GET grants can be bound by memory windows (RDS-09,
-  `DFKV_RDMA_SERVER_MW=1`, off by default; design in
-  `docs/design/server-memory-windows.md`). Each GET registered a memory
-  region over the value it served and deregistered it at the RELEASE, about
-  55 us per GET (220 us at 4 MiB). With the switch on, each RAM-arena
-  extent is registered once per rail, with no remote access (without a RAM
-  tier the switch does nothing, as the startup log says), and a GET of a
-  value in the RAM tier binds a type-2B window on its own connection (3.5 us) that the
-  RELEASE invalidates (3.4 us); the range is reused only after the
-  invalidation's completion and a quarantine of at least 5 ms (longer with
-  many GET bytes outstanding on the rail). Measured, one GET at a time:
-  the server's authorization of a grant 15-30 -> 1-1.5 us; GET p50 from the
-  RAM tier 221 -> 146 us at 64 KiB, 220 -> 198 us at 1 MiB, 424 -> 508 us
-  at 4 MiB (its RELEASE reply waits behind the invalidation). A GET staged
-  from disk keeps its per-grant MR: a READ of memory the disk has just
-  written by DMA is slow through any registration older than the write,
-  and fast through one made after it (RDS-29).
-  Nothing changes on the wire; clients of every version are served. A rail
-  whose device has no type-2B windows, a connection that cannot allocate
-  them, an arena extent not registered yet, a full quarantine: each uses the
-  per-grant MR, counted. Leased PUTs keep their per-grant MR. The residual
-  risk is confidentiality only, toward a client violating the protocol
-  (reading after its own RELEASE); never data corruption. On mlx5 a READ
-  accepted before the invalidation, or its retransmission, may read the
-  reused range for up to the client's transport retry horizon (about 3.7 s
-  at the defaults); the quarantine does not cover that. The default stays
-  off until it is established on real hardware whether mlx5 re-checks the
-  R_Key on a retransmitted READ. Under concurrency (4 client threads),
-  windows are faster from the RAM tier (64 KiB in batches of 8: 29000 ->
-  42000 GET/s) and as fast for GETs staged from disk (256 KiB: 5040 ->
-  5390 GET/s). New
-  `dfkv_rdma_server_mw_*` metrics and
-  `dfkv_rdma_server_grant_register_seconds` (both modes). A receive chunk
-  is now freed after the pool lock is released when it is trimmed. Quarantine
-  time uses the configured maximum hold, instead of hoping a bind-time rail
-  estimate bounds later grants; that estimate only selects a window versus a
-  per-grant MR at authorization. The byte cap accounts whole arena allocations
-  (including padding), plus temporary staging leases. Both reserved grants and
-  actual quarantine are charged under one accounting lock, with each reserved
-  amount moving unambiguously into quarantine rather than being recomputed
-  from the later data length. Concurrent admissions cannot overshoot;
-  the gauge continues to count actual quarantine only. Teardown checks the
-  QP-to-error transition before retrying refused windows; it stays fail-closed
-  when revocation cannot be proven, without assuming a provider-wide timeout.
 
 
 - RDMA client: the device context stays open while the transport lives
