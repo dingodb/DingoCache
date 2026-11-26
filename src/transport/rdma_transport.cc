@@ -335,6 +335,7 @@ const char* WireOpLogName(uint8_t op) {
     case WireOp::kLeasePut: return "lease_put";
     case WireOp::kRetain: return "retain";
     case WireOp::kRemovedWithin: return "removed_within";
+    case WireOp::kRemovedWithinAges: return "removed_within_ages";
     default: return "unknown";
   }
 }
@@ -3729,7 +3730,8 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     }
     const uint64_t response_bound =
         op == WireOp::kMembers || op == WireOp::kRetain ||
-                op == WireOp::kRemovedWithin
+                op == WireOp::kRemovedWithin ||
+                op == WireOp::kRemovedWithinAges
             ? rdma::kV2ControlResponseMax
             : 0;
     if (ok && !conn->Decode(
@@ -3860,6 +3862,17 @@ Status RdmaTransport::RemovedWithin(const std::string& node,
     return Status::kInvalid;
   return RoundTrip(node, WireOp::kRemovedWithin, BlockKey{0, 0, tenant_hash},
                    0, count, payload.data(), payload.size(), out);
+}
+
+Status RdmaTransport::RemovedWithinAges(const std::string& node,
+                                        uint64_t tenant_hash, uint64_t count,
+                                        const std::string& payload,
+                                        std::string* out) {
+  if (out == nullptr || count == 0 || count > kRemovedWithinMaxKeys)
+    return Status::kInvalid;
+  return RoundTrip(node, WireOp::kRemovedWithinAges,
+                   BlockKey{0, 0, tenant_hash}, 0, count, payload.data(),
+                   payload.size(), out);
 }
 
 Status RdmaTransport::Remove(const std::string& node, const BlockKey& key) {

@@ -1,8 +1,7 @@
 # Unavailable owners: absent grace, cooldown reroute, recent-REMOVE memory, read-back
 
-Status: design, revision 11 (stage B's code). Stages A, C and M are
-implemented; the rest is design. Each
-mechanism sits behind its own switch, off by default; none changes a released
+Status: design revision 12 is implemented by this change (CLI-35 W);
+stages A, C, M and B were implemented earlier. Each mechanism sits behind its own switch, off by default; none changes a released
 binary. A and C are client-side only. The recent-REMOVE memory (M) adds one
 wire op and server state; B depends on M and does not ship without it.
 
@@ -551,6 +550,177 @@ current owner may ask the previous owner once.
   index, about 48 B) is a prerequisite, as is a per-node memory figure at
   the group's REMOVE rate × H.
 
+### 3.5 W: rewrite after REMOVE (CLI-35; server `DFKV_WRITE_MEMORY_ENTRIES`, client `DFKV_RING_READBACK_REWRITE`, both default 0 = off)
+
+B refuses every read-back of a key that some asked node removed within H,
+even when the key was written again at P after that REMOVE. Under churn
+these are most of B's refusals: in case 5 (§7) the first 10 s after the
+return reach 56 % full against a steady 69 %, and the misses are
+`refused_removed` read-backs of keys removed and written again (CLI-02
+measurement). W lets B read such a key back when P's copy was written after
+every REMOVE an asked node reports.
+
+- **What has to be shown.** A read-back of K from P is admissible (§7's
+  correctness definition) if an acknowledged PUT of K was handled at P
+  after each REMOVE of K that an asked node recorded. M records a REMOVE
+  while handling it, before the acknowledgement (§3.3); W records a PUT the
+  same way. If P's PUT record comes after a REMOVE record, the PUT ended
+  after the REMOVE started: the two overlap or the PUT follows, so a history
+  with the PUT after the REMOVE exists and the value is a legitimate answer.
+  REMOVEs no asked node saw are the residual of §3.4's overlap argument
+  (c ≤ F − 2), unchanged. A REMOVE that lands after the question is
+  concurrent with the reader's GET (the read-back is part of that GET call,
+  which began before the question), as in §3.4.
+- **What P must know.** For K: how long ago P last acknowledged a PUT of
+  K, stored or answered as already present (a duplicate PUT is a PUT of an
+  interchangeable value, §2). Only writes within the lookback matter: a
+  write older than H precedes every REMOVE M reports (M answers about the
+  last H only), so the old rule applies. Hence a RAM table of recent PUTs,
+  not a field per stored value:
+  - **W, the recent-PUT memory**, the structure of M (CLI-33: a ring of
+    32-byte records and an open-addressing index of 4-byte slots, 40 B an
+    entry), split into 16 shards by key hash. While W is on, PUT, REMOVE and
+    op 26 serialize a logical key against a separate publication mutex,
+    distinct from the RAM tier's admission lock. It uses one of 64 hash
+    buckets (collisions only serialize unrelated keys unnecessarily);
+    a batch is locked in bucket order, once per bucket. That outer lock covers
+    REMOVE's storage operations as well as publication and remains held when
+    the RAM tier releases the inner lock for a flush. Op 26 then holds M's
+    table lock and W's epoch lock in that order and evaluates both at the
+    maximum of its sampled RAW, M's watermark and W's watermark. An unrelated
+    key can advance either table only before or after that joint evaluation;
+    it cannot make one response use different effective times for M and W.
+    Window: the node's `DFKV_REMOVE_MEMORY_MS`; capacity
+    `DFKV_WRITE_MEMORY_ENTRIES` (0 = off; 1024-67108864), full: the oldest
+    is dropped. W needs no coverage: a key not in W has *no recent write*,
+    and B then applies the old rule (refuses on any REMOVE). Losing W
+    (capacity, restart) only loses read-backs.
+  - Recorded: every PUT the node acknowledges `kOk`, including the
+    already-present answer, before the reply. Not recorded: internal copies
+    (RAM-tier promotion, a drain's copy, a warm restart's reload), which are
+    not PUTs.
+- **Clocks: ages, never times.** The crux is comparing P's write with
+  REMOVEs recorded on other nodes. Wall-clock times would need a bound on
+  the offset between nodes, which NTP does not give under steps, bad
+  configuration or a node that never synced. W and M therefore keep each
+  node's own clock and answer *ages*: how many ms ago, on the answering
+  node's clock, at the moment it answers. An age depends only on that
+  node's clock *rate*, never on its offset.
+  - **Which clock: `CLOCK_MONOTONIC_RAW`, on every node (M and W) and on
+    the client (its request times).** `CLOCK_MONOTONIC` and
+    `CLOCK_BOOTTIME` are "affected by frequency adjustments"; RAW "provides
+    access to a raw hardware-based time that is not subject to frequency
+    adjustments" (clock_gettime(2)). The adjustments are not small:
+    adjtimex(2) clamps `ADJ_FREQUENCY` to (−32768000, +32768000) in units
+    of 2⁻¹⁶ ppm, i.e. ±500 ppm, but also lets the tick length be set
+    between 900000/HZ and 1100000/HZ (`ADJ_TICK`, ±10 %), and chrony slews
+    through it: chrony.conf(5), `maxslewrate`: "By default, the maximum
+    slew rate is set to 83333.333 ppm (one twelfth)", with a Linux driver
+    limit of 100000 ppm. A clock slewed slow on P understates P's write
+    age, so the write looks newer: the unsafe direction, on stock hosts
+    (after a VM resume or a late first sync). M moves from the steady
+    clock to RAW too (a REMOVE age overstated on node i is the same unsafe
+    direction); M's answers to op 25 do not change.
+  - **Assumption (rate):** every node's and the client's raw oscillator
+    advances at the real rate within ρ = 1000 ppm (commodity oscillators
+    are in the ±100 ppm class; NTP slewing does not apply to RAW). A
+    constant, not a switch.
+  - **Stopped clocks.** RAW "does not count time that the system is
+    suspended" (clock_gettime(2)), and a VM's guest clock may not count a
+    pause. A stopped clock on P makes its write look newer than it is.
+    Each node with W samples (`CLOCK_REALTIME` − RAW) and
+    (`CLOCK_BOOTTIME` − RAW) at its 1 s tick and again before answering
+    op 26, and keeps the tick samples of the last `DFKV_REMOVE_MEMORY_MS`
+    (W's window; a sliding maximum and minimum, at most one sample a
+    second). When max − min of either over that span exceeds G = 1000 ms
+    (suspend, a pause the host clock catches up on, an NTP step, and also
+    many short pauses: repeated stops of under G between ticks add up
+    over the window, which a tick-to-tick check would never see), W is
+    cleared before the answer (counted; only read-backs are lost) and the
+    samples start again; they also start again whenever W is empty, so the
+    raw oscillator's slow drift against the disciplined clocks (about
+    0.1 s over an hour at 30 ppm) never accumulates. Every write W holds is
+    then within a span over which P's RAW clock lost at most G against
+    real time, so the rule below keeps a guard of G. A large chrony slew of
+    REALTIME (up to one twelfth, above) can also exceed G within the
+    window and clear W spuriously: only read-backs are lost. Residual, stated as a limit: a pause that neither REALTIME nor
+    BOOTTIME shows until NTP corrects it later (a guest whose wall clock
+    stops with it); between the resume and that correction W can err.
+    Paused clocks on other nodes only make their REMOVEs look newer (the
+    safe direction), and P's own records share one clock.
+  - **Where W may be turned on (DEPLOY states it with the code):** bare
+    metal, or hypervisors whose guest clocks count pauses (the guest's
+    REALTIME is corrected at resume). If that is unknown, leave W off.
+- **The comparison.** The client sends the question to the nodes of the
+  ask set. For each request X actually answered (per chunk and per
+  attempt, never per call: a node asked in two chunks, a retry, or the
+  op-25 fallback each has its own times) it notes the send and reply
+  times s_X ≤ e_X on its RAW clock; the node computed its ages at some
+  moment in [s_X, e_X]. An answered age a (ms, floored, so the true reading
+  is in [a, a + 1)) measures between a/(1 + ρ) and (a + 1)/(1 − ρ) real ms,
+  so the event lies in [s_X − (a + 1)/(1 − ρ), e_X − a/(1 + ρ)] in the
+  client's time. With P's write age b and node i's REMOVE age a_i, taken
+  from the requests that carried those keys, the write is after the
+  REMOVE for certain if s_P − (b + 1)/(1 − ρ) > e_i − a_i/(1 + ρ). The
+  rule the client applies adds the client's own rate over the gap and the
+  pause guard G:
+
+      a_i/(1 + ρ) − (b + 1)/(1 − ρ) > max(0, e_i − s_P)/(1 − ρ) + G.
+
+  The gap e_i − s_P is negative when node i answered before P was asked
+  (sequential chunks, a retry, the fallback round trip, more nodes than
+  workers); dividing a negative gap by (1 − ρ) would overstate the
+  separation, hence max(0, ·). Only differences of the client's readings
+  enter, never its offset. For P's own records (i = P), M and W share the
+  same per-key publication locks: they cover REMOVE from before its storage
+  operations through its record, the corresponding PUT path, and op 26's
+  read of both tables at one RAW millisecond. Consequently a rewrite later
+  than a REMOVE never looks older, even within one millisecond, but equal
+  integer ages carry no sub-millisecond order. Equal ages are refused: they
+  may equally be a completed PUT followed by its REMOVE in the same millisecond.
+  The joint snapshot orders the tables' reads, not the completed PUT/REMOVE.
+  A valid rewrite therefore has a_P > b. Unknown answers and missing W records
+  fail closed. Every W write checks for a clock jump and clears the table
+  before publishing, so an acknowledged record
+  cannot escape a pause check merely by racing one. With no W record at that
+  joint snapshot the old rule still applies (refuse). Read back iff no asked
+  *unknown*, and every asked node either reports no REMOVE within H or a
+  REMOVE the write is after by this rule. Otherwise the old rule stands
+  (refuse). Margin in practice: G plus about 0.12 s for ages of a minute
+  plus the request spread, so a rewrite more than about 1.2 s after a
+  REMOVE is recognized.
+- **Wire: one new op, `kRemovedWithinAges = 26`.** TCP and RDMA, the
+  request of op 25. Reply `kOk`: `u32 covered_ms`, then per key
+  `u32 removed_age_ms | u32 written_age_ms`, each `0xFFFFFFFF` for "none
+  within the window" and, for `removed_age_ms`, `0xFFFFFFFE` for *unknown*
+  (beyond coverage). 8 bytes a key: 1024 keys still fit the 32 KiB RDMA
+  control frame. Every node answers both fields; B uses `written_age_ms` of
+  P only.
+- **Version gating and interop.** Op 26 is sent only by a client with
+  `DFKV_RING_READBACK_REWRITE=1` (which requires B). A node without op 26
+  (older release, or M off) answers `kInvalid`: the client asks that node
+  op 25 instead, remembered for 60 s as for "no M" (§3.3). A node with M
+  but W off answers op 26 with `written_age_ms = none`. Fail closed in
+  every mixed case: a REMOVE known only as op 25's bit counts as just now
+  (age 0), so no write can be shown after it; P without op 26 or without W
+  has no recent write; any *unknown* refuses. With the client switch off
+  nothing is sent that is not sent today.
+- **Cost.** Memory: 40 B per PUT within the window, at most
+  `DFKV_WRITE_MEMORY_ENTRIES` × 40 B (40 MiB at 1 Mi). At a high PUT rate
+  the window is cut by capacity: older rewrites are not recognized (fewer
+  read-backs, never more). CPU: one W record per acknowledged PUT (about
+  0.3 µs, CLI-33's measurement of M, under a shard lock), one W lookup per
+  key asked. Reply: 8 B a key instead of 1. Nothing on GET or EXIST. With W
+  enabled, REMOVE takes the same publication mutex across storage and M
+  publication; op 26 takes each queried bucket once while reading M and W.
+- **Metrics.** Server: `dfkv_removed_within_ages_requests_total` (op 26
+  answered), `dfkv_write_memory_entries`,
+  `dfkv_write_memory_dropped_total`, `dfkv_write_memory_cleared_total{reason}`
+  (realtime, boottime: a clock jump above G). Client:
+  `dfkv_client_readback_reads_total{result}` gains `hit_rewritten` (read
+  back because P's write followed every reported REMOVE; counted in
+  addition to `hit` or `miss`).
+
 ## 4. Retention, tenants, debounce
 
 - **Tenants.** M and read-back use the same `BlockKey`, tenant hash included;
@@ -590,6 +760,8 @@ current owner may ask the previous owner once.
 | `DFKV_REMOVE_MEMORY_MS` | server | 0 (off) | 0-3600000 |
 | `DFKV_REMOVE_MEMORY_ENTRIES` | server | 1048576 | 1024-67108864 |
 | `DFKV_RING_READBACK_MS` | client | 0 (off) | 0-600000; window plus settle (ten polls) at most the nodes' M |
+| `DFKV_WRITE_MEMORY_ENTRIES` | server | 0 (off) | 0 or 1024-67108864; recent PUTs kept for W (§3.5), window `DFKV_REMOVE_MEMORY_MS` |
+| `DFKV_RING_READBACK_REWRITE` | client | 0 (off) | 0 or 1; requires B; asks op 26 (§3.5) |
 
 ## 6. Client metrics (mirrored in `dfkv_common.client_metrics`)
 
@@ -652,11 +824,48 @@ of every variant set on every client and, for M, every server):
   `dfkv_removed_within_queries_total` stays 0) and the results equal the
   variant without B.
 
+**Acceptance for W** (§3.5; case 5 with the churn below, W on every server
+and the rewrite switch on every client):
+
+- case 5, A+M+B+W against A+M+B in the same run: the full-prefix hit rate
+  in the first 10 s after the return at least 90 % of base's own 30-60 s
+  rate (A+M+B: 56 % against 69 %, 81 %), `hit_rewritten` counted, and
+  `refused_removed` down by most of A+M+B's; 0 violations;
+- a REMOVE recorded shortly after the rewrite at P on another node (the
+  remover acting inside the margin): refused, 0 violations; and with the
+  rewrite well after the REMOVE: read back;
+- mixed releases: one asked node without op 26 (an older server), and P
+  with W off: the results equal A+M+B (fail closed), 0 violations;
+- with the client switch off, no op 26 is sent (the servers'
+  `dfkv_removed_within_ages_requests_total` stays 0) and the results equal A+M+B;
+- unit tests with a scripted transport for the comparison itself: ages at
+  the edge of the margin both ways, request spreads, P's exact same-clock
+  case including a tie (refused), `0xFFFFFFFE` and `kInvalid` answers, and
+  a clock running ρ fast or slow on P or on i (still safe at ρ, the margin
+  exactly consumed); each must fail on a rule without the ρ terms or
+  without the request spread. Also, each failing on the revision-12 first
+  draft's rule: a gap e_i − s_P < 0 at the margin, and a question split
+  into chunks (times per chunk); and a P whose `CLOCK_MONOTONIC` runs
+  8.3 % slow while RAW is exact, whose answer (RAW) is refused at a
+  separation the slewed clock would have admitted. Server side: an
+  injected REALTIME or BOOTTIME jump above G clears W before the next
+  op-26 answer, and one below G does not; repeated 0.9 s jumps at every
+  tick clear W once their sum within the window exceeds G (failing with a
+  tick-to-tick check); samples restart when W is empty.
+
 **Correctness under churn**, in every variant: removers REMOVE a sample of
 present keys throughout (and PUT some again); every reader hit is checked
 against the log of REMOVEs: a violation is a hit on a key whose last REMOVE
 *returned* before the read *started* and which no PUT followed. Expected 0 in
-all variants. The removers and readers include:
+all variants. With W, a PUT that ended after the REMOVE started counts as
+following it (§3.5). The checker stamps every op of every client with its
+start and end on one harness clock and applies, for a hit of K by a read
+[r.start, r.end]: let R be the REMOVE of K with the latest start among
+those with R.end < r.start; the hit is a violation iff R exists and no PUT
+W of K has W.end > R.start and W.start < r.end. Every PUT attempt issued
+counts, with its client-side interval, whatever the client saw (ok, an
+error or a timeout): a PUT the client gave up on may still have been
+stored. The removers and readers include:
 
 - a remover restarted inside a read-back window (it has no previous ring);
 - a reader whose member poller lags (poll interval raised to 10 s);
@@ -752,10 +961,29 @@ removed afterwards.
 4. M on the server (table, coverage, `kRemovedWithin`) with tests, including
    interop with older clients and servers.
 5. B on top of M, then the measurements of §7. B does not ship without M.
+6. W (§3.5, CLI-35): the server table and op 26, then B's rule, then the
+   measurements of §7's W cases.
 
 ## 9. Revisions
 
 - Revision 1: first version, after two prototype measurement runs.
+- Revision 12 (CLI-35 delta, W): B may read back a key removed and then
+  written again at P: a recent-PUT memory on the server (W, M's structure,
+  window M's, capacity `DFKV_WRITE_MEMORY_ENTRIES`), a new op 26 answering
+  per key the age of the latest REMOVE and of the latest PUT, ages on each
+  node's own `CLOCK_BOOTTIME` (M moves to it), and the client comparing
+  ages through its request windows with a clock-rate bound of 1000 ppm
+  (never clock offsets); P's own records compared exactly; fail closed for
+  every older or partial node; §7 cases for W. After review: every age
+  and request time on `CLOCK_MONOTONIC_RAW` (BOOTTIME and MONOTONIC are
+  slewed by chrony up to 83333 ppm by default, cited); the request gap
+  clamped at 0 and taken per answered request; W cleared on a REALTIME or
+  BOOTTIME jump against RAW above G = 1 s, with G kept in the rule; where
+  W may be turned on; the checker's exact predicate. Round 3: the jump
+  check is over the samples of the whole window (max − min), not tick to
+  tick, so that short pauses cannot add up unseen, restarting whenever W
+  is empty; spurious clears from chrony slews noted; the checker counts
+  every issued PUT attempt.
 - Revision 11 (stage B's code): the episode-end cleanup removed the
   substitute copies B's case 3 reads back; with B on it now waits for B's
   window, but only while every registered client advertises B

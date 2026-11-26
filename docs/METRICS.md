@@ -127,6 +127,10 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_exist_hit_total` / `dfkv_exist_miss_total` | counter | Exist 命中 / 未命中 |
 | `dfkv_remove_memory_entries` / `dfkv_remove_memory_covered_seconds` | gauge | 近期删除记忆（`DFKV_REMOVE_MEMORY_MS`，DEPLOY §4c-4，只在打开时输出）：记着的 key 数 / 往回多久内的删除节点都知道（启动以来，或丢掉的最新一条之后，至多保留时长） |
 | `dfkv_remove_memory_dropped_total` | counter | 记忆满了丢掉的记录（之后节点知道的时间段变短） |
+| `dfkv_removed_within_ages_requests_total` | counter | 回答过的 `kRemovedWithinAges`（op 26，DEPLOY §4c-6）请求数；客户端没开 `DFKV_RING_READBACK_REWRITE` 时保持 0 |
+| `dfkv_write_memory_entries` | gauge | 最近 PUT 记忆（DEPLOY §4c-6，`DFKV_WRITE_MEMORY_ENTRIES`）里的 key 数 |
+| `dfkv_write_memory_dropped_total` | counter | 最近 PUT 记忆满了丢掉的记录（只是少回读） |
+| `dfkv_write_memory_cleared_total{reason}` | counter | 窗口内 `CLOCK_REALTIME`（`realtime`）或 `CLOCK_BOOTTIME`（`boottime`）相对 `CLOCK_MONOTONIC_RAW` 漂移超过 1 秒而清空最近 PUT 记忆的次数（可能停过机；chrony 大幅调整也会触发） |
 | `dfkv_removed_within_queries_total{result}` | counter | `kRemovedWithin` 问到的 key，按回答：`removed`、`not_removed`、`unknown` |
 | `dfkv_remove_ok_total` / `dfkv_remove_miss_total` | counter | Remove 删掉了块 / 目标本就不存在（partial save 清理等路径的诊断分型） |
 | `dfkv_bytes_written_total` / `dfkv_bytes_read_total` | counter | 读写字节 |
@@ -461,7 +465,7 @@ Prometheus 调用。vLLM 使用同一 allowlist，区别只是在 family 前加 
 | `dfkv_client_ring_absent_dropped_total{reason}` | counter | 移出的缺席成员：`grace` 宽限期满，`bound` 超过 `max(1, N/8)` 的上限立即移出，`planned` 排空后下线、不保留 |
 | `dfkv_client_ring_absent_removes_unconfirmed_total` / `_retried_total` / `_dropped_total` | counter | 缺席成员没确认的 REMOVE / 它回来后重发的次数（每次发送都计）/ 最终没确认的（超出队列上限、成员被移出、回来后一个宽限期仍未确认） |
 | `dfkv_client_cooldown_reroutes_total{op}` | counter | 冷却改道（DEPLOY §4c-3）：owner 在本客户端回避期内、改走替补的 key（`get`、`exist`、`put`、`retain`）；`none`：owner 在回避期内但前几个候选都不能用，照旧跳过 |
-| `dfkv_client_readback_reads_total{result}` | counter | 回读前任 owner（DEPLOY §4c-5）：`hit`、`miss`，以及被拒的候选：`refused_removed`（有节点说删过）、`refused_unknown`（有节点说不知道、没有记忆或问不到）、`refused_length`（本客户端见过长度不符）、`refused_gate`（登记门关着）、`refused_cooling`（前任 owner 在回避期） |
+| `dfkv_client_readback_reads_total{result}` | counter | 回读前任 owner（DEPLOY §4c-5）：`hit`、`miss`，以及被拒的候选：`refused_removed`（有节点说删过）、`refused_unknown`（有节点说不知道、没有记忆或问不到）、`refused_length`（本客户端见过长度不符）、`refused_gate`（登记门关着）、`refused_cooling`（前任 owner 在回避期）；`hit_rewritten`：删除后又在前任 owner 上重写、因此回读的次数（DEPLOY §4c-6，另外也计入 hit 或 miss） |
 | `dfkv_client_readback_changes_refused_total{reason}` / `dfkv_client_readback_window_active` | counter / gauge | 没有回读窗口的环变化：`held`（被保护视图压得太久）、`chained`（窗口内又一次变化）/ 当前是否有窗口 |
 | `dfkv_client_readback_memory_short_total{reason}` | counter | 记忆长期短于回读所需时长 H 的节点（`window`：`DFKV_REMOVE_MEMORY_MS` 小于 H）；每个节点计一次并打一条 WARNING |
 | `dfkv_client_ring_reroute_episode_pending` | gauge | 回避期已结束、在替补上的 REMOVE 还没确认的 key 数；它和正在记账的 key 合计受 `DFKV_RING_REROUTE_KEYS` 限制，持续增长说明某个替补一直清不掉（例如它已经死了），改道写入快被拒绝了 |

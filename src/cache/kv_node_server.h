@@ -7,7 +7,9 @@
 #define DFKV_KV_NODE_SERVER_H_
 
 #include <atomic>
+#include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -22,6 +24,8 @@
 #include "cache/disk_cache_group.h"
 #include "cache/ram_tier.h"
 #include "cache/remove_memory.h"
+#include "cache/write_memory.h"
+#include "common/raw_clock.h"
 #include "cache/read_coalescer.h"
 #include "cache/recent_reads.h"
 #include "common/block_key_hash.h"
@@ -189,8 +193,6 @@ class KvNodeServer {
   Status CacheDirectForKey(
       const BlockKey& key, char* data, size_t len, size_t cap,
       std::chrono::steady_clock::time_point batch_arrival = {});
-  std::vector<Status> CacheDirectBatchForKeys(
-      const std::vector<StoreEngine::CacheBatchItem>& items);
 
   // RDMA direct GET: read an O_DIRECT-aligned superset into `io_buf`; *out_data
   // points inside that same buffer at the exact requested range so the RDMA layer
@@ -336,6 +338,13 @@ class KvNodeServer {
   Status ProcessRemovedWithin(const BlockKey& prefix_key, uint64_t count,
                               const char* payload, uint64_t payload_len,
                               std::string* out_data);
+  Status ProcessRemovedWithinAges(const BlockKey& prefix_key, uint64_t count,
+                                  const char* payload, uint64_t payload_len,
+                                  std::string* out_data);
+  // A PUT about to be acknowledged kOk (the recent-PUT memory, CLI-35).
+  void NoteWrite(const BlockKey& key) {
+    if (write_memory_) write_memory_->Record(key, RawMs());
+  }
   Status ProcessRetain(const BlockKey& prefix_key, uint64_t count,
                        const char* payload, uint64_t payload_len,
                        std::string* out_data);
@@ -364,8 +373,36 @@ class KvNodeServer {
   std::unique_ptr<RecentReads> recent_reads_;
   std::atomic<size_t> promote_deferred_{0};
   std::atomic<size_t> remove_ok_{0}, remove_miss_{0};
-  // Recent-REMOVE memory (DFKV_REMOVE_MEMORY_MS; null = off).
+  // W has a distinct publication lock so a RAM flush can release only the
+  // inner admission lock, not the PUT/REMOVE vs op-26 serialization.
+  std::unique_lock<std::mutex> MemoryKey(const BlockKey& key) {
+    const size_t bucket =
+        BlockKeyMixHash{}(key) % memory_key_locks_.size();
+    if (memory_key_expected_bucket_for_test_.load(
+            std::memory_order_relaxed) == bucket) {
+      std::lock_guard<std::mutex> lk(memory_key_test_mu_);
+      memory_key_arrived_bucket_for_test_ = bucket;
+      memory_key_test_cv_.notify_all();
+    }
+    return std::unique_lock<std::mutex>(memory_key_locks_[bucket]);
+  }
+  std::array<std::mutex, 64> memory_key_locks_;
+  // The opt-in disk-barrier test proves op 26 reached this bucket's lock
+  // before releasing storage; 64 is no valid bucket and disarms the hook.
+  std::atomic<size_t> memory_key_expected_bucket_for_test_{64};
+  std::mutex memory_key_test_mu_;
+  std::condition_variable memory_key_test_cv_;
+  size_t memory_key_arrived_bucket_for_test_ = 64;
+  // Op-26 pauses before reading its joint M/W publication snapshot in a test.
+  std::atomic<bool> pause_ages_for_test_{false};
+  std::mutex ages_test_mu_;
+  std::condition_variable ages_test_cv_;
+  int ages_test_state_ = 0;
+  void AfterRemovedAgesForTest();
   std::unique_ptr<RemoveMemory> remove_memory_;
+  // Recent-PUT memory (DFKV_WRITE_MEMORY_ENTRIES, needs M; null = off).
+  std::unique_ptr<WriteMemory> write_memory_;
+  std::atomic<uint64_t> removed_within_ages_requests_{0};  // op 26 answered
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
   // Read-side convoy collapse (env DFKV_READ_COALESCE=1; see read_coalescer.h).
   ReadCoalescer read_coalescer_;

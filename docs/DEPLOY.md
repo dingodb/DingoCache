@@ -1298,6 +1298,31 @@ RETAIN 保护两份（排空节点那份还在服务读），哪边有 key 就�
   （held、chained）、`dfkv_client_readback_window_active`、`dfkv_client_readback_memory_short_total`
   （节点的记忆长期短于需要的时长，每个节点一条 WARNING）。
 
+### 4c-6. 回读重写过的 key（rewrite，`DFKV_WRITE_MEMORY_ENTRIES` 节点侧 + `DFKV_RING_READBACK_REWRITE` 客户端侧，默认都关）<a name="4c-rewrite"></a>
+
+设计见 [ring-unavailable-owner.md](design/ring-unavailable-owner.md) §3.5（CLI-35）。
+
+- **作用：** 回读（4c-5）遇到“某个节点说最近删过”的 key 一律不回读。打开后，如果前任 owner 在那次删除之后
+  又收到过这个 key 的 PUT（删了又写回来），就照样回读。删除和重写交替频繁的负载（例如读到缺失就重新计算写回）
+  在节点空盘回来后的头几秒命中率更高。
+- **怎么打开：** 节点设 `DFKV_WRITE_MEMORY_ENTRIES`（最近 PUT 记忆的条数，0=关，1024–67108864；
+  需要同时打开 4c-4 的 `DFKV_REMOVE_MEMORY_MS`，窗口与它相同），客户端设 `DFKV_RING_READBACK_REWRITE=1`
+  （需要 4c-5 的回读）。客户端开关关着时什么新请求都不发；混用老版本节点（不认识新请求）或没开记忆的节点时，
+  自动退回 4c-5 的规则（照旧不回读）。
+- **只在这些机器上打开：** 物理机，或者虚拟机暂停/迁移后 guest 的时钟会追上实际时间的虚拟化平台。判断依据：
+  节点比较的是各自 `CLOCK_MONOTONIC_RAW` 测出的“多久以前”，要求这个时钟不停走；节点每秒检查
+  `CLOCK_REALTIME`、`CLOCK_BOOTTIME` 相对它的漂移，窗口内累计超过 1 秒就清空记忆（只是少回读），但 guest
+  时钟在暂停期间停住、要等 NTP 之后才纠正的平台查不出来，**不确定的话不要打开**。
+- **大小：** 每条 40 字节（与 4c-4 同样的结构，分 16 段）。需要容纳“窗口内的 PUT 数”：每秒 PUT 数 ×
+  `DFKV_REMOVE_MEMORY_MS`/1000。例如每秒 2000 个 PUT、窗口 600 s，需要约 120 万条（约 48 MiB）；放不下时只记得
+  更近的 PUT，少回读，不会多回读。超过 4194304 条时内存在启动时一次分配，之前按需翻倍（每次翻倍让这一段的 PUT
+  停顿几毫秒）。每个确认的 PUT 多一次约 0.3 µs 的记录（段锁内）。
+- **判断规则：** 删除的年龄、写入的年龄都由各节点自己报告，客户端用自己发请求、收回复的时间夹住它们，按时钟
+  速率误差 1000 ppm 和 1 秒的暂停余量比较，所以删除之后约 1.2 秒以内的重写不算。同 key 的完成与查询按同一把 key 锁排序，同毫秒也不会把先写后删误认成后写。
+- 指标：节点 `dfkv_write_memory_entries`、`dfkv_write_memory_dropped_total`、
+  `dfkv_write_memory_cleared_total{reason}`（realtime、boottime：时钟漂移超过 1 秒而清空）；客户端
+  `dfkv_client_readback_reads_total{result="hit_rewritten"}`（因为重写而回读的次数，另外也计入 hit 或 miss）。
+
 ### 4d. 成员漂移 / split-brain 巡检
 
 `deploy/dfkv_membership_audit.py` 分别查询每个 MDS（不是把 endpoints 当故障转移

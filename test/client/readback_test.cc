@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "client/key_map.h"
+#include "common/raw_clock.h"
 #include "common/membership.h"
 #include "transport/transport.h"
 #include "transport/wire.h"
@@ -52,8 +53,9 @@ class NodesTransport final : public Transport {
     std::lock_guard<std::mutex> lk(mu);
     ++writes[node];
     if (down.count(node)) return Status::kIOError;
-    // Write-once per node, as the servers.
+    // Write-once per node, as the servers; a duplicate is a PUT all the same.
     store[node].emplace(K(key), std::string(static_cast<const char*>(data), len));
+    written_at[node][K(key)] = RawMsExact();
     return Status::kOk;
   }
   Status Range(const std::string& node, const BlockKey& key, uint64_t offset,
@@ -93,6 +95,7 @@ class NodesTransport final : public Transport {
     ++removes[node];
     if (down.count(node) || failing_removes.count(node)) return Status::kIOError;
     removed_here[node].insert(K(key));
+    removed_at[node][K(key)] = RawMsExact();
     return store[node].erase(K(key)) ? Status::kOk : Status::kNotFound;
   }
   // With retain_answers, RETAIN answers as a node with retention: hit if
@@ -149,6 +152,49 @@ class NodesTransport final : public Transport {
       const Key k{net::GetU64(d), net::GetU64(d + 8)};
       (*out)[4 + i] = static_cast<char>(
           m == kUnknown ? 2 : (removed_here[node].count(k) ? 1 : 0));
+    }
+    return Status::kOk;
+  }
+  // Op 26 (CLI-35): ages from the RAW times above. no_ages: the node does
+  // not know the op (kInvalid; it then answers op 25); w_off: the node has
+  // no recent-PUT memory. ages_asked counts op-26 requests; ages_delay_ms
+  // holds each answer that long.
+  std::map<std::string, std::map<Key, double>> removed_at, written_at;
+  std::set<std::string> no_ages, w_off;
+  std::map<std::string, int> ages_asked;
+  std::map<std::string, int> ages_delay_ms;
+  Status RemovedWithinAges(const std::string& node, uint64_t, uint64_t count,
+                           const std::string& payload,
+                           std::string* out) override {
+    int delay = 0;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      ++ages_asked[node];
+      delay = ages_delay_ms.count(node) ? ages_delay_ms[node] : 0;
+    }
+    if (delay) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    std::lock_guard<std::mutex> lk(mu);
+    const Memory m = memory.count(node) ? memory[node] : kMemory;
+    if (m == kNoMemory || no_ages.count(node)) return Status::kInvalid;
+    if (m == kFail || down.count(node)) return Status::kIOError;
+    const double now = RawMsExact();
+    const uint32_t age_ms = net::GetU32(payload.data() + 4);
+    out->assign(4 + count * 8, '\0');
+    net::PutU32(&(*out)[0], m == kUnknown ? 0 : 3600000);
+    for (uint64_t i = 0; i < count; ++i) {
+      const char* d = payload.data() + kRemovedWithinHeaderBytes + i * 16;
+      const Key k{net::GetU64(d), net::GetU64(d + 8)};
+      uint32_t removed = kRemovedAgeNone, written = kRemovedAgeNone;
+      if (m == kUnknown) {
+        removed = kRemovedAgeUnknown;
+      } else if (removed_at[node].count(k) &&
+                 now - removed_at[node][k] <= age_ms) {
+        removed = static_cast<uint32_t>(now - removed_at[node][k]);
+      }
+      if (!w_off.count(node) && written_at[node].count(k))
+        written = static_cast<uint32_t>(now - written_at[node][k]);
+      net::PutU32(&(*out)[4 + i * 8], removed);
+      net::PutU32(&(*out)[8 + i * 8], written);
     }
     return Status::kOk;
   }
@@ -897,6 +943,251 @@ TEST_P(ReadBack, ARefusedSetDoesNotMakeAForeignCopyOwn) {
   auto c_only = OpenOn(&t, kIds);
   c_only->OnRegistry(true, {MarkedClient("self", 1000, false), MarkedClient("y", 1000)});
   expect_checked(c_only.get(), "C alone");
+}
+
+// ---- CLI-35: the rewrite check (design §3.5) ----
+
+using Answer = KVClient::MemoryAnswer;
+using Rewrite = KVClient::Rewrite;
+Answer Ans(uint32_t removed, uint32_t written, double sent, double answered) {
+  Answer a;
+  a.removed_age = removed;
+  a.written_age = written;
+  a.sent_ms = sent;
+  a.answered_ms = answered;
+  return a;
+}
+constexpr uint32_t kNo = kRemovedAgeNone, kUnk = kRemovedAgeUnknown;
+// Node i reports a REMOVE `a` ms old, answered at e_i; P (request sent at
+// 0) a write 10 ms old.
+Rewrite OneRemove(uint32_t a, double e_i) {
+  return KVClient::RewriteVerdict(
+      "p", {{"i", Ans(a, kNo, e_i - 1, e_i)}, {"p", Ans(kNo, 10, 0, 1)}});
+}
+
+// At the margin, both ways: a/(1+rho) - (b+1)/(1-rho) > gap/(1-rho) + G with
+// b = 10 and a gap of 5 ms holds from a = 1018. 1017 passes a rule without
+// the rho terms (a - 11 > 1005) or without the gap (a/(1+rho) - 11.01 > 1000).
+TEST(ReadBackRewrite, TheMarginHoldsBothWays) {
+  EXPECT_EQ(OneRemove(1018, 5), Rewrite::kAfterEvery);
+  EXPECT_EQ(OneRemove(1017, 5), Rewrite::kRemoved);
+}
+
+// Node i answered before P was asked (sequential chunks, a retry, the
+// fallback): the gap counts as 0, never as a credit. With the gap taken as
+// is (-50 ms), a = 1012 would pass.
+TEST(ReadBackRewrite, ANegativeGapCountsAsZero) {
+  EXPECT_EQ(OneRemove(1013, -50), Rewrite::kAfterEvery);
+  EXPECT_EQ(OneRemove(1012, -50), Rewrite::kRemoved);
+}
+
+// P's own records share one millisecond snapshot, but records carry no
+// sub-millisecond ordering. Equal ages must not turn PUT→REMOVE into a
+// permissible rewrite; reject such ties conservatively.
+TEST(ReadBackRewrite, PsOwnRecordsCompareExactly) {
+  const auto own = [](uint32_t removed, uint32_t written) {
+    return KVClient::RewriteVerdict("p", {{"p", Ans(removed, written, 0, 1)}});
+  };
+  EXPECT_EQ(own(100, 99), Rewrite::kAfterEvery);
+  EXPECT_EQ(own(100, 100), Rewrite::kRemoved);
+  EXPECT_EQ(own(99, 100), Rewrite::kRemoved);
+  EXPECT_EQ(own(kNo, 100), Rewrite::kNoRemove);
+}
+
+TEST(ReadBackRewrite, UnknownAndMissingWritesRefuse) {
+  // Some node could not say.
+  EXPECT_EQ(KVClient::RewriteVerdict(
+                "p", {{"i", Ans(kUnk, kNo, 0, 1)}, {"p", Ans(kNo, 10, 0, 1)}}),
+            Rewrite::kUnknown);
+  // A REMOVE not shown followed wins over unknown.
+  EXPECT_EQ(KVClient::RewriteVerdict("p", {{"i", Ans(kUnk, kNo, 0, 1)},
+                                           {"j", Ans(5, kNo, 0, 1)},
+                                           {"p", Ans(kNo, 10, 0, 1)}}),
+            Rewrite::kRemoved);
+  // No write remembered at P (W off, an older node, a failed request).
+  EXPECT_EQ(KVClient::RewriteVerdict(
+                "p", {{"i", Ans(50000, kNo, 0, 1)}, {"p", Ans(kNo, kNo, 0, 1)}}),
+            Rewrite::kRemoved);
+  EXPECT_EQ(KVClient::RewriteVerdict("p", {{"i", Ans(50000, kNo, 0, 1)}}),
+            Rewrite::kRemoved);
+  // Nothing removed: the old rule's read-back.
+  EXPECT_EQ(KVClient::RewriteVerdict(
+                "p", {{"i", Ans(kNo, kNo, 0, 1)}, {"p", Ans(kNo, kNo, 0, 1)}}),
+            Rewrite::kNoRemove);
+}
+
+// Real timelines with every clock within rho (fast, exact, slow), answers at
+// either end of their requests and the ages floored: a read-back is only
+// ever admitted when the write really followed the REMOVE; and one well
+// after it is admitted.
+TEST(ReadBackRewrite, ClocksWithinRhoNeverAdmitAWriteBeforeTheRemove) {
+  const double rho = 1e-3;
+  for (double t_w = -1500; t_w <= 3000; t_w += 7) {  // the REMOVE is at 0
+    for (double r_i : {1 - rho, 1.0, 1 + rho})
+      for (double r_p : {1 - rho, 1.0, 1 + rho})
+        for (double spread : {0.0, 3.0, 50.0})
+          for (double at_i : {0.0, 1.0})
+            for (double at_p : {0.0, 1.0}) {
+              const double s = 60000, e = s + spread;
+              const double tau_i = s + at_i * spread, tau_p = s + at_p * spread;
+              const auto a = static_cast<uint32_t>((tau_i - 0) * r_i);
+              const auto b = static_cast<uint32_t>((tau_p - t_w) * r_p);
+              const Rewrite v = KVClient::RewriteVerdict(
+                  "p", {{"i", Ans(a, kNo, s, e)}, {"p", Ans(kNo, b, s, e)}});
+              if (v == Rewrite::kAfterEvery)
+                ASSERT_GT(t_w, 0) << "admitted a write before the REMOVE";
+              if (t_w > 1500 && spread < 10)
+                EXPECT_EQ(v, Rewrite::kAfterEvery) << "t_w " << t_w;
+            }
+  }
+}
+
+// Why RAW: P's CLOCK_MONOTONIC slewed 8.3 % slow (chrony's default
+// maxslewrate) understates the write's age, and a write made 100 ms before
+// the REMOVE looks 5 s after it. The node's RAW age refuses it.
+TEST(ReadBackRewrite, ASlewedClockWouldAdmitWhatTheRawClockRefuses) {
+  const double s = 60000;  // the REMOVE at 0, the write at -100
+  const auto a = static_cast<uint32_t>(s);
+  const auto raw = static_cast<uint32_t>(s + 100);
+  const auto slewed = static_cast<uint32_t>((s + 100) * (1 - 1.0 / 12));
+  const auto verdict = [&](uint32_t b) {
+    return KVClient::RewriteVerdict(
+        "p", {{"i", Ans(a, kNo, s, s + 1)}, {"p", Ans(kNo, b, s, s + 1)}});
+  };
+  EXPECT_EQ(verdict(raw), Rewrite::kRemoved);
+  EXPECT_EQ(verdict(slewed), Rewrite::kAfterEvery)
+      << "the hazard the raw clock is for";
+}
+
+struct RwEnv {
+  ScopedEnv readback{"DFKV_RING_READBACK_MS", "60000"};
+  ScopedEnv rewrite{"DFKV_RING_READBACK_REWRITE", "1"};
+};
+
+// A question split into chunks: each key carries the times of the request
+// that answered it, not those of the call.
+TEST_P(ReadBack, EachChunkCarriesItsOwnRequestTimes) {
+  RwEnv env;
+  auto c = OpenOn(&t, kIds);
+  t.ages_delay_ms[Addr("a")] = 30;
+  std::vector<std::string> keys;
+  for (int i = 0; i < 1500; ++i) keys.push_back("chunk-times-" + std::to_string(i));
+  std::vector<Answer> answers;
+  ASSERT_EQ(c->RemovedWithinAges(Addr("a"), keys, 1000, &answers), Status::kOk);
+  EXPECT_EQ(Asked("a"), 0) << "op 25 asked";
+  EXPECT_EQ(t.ages_asked[Addr("a")], 2);
+  const Answer& first = answers[0];
+  const Answer& second = answers[1499];
+  EXPECT_GE(first.answered_ms - first.sent_ms, 30);
+  EXPECT_GE(second.sent_ms, first.answered_ms) << "one time for the whole call";
+  EXPECT_EQ(answers[1023].sent_ms, first.sent_ms);
+  EXPECT_EQ(answers[1024].sent_ms, second.sent_ms);
+}
+
+// A node without op 26 is asked op 25: a REMOVE comes back as just now, no
+// write; it is not asked op 26 again for a while. A node without M: unknown.
+TEST_P(ReadBack, ANodeWithoutTheOpIsAskedTheOldOne) {
+  RwEnv env;
+  auto c = OpenOn(&t, kIds);
+  const std::string key = "old-node";
+  t.no_ages.insert(Addr("a"));
+  t.removed_here[Addr("a")].insert(K(key));
+  std::vector<Answer> answers;
+  ASSERT_EQ(c->RemovedWithinAges(Addr("a"), {key, "other"}, 1000, &answers),
+            Status::kOk);
+  EXPECT_EQ(answers[0].removed_age, 0u);
+  EXPECT_EQ(answers[1].removed_age, kNo);
+  EXPECT_EQ(answers[0].written_age, kNo);
+  ASSERT_EQ(c->RemovedWithinAges(Addr("a"), {key}, 1000, &answers), Status::kOk);
+  EXPECT_EQ(t.ages_asked[Addr("a")], 1) << "asked op 26 again at once";
+  EXPECT_EQ(Asked("a"), 2);
+  t.memory[Addr("b")] = NodesTransport::kNoMemory;
+  EXPECT_EQ(c->RemovedWithinAges(Addr("b"), {key}, 1000, &answers),
+            Status::kInvalid);
+  EXPECT_EQ(answers[0].removed_age, kUnk);
+}
+
+// End to end: a key removed at an asked node 5 s ago and written at P 2 s
+// ago is read back (hit_rewritten); written 4.5 s ago (inside G), it is
+// refused; with the switch off, op 26 is never sent and it is refused.
+TEST_P(ReadBack, ARewriteAfterARemoveIsReadBack) {
+  const std::string v(8, 'v');
+  const auto keys = MovedToF(4, "rewrite-");
+  auto setup = [&](const std::string& key, double removed_ago,
+                   double written_ago) {
+    const std::string p = PrevOwner(key);
+    std::string x;  // an asked node other than P and f
+    for (const auto& id : Successors(key, kOld))
+      if (id != p && id != "f") { x = id; break; }
+    std::lock_guard<std::mutex> lk(t.mu);
+    const double now = RawMsExact();
+    t.store[Addr(p)][K(key)] = v;
+    t.removed_here[Addr(x)].insert(K(key));
+    t.removed_at[Addr(x)][K(key)] = now - removed_ago;
+    t.written_at[Addr(p)][K(key)] = now - written_ago;
+  };
+  std::string out(v.size(), '\0');
+  {
+    RwEnv env;
+    auto c = OpenOn(&t, kOld);
+    c->SetMembers(View(kIds));
+    setup(keys[0], 5000, 2000);
+    EXPECT_TRUE(c->Get(keys[0], &out[0], out.size()));
+    EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"hit_rewritten\"}"), "1");
+    setup(keys[1], 5000, 4500);
+    EXPECT_FALSE(c->Get(keys[1], &out[0], out.size()));
+    EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"refused_removed\"}"), "1");
+    // P's own REMOVE before its rewrite: exact, no guard.
+    setup(keys[2], 5000, 2000);
+    {
+      std::lock_guard<std::mutex> lk(t.mu);
+      const std::string p = Addr(PrevOwner(keys[2]));
+      t.removed_at[p][K(keys[2])] = t.written_at[p][K(keys[2])] - 1;
+    }
+    EXPECT_TRUE(c->Get(keys[2], &out[0], out.size()));
+  }
+  {
+    RbEnv env;  // B without the rewrite switch
+    auto c = OpenOn(&t, kOld);
+    c->SetMembers(View(kIds));
+    int before = 0;
+    for (const auto& [node, n] : t.ages_asked) before += n;
+    setup(keys[3], 5000, 2000);
+    EXPECT_FALSE(c->Get(keys[3], &out[0], out.size()));
+    int after = 0;
+    for (const auto& [node, n] : t.ages_asked) after += n;
+    EXPECT_EQ(after, before) << "op 26 sent with the switch off";
+  }
+}
+
+// Mixed releases fail closed: an asked node without op 26 (its REMOVE known
+// only as a bit, so just now), or P without the recent-PUT memory.
+TEST_P(ReadBack, MixedReleasesRefuseAsBefore) {
+  const std::string v(8, 'v');
+  for (const bool p_without_w : {false, true}) {
+    NodesTransport tt(GetParam());
+    RwEnv env;
+    auto c = OpenOn(&tt, kOld);
+    c->SetMembers(View(kIds));
+    const std::string key = MovedToF(1, std::string("mixed-") +
+                                            (p_without_w ? "w" : "op"))[0];
+    const std::string p = PrevOwner(key);
+    std::string x;
+    for (const auto& id : Successors(key, kOld))
+      if (id != p && id != "f") { x = id; break; }
+    {
+      std::lock_guard<std::mutex> lk(tt.mu);
+      const double now = RawMsExact();
+      tt.store[Addr(p)][K(key)] = v;
+      tt.removed_here[Addr(x)].insert(K(key));
+      tt.removed_at[Addr(x)][K(key)] = now - 30000;
+      tt.written_at[Addr(p)][K(key)] = now - 1000;  // well after
+      if (p_without_w) tt.w_off.insert(Addr(p)); else tt.no_ages.insert(Addr(x));
+    }
+    std::string out(v.size(), '\0');
+    EXPECT_FALSE(c->Get(key, &out[0], out.size())) << p_without_w;
+    EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"refused_removed\"}"), "1");
+  }
 }
 
 }  // namespace

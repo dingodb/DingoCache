@@ -101,6 +101,9 @@ class RdmaTransport : public Transport {
   Status RemovedWithin(const std::string& node, uint64_t tenant_hash,
                        uint64_t count, const std::string& payload,
                        std::string* out) override;
+  Status RemovedWithinAges(const std::string& node, uint64_t tenant_hash,
+                           uint64_t count, const std::string& payload,
+                           std::string* out) override;
   Status Members(const std::string& node, std::string* out) override;
 
   bool RegisterMemory(void* base, size_t size) override;

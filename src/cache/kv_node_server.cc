@@ -1,5 +1,6 @@
 #include "cache/kv_node_server.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <cstdio>
@@ -110,7 +111,11 @@ KvNodeServer::KvNodeServer(DiskCacheGroup::Options options,
       ram_starting_(StartRamTier()),
       group_(OpenedNotActivated(std::move(options))) {
   shutdown_drain_timeout_s_ = ResolveShutdownDrainTimeoutSeconds();
-  remove_memory_ = RemoveMemory::FromEnv(SteadyMs());
+  // Ages on CLOCK_MONOTONIC_RAW: compared across nodes by the read-back's
+  // rewrite check (design §3.5), which bounds only the clock's rate.
+  remove_memory_ = RemoveMemory::FromEnv(RawMs());
+  write_memory_ = WriteMemory::FromEnv(
+      remove_memory_ ? remove_memory_->WindowMs() : 0, RawMs());
   // With a disk that failed to open the start is over: the arena need not be
   // faulted in to the end just to be dropped.
   if (!group_.Healthy())
@@ -796,7 +801,7 @@ std::string KvNodeServer::MetricsText() const {
            rs.wheel_entries);
   }
   if (remove_memory_) {
-    const uint64_t now = SteadyMs();
+    const uint64_t now = RawMs();
     metric("dfkv_remove_memory_entries", "gauge",
            "Keys the recent-REMOVE memory holds (DFKV_REMOVE_MEMORY_MS)",
            remove_memory_->Entries());
@@ -806,6 +811,25 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_remove_memory_dropped_total", "counter",
            "Records dropped for room (what the node knows then starts later)",
            remove_memory_->Dropped());
+    metric("dfkv_removed_within_ages_requests_total", "counter",
+           "kRemovedWithinAges (op 26) requests answered",
+           removed_within_ages_requests_.load(std::memory_order_relaxed));
+    if (write_memory_) {
+      metric("dfkv_write_memory_entries", "gauge",
+             "Keys the recent-PUT memory holds (DFKV_WRITE_MEMORY_ENTRIES)",
+             write_memory_->Entries());
+      metric("dfkv_write_memory_dropped_total", "counter",
+             "Recent-PUT records dropped for room",
+             write_memory_->Dropped());
+      s += "# HELP dfkv_write_memory_cleared_total Times the recent-PUT "
+           "memory was cleared because a clock moved against "
+           "CLOCK_MONOTONIC_RAW by more than 1 s within its window, by clock\n"
+           "# TYPE dfkv_write_memory_cleared_total counter\n";
+      s += "dfkv_write_memory_cleared_total{reason=\"realtime\"} " +
+           std::to_string(write_memory_->Cleared(WriteMemory::kRealtime)) + "\n";
+      s += "dfkv_write_memory_cleared_total{reason=\"boottime\"} " +
+           std::to_string(write_memory_->Cleared(WriteMemory::kBoottime)) + "\n";
+    }
     s += "# HELP dfkv_removed_within_queries_total Keys asked about by "
          "kRemovedWithin, by answer\n"
          "# TYPE dfkv_removed_within_queries_total counter\n";
@@ -1521,6 +1545,8 @@ Status KvNodeServer::ProcessRequestForKey(
       }
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
+      std::unique_lock<std::mutex> publication_lock;
+      if (write_memory_) publication_lock = MemoryKey(key);
       auto key_lock = LockPutKey(key);
       // RAM-ACK publishes a flush-pinned copy. A reached positive watermark
       // rejects new keys before admission; only a capacity bypass may take
@@ -1559,6 +1585,7 @@ Status KvNodeServer::ProcessRequestForKey(
           invalid_ops_.fetch_add(1, std::memory_order_relaxed);
         }
       }
+      if (st == Status::kOk && write_memory_) NoteWrite(key);
       if (samp) put_lat_.Observe(NowSec() - t0);
       EndPut();
       break;
@@ -1670,6 +1697,10 @@ Status KvNodeServer::ProcessRequestForKey(
     case WireOp::kRemovedWithin:
       st = ProcessRemovedWithin(key, length, payload, payload_len, out_data);
       break;
+    case WireOp::kRemovedWithinAges:
+      st = ProcessRemovedWithinAges(key, length, payload, payload_len,
+                                    out_data);
+      break;
     case WireOp::kLookup: {
       ValueMetadata metadata;
       st = LookupForKey(key, &metadata);
@@ -1681,6 +1712,10 @@ Status KvNodeServer::ProcessRequestForKey(
       // RamTier hides the key first and waits out/cancels any flush. The disk
       // remove therefore compensates a flush that reached durable storage just
       // before the fence; after it returns no later RAM worker can republish.
+      // With W, this per-key lock covers storage as well as publication, so
+      // the PUT/REMOVE completion order and the op-26 view agree.
+      std::unique_lock<std::mutex> write_key_lock;
+      if (write_memory_) write_key_lock = MemoryKey(key);
       // A parked RETAIN SET goes first: forgotten after the RAM remove, it
       // could be one made for the next value of the key.
       if (ram_) ApplyPendingRetain(key, /*flushed=*/false);
@@ -1690,11 +1725,10 @@ Status KvNodeServer::ProcessRequestForKey(
       // between the two removes; a promotion after the disk remove is not
       // installed (it checks the disk), one before it is dropped here.
       if (ram_) ram_->DropDurableCopy(key);
-      // Recorded before the acknowledgement, whatever the key's state was
-      // (recent-REMOVE memory, DFKV_REMOVE_MEMORY_MS).
+      // Ordered with W by the per-key lock, before the acknowledgement.
       if (remove_memory_ &&
           (disk_status == Status::kOk || disk_status == Status::kNotFound))
-        remove_memory_->Record(key, SteadyMs());
+        remove_memory_->Record(key, RawMs());
       if (disk_status == Status::kOk ||
           (disk_status == Status::kNotFound && ram_had)) {
         st = Status::kOk;
@@ -1772,10 +1806,84 @@ Status KvNodeServer::ProcessRemovedWithin(const BlockKey& prefix_key,
   out_data->assign(4 + count, '\0');
   const uint64_t covered = remove_memory_->Query(
       prefix_key.tenant_hash, payload + kRemovedWithinHeaderBytes,
-      static_cast<size_t>(count), age_ms, SteadyMs(),
+      static_cast<size_t>(count), age_ms, RawMs(),
       reinterpret_cast<uint8_t*>(&(*out_data)[4]));
   net::PutU32(&(*out_data)[0],
               static_cast<uint32_t>(std::min<uint64_t>(covered, UINT32_MAX)));
+  return Status::kOk;
+}
+
+// kRemovedWithinAges (op 26, CLI-35). Both ages from one clock reading and
+// one publication snapshot, so P's own REMOVE and PUT compare exactly. W's
+// pause check and expiry run first; without W every key has no recent write.
+void KvNodeServer::AfterRemovedAgesForTest() {
+  if (!pause_ages_for_test_.load(std::memory_order_relaxed)) return;
+  std::unique_lock<std::mutex> lk(ages_test_mu_);
+  ++ages_test_state_;
+  ages_test_cv_.notify_all();
+  ages_test_cv_.wait(lk, [this] { return ages_test_state_ % 2 == 0; });
+}
+Status KvNodeServer::ProcessRemovedWithinAges(const BlockKey& prefix_key,
+                                              uint64_t count,
+                                              const char* payload,
+                                              uint64_t payload_len,
+                                              std::string* out_data) {
+  if (out_data == nullptr || !remove_memory_) return Status::kInvalid;
+  if (count == 0 || count > kRemovedWithinMaxKeys || payload == nullptr ||
+      payload_len != kRemovedWithinHeaderBytes + count * 16 ||
+      net::GetU32(payload) != count)
+    return Status::kInvalid;
+  removed_within_ages_requests_.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t age_ms = net::GetU32(payload + 4);
+  const char* digests = payload + kRemovedWithinHeaderBytes;
+  const size_t n = static_cast<size_t>(count);
+  std::vector<uint32_t> removed(n, kRemovedAgeNone), written(n, kRemovedAgeNone);
+  uint64_t covered = 0;
+  {
+    // With W, reject an unfinished REMOVE as well as an in-flight PUT of the
+    // same key (without an unrelated-key lock). Locks are ordered and
+    // deduplicated by their hashed mutex bucket, not only by full key: two
+    // different keys may share one of the 64 mutexes.
+    std::vector<BlockKey> keys;
+    keys.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+      const char* d = digests + i * 16;
+      keys.push_back({net::GetU64(d), net::GetU64(d + 8),
+                     prefix_key.tenant_hash});
+    }
+    std::sort(keys.begin(), keys.end(), [this](const BlockKey& a, const BlockKey& b) {
+      return BlockKeyMixHash{}(a) % memory_key_locks_.size() <
+             BlockKeyMixHash{}(b) % memory_key_locks_.size();
+    });
+    keys.erase(std::unique(keys.begin(), keys.end(),
+                           [this](const BlockKey& a, const BlockKey& b) {
+                             return BlockKeyMixHash{}(a) %
+                                        memory_key_locks_.size() ==
+                                    BlockKeyMixHash{}(b) %
+                                        memory_key_locks_.size();
+                           }), keys.end());
+    std::vector<std::unique_lock<std::mutex>> held;
+    held.reserve(keys.size());
+    for (const BlockKey& key : keys)
+      if (write_memory_) held.push_back(MemoryKey(key));
+    const uint64_t now = RawMs();
+    AfterRemovedAgesForTest();
+    if (write_memory_) {
+      covered = write_memory_->AgesWithRemovals(
+          *remove_memory_, prefix_key.tenant_hash, digests, n, age_ms, now,
+          removed.data(), written.data());
+    } else {
+      covered = remove_memory_->QueryAges(prefix_key.tenant_hash, digests, n,
+                                          age_ms, now, removed.data());
+    }
+  }
+  out_data->assign(4 + n * kRemovedWithinAgesKeyBytes, '\0');
+  net::PutU32(&(*out_data)[0],
+              static_cast<uint32_t>(std::min<uint64_t>(covered, UINT32_MAX)));
+  for (size_t i = 0; i < n; ++i) {
+    net::PutU32(&(*out_data)[4 + i * 8], removed[i]);
+    net::PutU32(&(*out_data)[8 + i * 8], written[i]);
+  }
   return Status::kOk;
 }
 
@@ -1919,11 +2027,6 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
 }
 
 
-std::vector<Status> KvNodeServer::CacheDirectBatchForKeys(
-    const std::vector<StoreEngine::CacheBatchItem>& items) {
-  return group_.CacheDirectBatch(items);
-}
-
 Status KvNodeServer::CacheDirectForKey(
     const BlockKey& key, char* data, size_t len, size_t cap,
     std::chrono::steady_clock::time_point batch_arrival) {
@@ -1934,6 +2037,8 @@ Status KvNodeServer::CacheDirectForKey(
   if (!TryBeginPut()) return Status::kCacheFull;
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
+  std::unique_lock<std::mutex> publication_lock;
+  if (write_memory_) publication_lock = MemoryKey(key);
   auto key_lock = LockPutKey(key);
   // PUT write-around: write directly to disk, skip the synchronous 1 MiB
   // arena memcpy. The arena is filled lazily by read-promotion on GET miss
@@ -1981,6 +2086,7 @@ Status KvNodeServer::CacheDirectForKey(
       invalid_ops_.fetch_add(1, std::memory_order_relaxed);
     }
   }
+  if (st == Status::kOk) NoteWrite(key);
   if (samp) put_lat_.Observe(NowSec() - t0);
   EndPut();
   return st;

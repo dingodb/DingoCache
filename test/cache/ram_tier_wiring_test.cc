@@ -15,8 +15,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <future>
 #include <chrono>
 #include <condition_variable>
@@ -127,6 +129,36 @@ class KvNodeServerWiringTestPeer {
   static auto LockPut(KvNodeServer& server, const BlockKey& key) {
     return std::make_unique<KvNodeServer::PutKeyLock>(server.LockPutKey(key));
   }
+  static size_t PublicationBucket(const KvNodeServer& server,
+                                  const BlockKey& key) {
+    return BlockKeyMixHash{}(key) % server.memory_key_locks_.size();
+  }
+  static bool HasWriteMemory(const KvNodeServer& server) {
+    return server.write_memory_ != nullptr;
+  }
+  static uint64_t RemovedWithinAgesRequests(const KvNodeServer& server) {
+    return server.removed_within_ages_requests_.load(
+        std::memory_order_relaxed);
+  }
+  static void ExpectPublicationWait(KvNodeServer& server,
+                                    const BlockKey& key) {
+    const size_t bucket = PublicationBucket(server, key);
+    {
+      std::lock_guard<std::mutex> lk(server.memory_key_test_mu_);
+      server.memory_key_arrived_bucket_for_test_ =
+          server.memory_key_locks_.size();
+      server.memory_key_expected_bucket_for_test_.store(
+          bucket, std::memory_order_relaxed);
+    }
+    server.memory_key_test_cv_.notify_all();
+  }
+  static bool WaitPublicationWait(KvNodeServer& server,
+                                  const BlockKey& key) {
+    const size_t bucket = PublicationBucket(server, key);
+    std::unique_lock<std::mutex> lk(server.memory_key_test_mu_);
+    return server.memory_key_test_cv_.wait_for(
+        lk, 2s, [&] { return server.memory_key_arrived_bucket_for_test_ == bucket; });
+  }
   static void SetWriteBack(KvNodeServer& server, bool write_back) {
     server.ram_write_back_ = write_back;
   }
@@ -235,8 +267,9 @@ struct OpenFlushOnExit {
 class BlockingBypassStore : public KVStore {
  public:
   BlockingBypassStore(const std::string& path, uint64_t capacity,
-                      FlushBarrier& barrier)
-      : KVStore(Options{path, capacity}), barrier_(barrier) {}
+                      FlushBarrier& barrier, bool block_remove = false)
+      : KVStore(Options{path, capacity}), barrier_(barrier),
+        block_remove_(block_remove) {}
   Status Cache(const BlockKey& key, const void* data, size_t len) override {
     if (len > 64 * 1024) barrier_.Block();
     return KVStore::Cache(key, data, len);
@@ -246,9 +279,14 @@ class BlockingBypassStore : public KVStore {
     if (len > 64 * 1024) barrier_.Block();
     return KVStore::CacheDirect(key, data, len, cap);
   }
+  Status Remove(const BlockKey& key) override {
+    if (block_remove_) barrier_.Block();
+    return KVStore::Remove(key);
+  }
 
  private:
   FlushBarrier& barrier_;
+  bool block_remove_;
 };
 
 // Extract a single-sample counter/gauge value from Prometheus text (line
@@ -2590,3 +2628,534 @@ TEST(RamTierWiring, PutKeyLockSerializesOnlyItsKey) {
   server.reset();
   fs::remove_all(dir);
 }
+
+// ---- CLI-35 publication-lock disk-I/O microbenchmarks -----------------------
+// These are measurements, not regression gates: no result depends on a timing
+// threshold. Only the deliberate "still blocked" check has a short deadline.
+namespace {
+
+bool PublicationBenchEnabled() {
+  const char* enabled = std::getenv("DFKV_PUBLICATION_BENCH");
+  return enabled != nullptr && std::string(enabled) == "1";
+}
+
+class ScopedBenchEnv {
+ public:
+  ScopedBenchEnv(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      had_old_ = true;
+      old_ = old;
+    }
+    if (value)
+      ::setenv(name, value, 1);
+    else
+      ::unsetenv(name);
+  }
+  ~ScopedBenchEnv() {
+    if (had_old_)
+      ::setenv(name_, old_.c_str(), 1);
+    else
+      ::unsetenv(name_);
+  }
+
+ private:
+  const char* name_;
+  bool had_old_ = false;
+  std::string old_;
+};
+
+using BenchClock = std::chrono::steady_clock;
+
+double BenchUs(BenchClock::duration elapsed) {
+  return std::chrono::duration<double, std::micro>(elapsed).count();
+}
+
+struct PublicationNode {
+  fs::path dir;
+  std::unique_ptr<KvNodeServer> server;
+  std::string addr;
+  bool started = false;
+  ~PublicationNode() {
+    server.reset();
+    fs::remove_all(dir);
+  }
+};
+
+using BenchEngineFactory =
+    std::function<std::unique_ptr<StoreEngine>(const std::string&, uint64_t)>;
+
+std::unique_ptr<PublicationNode> StartPublicationNode(
+    const std::string& tag, bool write_memory,
+    BenchEngineFactory factory = {}) {
+  auto node = std::make_unique<PublicationNode>();
+  node->dir = fs::temp_directory_path() /
+              ("dfkv_pubbench_" + tag + "_" + std::to_string(::getpid()));
+  fs::remove_all(node->dir);
+  fs::create_directories(node->dir);
+  ScopedBenchEnv remove_window("DFKV_REMOVE_MEMORY_MS", "600000");
+  ScopedBenchEnv write_entries("DFKV_WRITE_MEMORY_ENTRIES",
+                               write_memory ? "65536" : nullptr);
+  ScopedBenchEnv no_ram("DFKV_RAM_TIER", nullptr);
+  ScopedBenchEnv quiet_logs("DFKV_LOG", "ERROR");
+  DiskCacheGroup::Options options{{node->dir.string()}, 1ull << 30, "file"};
+  options.engine_factory = std::move(factory);
+  node->server = KvNodeServerWiringTestPeer::Create(std::move(options));
+  if (node->server->Healthy())
+    node->started = node->server->Start(0) == Status::kOk;
+  if (node->started)
+    node->addr = "127.0.0.1:" + std::to_string(node->server->port());
+  return node;
+}
+
+bool PublicationKeysDistinct(const std::vector<BlockKey>& keys) {
+  for (size_t i = 0; i < keys.size(); ++i)
+    for (size_t j = 0; j < i; ++j)
+      if (keys[i] == keys[j]) return false;
+  return true;
+}
+
+bool OnePublicationBucket(const KvNodeServer& server,
+                          const std::vector<BlockKey>& keys) {
+  if (keys.empty()) return false;
+  const size_t bucket =
+      KvNodeServerWiringTestPeer::PublicationBucket(server, keys[0]);
+  for (const auto& key : keys)
+    if (KvNodeServerWiringTestPeer::PublicationBucket(server, key) != bucket)
+      return false;
+  return true;
+}
+
+bool SpreadPublicationBuckets(const KvNodeServer& server,
+                              const std::vector<BlockKey>& keys) {
+  if (keys.empty()) return false;
+  std::vector<bool> seen(64, false);
+  for (const auto& key : keys) {
+    const size_t bucket =
+        KvNodeServerWiringTestPeer::PublicationBucket(server, key);
+    if (seen[bucket]) return false;
+    seen[bucket] = true;
+  }
+  return true;
+}
+
+std::vector<BlockKey> KeysInOneBucket(const KvNodeServer& server,
+                                      const std::string& key_namespace,
+                                      size_t count) {
+  const BlockKey first = ToBlockKey(key_namespace, "collision-0");
+  const size_t bucket =
+      KvNodeServerWiringTestPeer::PublicationBucket(server, first);
+  std::vector<BlockKey> keys{first};
+  for (uint64_t serial = 1; keys.size() < count; ++serial) {
+    auto key = ToBlockKey(key_namespace,
+                          "collision-" + std::to_string(serial));
+    if (KvNodeServerWiringTestPeer::PublicationBucket(server, key) == bucket)
+      keys.push_back(key);
+  }
+  return keys;
+}
+
+std::vector<BlockKey> KeysAcrossBuckets(const KvNodeServer& server,
+                                        const std::string& key_namespace,
+                                        size_t count) {
+  std::vector<BlockKey> keys;
+  std::vector<bool> used(64, false);
+  for (uint64_t serial = 0; keys.size() < count; ++serial) {
+    auto key = ToBlockKey(key_namespace, "spread-" + std::to_string(serial));
+    const size_t bucket =
+        KvNodeServerWiringTestPeer::PublicationBucket(server, key);
+    if (!used[bucket]) {
+      used[bucket] = true;
+      keys.push_back(key);
+    }
+  }
+  return keys;
+}
+
+struct CallStats {
+  std::vector<double> us;
+  size_t failures = 0;
+};
+
+struct ClientCallStats {
+  std::vector<double> put_us;
+  std::vector<double> remove_us;
+  size_t put_failures = 0;
+  size_t remove_failures = 0;
+};
+
+double SortedCallPercentile(const std::vector<double>& samples,
+                            size_t percentile) {
+  if (samples.empty()) return 0;
+  const size_t rank = (percentile * samples.size() + 99) / 100;
+  return samples[std::min(samples.size() - 1, rank - 1)];
+}
+
+void PrintCalls(const std::string& scenario, int repetition, bool write_memory,
+                const char* operation, const CallStats& stats, double wall_us,
+                size_t keys = 0) {
+  std::vector<double> sorted = stats.us;
+  std::sort(sorted.begin(), sorted.end());
+  const double p50 = SortedCallPercentile(sorted, 50);
+  const double p99 = SortedCallPercentile(sorted, 99);
+  const double max = sorted.empty() ? 0 : sorted.back();
+  const double calls_per_second =
+      wall_us > 0 ? stats.us.size() * 1000000.0 / wall_us : 0;
+  const double keys_per_second =
+      wall_us > 0 ? keys * 1000000.0 / wall_us : 0;
+  std::printf(
+      "PUBLICATION_BENCH scenario=%s rep=%d W=%s op=%s calls=%zu keys=%zu "
+      "p50_us=%.3f p99_us=%.3f max_us=%.3f failures=%zu wall_us=%.3f "
+      "calls_per_s=%.3f keys_per_s=%.3f\n",
+      scenario.c_str(), repetition, write_memory ? "on" : "off", operation,
+      stats.us.size(), keys, p50, p99, max, stats.failures, wall_us,
+      calls_per_second, keys_per_second);
+}
+
+struct AlternatingResult {
+  bool started = false;
+  bool write_memory_matches = false;
+  bool layout_matches = false;
+  bool final_value_matches = false;
+  CallStats put;
+  CallStats remove;
+  double wall_us = 0;
+};
+
+AlternatingResult MeasureAlternating(const std::string& scenario,
+                                     int repetition, bool write_memory,
+                                     const std::vector<BlockKey>& keys,
+                                     bool spread) {
+  constexpr size_t kClients = 4;
+  constexpr size_t kIterations = 128;
+  const std::string tag = scenario + "_" + std::to_string(repetition) + "_" +
+                          (write_memory ? "on" : "off");
+  auto node = StartPublicationNode(tag, write_memory);
+  AlternatingResult result;
+  result.started = node->started;
+  if (!node->started) return result;
+  result.write_memory_matches =
+      KvNodeServerWiringTestPeer::HasWriteMemory(*node->server) == write_memory;
+  result.layout_matches = PublicationKeysDistinct(keys) &&
+                          (spread ? SpreadPublicationBuckets(*node->server, keys)
+                                  : OnePublicationBucket(*node->server, keys));
+
+  std::vector<ClientCallStats> clients(kClients);
+  std::atomic<bool> go{false};
+  auto writer = [&](size_t client) {
+    clients[client].put_us.reserve(kIterations);
+    clients[client].remove_us.reserve(kIterations);
+    TcpTransport transport;
+    const std::string value(128, 'v');
+    while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+    for (size_t i = 0; i < kIterations; ++i) {
+      const BlockKey& key = keys[(client * kIterations + i) % keys.size()];
+      auto started = BenchClock::now();
+      const Status put = transport.Cache(node->addr, key, value.data(), value.size());
+      clients[client].put_us.push_back(BenchUs(BenchClock::now() - started));
+      if (put != Status::kOk) ++clients[client].put_failures;
+      started = BenchClock::now();
+      const Status removed = transport.Remove(node->addr, key);
+      clients[client].remove_us.push_back(BenchUs(BenchClock::now() - started));
+      // Another client may legitimately have removed the shared key first.
+      if (removed != Status::kOk && removed != Status::kNotFound)
+        ++clients[client].remove_failures;
+    }
+  };
+  std::vector<std::thread> threads;
+  threads.reserve(kClients);
+  for (size_t client = 0; client < kClients; ++client)
+    threads.emplace_back(writer, client);
+  const auto wall_started = BenchClock::now();
+  go.store(true, std::memory_order_release);
+  for (auto& thread : threads) thread.join();
+  result.wall_us = BenchUs(BenchClock::now() - wall_started);
+  for (auto& client : clients) {
+    result.put.us.insert(result.put.us.end(), client.put_us.begin(),
+                         client.put_us.end());
+    result.remove.us.insert(result.remove.us.end(), client.remove_us.begin(),
+                            client.remove_us.end());
+    result.put.failures += client.put_failures;
+    result.remove.failures += client.remove_failures;
+  }
+
+  // End-to-end correctness is not included in the measured loop.
+  TcpTransport check;
+  const std::string value(128, 'z');
+  std::string readback;
+  const Status put = check.Cache(node->addr, keys[0], value.data(), value.size());
+  const Status range = check.Range(node->addr, keys[0], 0, value.size(), &readback);
+  result.final_value_matches = put == Status::kOk && range == Status::kOk &&
+                               readback == value;
+  if (!result.final_value_matches) ++result.put.failures;
+  PrintCalls(scenario, repetition, write_memory, "PUT", result.put,
+             result.wall_us);
+  PrintCalls(scenario, repetition, write_memory, "REMOVE", result.remove,
+             result.wall_us);
+  return result;
+}
+
+TEST(RamTierWiring, PublicationDiskIoThroughputBenchmark) {
+  if (!PublicationBenchEnabled()) {
+    GTEST_SKIP() << "set DFKV_PUBLICATION_BENCH=1";
+  }
+  auto layout = StartPublicationNode("layout", true);
+  ASSERT_TRUE(layout->started);
+  const std::string ns = "publication/bench";
+  const std::vector<BlockKey> same_key{ToBlockKey(ns, "same-key")};
+  const auto collisions = KeysInOneBucket(*layout->server, ns, 16);
+  const auto spread = KeysAcrossBuckets(*layout->server, ns, 16);
+  ASSERT_TRUE(PublicationKeysDistinct(collisions));
+  ASSERT_TRUE(PublicationKeysDistinct(spread));
+  ASSERT_TRUE(OnePublicationBucket(*layout->server, collisions));
+  ASSERT_TRUE(SpreadPublicationBuckets(*layout->server, spread));
+  for (int rep = 0; rep < 5; ++rep) {
+    for (const bool write_memory : {true, false}) {
+      const auto same = MeasureAlternating("same_key", rep, write_memory,
+                                           same_key, false);
+      EXPECT_TRUE(same.started && same.write_memory_matches &&
+                  same.layout_matches && same.final_value_matches);
+      EXPECT_EQ(same.put.failures, 0u);
+      EXPECT_EQ(same.remove.failures, 0u);
+      const auto collision = MeasureAlternating("same_bucket", rep,
+                                                write_memory, collisions, false);
+      EXPECT_TRUE(collision.started && collision.write_memory_matches &&
+                  collision.layout_matches && collision.final_value_matches);
+      EXPECT_EQ(collision.put.failures, 0u);
+      EXPECT_EQ(collision.remove.failures, 0u);
+      const auto separated = MeasureAlternating("spread_buckets", rep,
+                                                write_memory, spread, true);
+      EXPECT_TRUE(separated.started && separated.write_memory_matches &&
+                  separated.layout_matches && separated.final_value_matches);
+      EXPECT_EQ(separated.put.failures, 0u);
+      EXPECT_EQ(separated.remove.failures, 0u);
+    }
+  }
+}
+
+struct AgesCaseResult {
+  bool layout_matches = false;
+  uint64_t server_requests = 0;
+  uint64_t expected_requests = 0;
+  size_t keys = 0;
+  double wall_us = 0;
+  CallStats calls;
+};
+
+AgesCaseResult MeasureAgesCase(KvNodeServer& server, const std::string& addr,
+                               const std::string& scenario, int repetition,
+                               bool write_memory,
+                               const std::vector<BlockKey>& keys,
+                               bool duplicate) {
+  AgesCaseResult result;
+  result.keys = keys.size();
+  result.layout_matches =
+      !keys.empty() && OnePublicationBucket(server, keys) &&
+      (duplicate || PublicationKeysDistinct(keys)) &&
+      (!duplicate || std::all_of(keys.begin(), keys.end(), [&](const BlockKey& key) {
+        return key == keys[0];
+      }));
+  result.expected_requests = (keys.size() + kRemovedWithinMaxKeys - 1) /
+                             kRemovedWithinMaxKeys;
+  const uint64_t requests_before =
+      KvNodeServerWiringTestPeer::RemovedWithinAgesRequests(server);
+  TcpTransport transport;
+  const auto wall_started = BenchClock::now();
+  for (size_t begin = 0; begin < keys.size(); begin += kRemovedWithinMaxKeys) {
+    const size_t count =
+        std::min(kRemovedWithinMaxKeys, keys.size() - begin);
+    const std::string payload =
+        EncodeRemovedWithinPayload(600000, keys.data() + begin, count);
+    std::string out;
+    const auto started = BenchClock::now();
+    const Status status = transport.RemovedWithinAges(
+        addr, keys[begin].tenant_hash, count, payload, &out);
+    result.calls.us.push_back(BenchUs(BenchClock::now() - started));
+    bool valid = status == Status::kOk &&
+                 out.size() == 4 + count * kRemovedWithinAgesKeyBytes;
+    for (size_t i = 0; valid && i < count; ++i) {
+      const uint32_t removed_age = net::GetU32(out.data() + 4 + i * 8);
+      valid = (removed_age == kRemovedAgeNone ||
+               removed_age == kRemovedAgeUnknown) &&
+              net::GetU32(out.data() + 8 + i * 8) == kRemovedAgeNone;
+    }
+    if (!valid) ++result.calls.failures;
+  }
+  result.wall_us = BenchUs(BenchClock::now() - wall_started);
+  result.server_requests =
+      KvNodeServerWiringTestPeer::RemovedWithinAgesRequests(server) -
+      requests_before;
+  PrintCalls(scenario + "_n" + std::to_string(keys.size()), repetition,
+             write_memory, "OP26", result.calls, result.wall_us, result.keys);
+  return result;
+}
+
+TEST(RamTierWiring, PublicationAgesBatchThroughputBenchmark) {
+  if (!PublicationBenchEnabled()) {
+    GTEST_SKIP() << "set DFKV_PUBLICATION_BENCH=1";
+  }
+  auto layout = StartPublicationNode("batch_layout", true);
+  ASSERT_TRUE(layout->started);
+  const auto pool = KeysInOneBucket(*layout->server, "publication/batch", 1025);
+  ASSERT_TRUE(PublicationKeysDistinct(pool));
+  ASSERT_TRUE(OnePublicationBucket(*layout->server, pool));
+  for (int rep = 0; rep < 5; ++rep) {
+    for (const bool write_memory : {true, false}) {
+      auto node = StartPublicationNode(
+          "batch_" + std::to_string(rep) + (write_memory ? "_on" : "_off"),
+          write_memory);
+      ASSERT_TRUE(node->started);
+      ASSERT_EQ(KvNodeServerWiringTestPeer::HasWriteMemory(*node->server),
+                write_memory);
+      for (const size_t count : {size_t{1}, size_t{128}, size_t{1024},
+                                 size_t{1025}}) {
+        const std::vector<BlockKey> collisions(pool.begin(),
+                                               pool.begin() + count);
+        const std::vector<BlockKey> duplicates(count, pool[0]);
+        const auto same_bucket = MeasureAgesCase(
+            *node->server, node->addr, "same_bucket", rep, write_memory,
+            collisions, false);
+        EXPECT_TRUE(same_bucket.layout_matches);
+        EXPECT_EQ(same_bucket.server_requests, same_bucket.expected_requests);
+        EXPECT_EQ(same_bucket.calls.failures, 0u);
+        const auto repeated = MeasureAgesCase(
+            *node->server, node->addr, "duplicates", rep, write_memory,
+            duplicates, true);
+        EXPECT_TRUE(repeated.layout_matches);
+        EXPECT_EQ(repeated.server_requests, repeated.expected_requests);
+        EXPECT_EQ(repeated.calls.failures, 0u);
+      }
+    }
+  }
+}
+
+bool BenchFlagReady(const std::atomic<bool>& flag,
+                    std::chrono::milliseconds timeout) {
+  const auto deadline = BenchClock::now() + timeout;
+  while (BenchClock::now() < deadline) {
+    if (flag.load(std::memory_order_acquire)) return true;
+    std::this_thread::yield();
+  }
+  return flag.load(std::memory_order_acquire);
+}
+
+struct JoinBenchThread {
+  FlushBarrier* release;
+  std::thread thread;
+  ~JoinBenchThread() {
+    release->Open();
+    if (thread.joinable()) thread.join();
+  }
+};
+
+// Hold the real disk store while its PUT/REMOVE owns the publication bucket.
+// With W, op 26 must wait; without W it must complete before the disk opens.
+TEST(RamTierWiring, PublicationDiskBarrierWaitBenchmark) {
+  if (!PublicationBenchEnabled()) {
+    GTEST_SKIP() << "set DFKV_PUBLICATION_BENCH=1";
+  }
+  for (const bool write_memory : {true, false}) {
+    for (const bool remove_operation : {false, true}) {
+      FlushBarrier barrier;
+      auto node = StartPublicationNode(
+          std::string("barrier_") + (remove_operation ? "remove_" : "put_") +
+              (write_memory ? "on" : "off"),
+          write_memory,
+          [&](const std::string& path, uint64_t capacity) {
+            return std::make_unique<BlockingBypassStore>(path, capacity, barrier,
+                                                         remove_operation);
+          });
+      ASSERT_TRUE(node->started);
+      ASSERT_EQ(KvNodeServerWiringTestPeer::HasWriteMemory(*node->server),
+                write_memory);
+      // 200 ms below is in this fresh node's known REMOVE history.
+      std::this_thread::sleep_for(300ms);
+      const BlockKey key = ToBlockKey("publication/barrier", "held");
+      const std::string small(128, 's'), large(128 * 1024, 'L');
+      TcpTransport writer_transport, query_transport;
+      writer_transport.set_timeouts(1000, 2000);
+      query_transport.set_timeouts(1000, 2000);
+      if (remove_operation) {
+        ASSERT_EQ(writer_transport.Cache(node->addr, key, small.data(), small.size()),
+                  Status::kOk);
+      }
+      std::atomic<Status> write_status{Status::kInvalid};
+      std::atomic<Status> query_status{Status::kInvalid};
+      std::atomic<bool> write_done{false}, query_done{false};
+      std::string query_out;
+      const auto disk_started = BenchClock::now();
+      JoinBenchThread writer{&barrier, std::thread([&] {
+        const Status status = remove_operation
+                                  ? writer_transport.Remove(node->addr, key)
+                                  : writer_transport.Cache(node->addr, key,
+                                                           large.data(), large.size());
+        write_status.store(status, std::memory_order_release);
+        write_done.store(true, std::memory_order_release);
+      })};
+      ASSERT_TRUE(barrier.AwaitEntry());
+      if (write_memory)
+        KvNodeServerWiringTestPeer::ExpectPublicationWait(*node->server, key);
+      const std::string payload = EncodeRemovedWithinPayload(200, &key, 1);
+      JoinBenchThread query{&barrier, std::thread([&] {
+        std::string out;
+        const Status status = query_transport.RemovedWithinAges(
+            node->addr, key.tenant_hash, 1, payload, &out);
+        query_status.store(status, std::memory_order_release);
+        query_out = std::move(out);
+        query_done.store(true, std::memory_order_release);
+      })};
+      bool query_finished_early = false;
+      if (write_memory) {
+        ASSERT_TRUE(KvNodeServerWiringTestPeer::WaitPublicationWait(
+            *node->server, key)) << "op 26 did not reach the held bucket";
+        query_finished_early = query_done.load(std::memory_order_acquire);
+        EXPECT_FALSE(query_finished_early)
+            << (remove_operation ? "REMOVE" : "PUT")
+            << " released op 26 while its disk barrier was still closed";
+      } else {
+        query_finished_early =
+            BenchFlagReady(query_done, std::chrono::milliseconds(2000));
+        EXPECT_TRUE(query_finished_early) << "W-off op 26 waited for disk I/O";
+      }
+      const auto blocked_us = BenchUs(BenchClock::now() - disk_started);
+      barrier.Open();
+      ASSERT_TRUE(BenchFlagReady(write_done, std::chrono::milliseconds(3000)));
+      ASSERT_TRUE(BenchFlagReady(query_done, std::chrono::milliseconds(3000)));
+      const auto disk_us = BenchUs(BenchClock::now() - disk_started);
+      writer.thread.join();
+      query.thread.join();
+      EXPECT_EQ(write_status.load(), Status::kOk);
+      EXPECT_EQ(query_status.load(), Status::kOk);
+      ASSERT_EQ(query_out.size(), 4 + kRemovedWithinAgesKeyBytes);
+      const uint32_t removed_age = net::GetU32(query_out.data() + 4);
+      const uint32_t written_age = net::GetU32(query_out.data() + 8);
+      if (write_memory) {
+        EXPECT_GE(disk_us, blocked_us);
+        if (remove_operation) {
+          EXPECT_NE(removed_age, kRemovedAgeNone);
+          EXPECT_NE(removed_age, kRemovedAgeUnknown);
+          // The small seed PUT before the gated REMOVE is a real W record.
+          EXPECT_NE(written_age, kRemovedAgeNone);
+          EXPECT_NE(written_age, kRemovedAgeUnknown);
+        } else {
+          EXPECT_TRUE(removed_age == kRemovedAgeNone ||
+                      removed_age == kRemovedAgeUnknown);
+          EXPECT_NE(written_age, kRemovedAgeNone);
+        }
+      } else {
+        EXPECT_TRUE(removed_age == kRemovedAgeNone ||
+                    removed_age == kRemovedAgeUnknown);
+        EXPECT_EQ(written_age, kRemovedAgeNone);
+      }
+      const int64_t failed = (write_status.load() != Status::kOk ? 1 : 0) +
+                             (query_status.load() != Status::kOk ? 1 : 0);
+      std::printf(
+          "PUBLICATION_BARRIER W=%s op=%s blocked_us=%.3f disk_call_us=%.3f "
+          "query_completed_before_release=%s failures=%lld\n",
+          write_memory ? "on" : "off", remove_operation ? "REMOVE" : "PUT",
+          blocked_us, disk_us, query_finished_early ? "yes" : "no",
+          static_cast<long long>(failed));
+    }
+  }
+}
+
+}  // namespace

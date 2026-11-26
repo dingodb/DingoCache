@@ -1,5 +1,7 @@
 #include "client/kv_client.h"
 
+#include "common/raw_clock.h"
+
 #include <unistd.h>
 #include <sys/random.h>
 
@@ -312,6 +314,14 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
                     std::to_string(fanout_) + "); read-back stays off");
       readback_on_ = false;
     }
+    rewrite_on_ = EnvNonnegativeInt("DFKV_RING_READBACK_REWRITE", 0) != 0;
+    if (rewrite_on_ && !readback_on_) {
+      DFKV_LOG_WARN("DFKV_RING_READBACK_REWRITE needs the read-back "
+                    "(DFKV_RING_READBACK_MS); it stays off");
+      rewrite_on_ = false;
+    }
+    config_dump::RecordResolved("DFKV_RING_READBACK_REWRITE",
+                                rewrite_on_ ? "1" : "0");
     fanout_on_ = reroute_on_ || readback_on_;
     if (fanout_on_) {
       recent_keep_ms_.store(33000, std::memory_order_relaxed);  // 11 polls of 3 s
@@ -1700,13 +1710,25 @@ void KVClient::AskRemoved(const std::vector<std::string>& keys, uint64_t now,
                          static_cast<uint64_t>(own_poll_ms_));
   const uint64_t h64 = readback_ms_ + 10 * poll;
   const uint32_t h = static_cast<uint32_t>(std::min<uint64_t>(h64, UINT32_MAX));
+  // With the rewrite check (CLI-35): each candidate's answers, by node.
+  const bool rewrite = rewrite_on_ && readback_on_;
+  std::vector<std::vector<std::pair<std::string, MemoryAnswer>>> heard(
+      rewrite ? cands.size() : 0);
   for (const auto& [node, list] : by_node) {
     std::vector<std::string> ask_keys;
     ask_keys.reserve(list.size());
     for (size_t c : list) ask_keys.push_back(keys[cands[c].i]);
     std::vector<uint8_t> answers;
     uint32_t covered = 0;
-    const Status st = RemovedWithin(node, ask_keys, h, &answers, &covered);
+    Status st;
+    if (rewrite) {
+      std::vector<MemoryAnswer> ages;
+      st = RemovedWithinAges(node, ask_keys, h, &ages, &covered);
+      for (size_t m = 0; m < list.size(); ++m)
+        heard[list[m]].emplace_back(node, ages[m]);
+    } else {
+      st = RemovedWithin(node, ask_keys, h, &answers, &covered);
+    }
     if (st == Status::kOk) {
       // A node whose M stays shorter than H past a start: counted once.
       std::lock_guard<std::mutex> lk(memory_short_mu_);
@@ -1725,6 +1747,7 @@ void KVClient::AskRemoved(const std::vector<std::string>& keys, uint64_t now,
                       "DFKV_REMOVE_MEMORY_MS there)");
       }
     }
+    if (rewrite) continue;
     for (size_t m = 0; m < list.size(); ++m) {
       RbCand& cand = cands[list[m]];
       if (answers[m] == 0) continue;
@@ -1735,9 +1758,65 @@ void KVClient::AskRemoved(const std::vector<std::string>& keys, uint64_t now,
         cand.refusal = kRbUnknown;
     }
   }
+  for (size_t c = 0; c < heard.size(); ++c) {
+    RbCand& cand = cands[c];
+    if (cand.refusal >= 0) continue;
+    switch (RewriteVerdict(cand.prev, heard[c])) {
+      case Rewrite::kNoRemove:
+        break;
+      case Rewrite::kAfterEvery:
+        readback_rewritten_.fetch_add(1, std::memory_order_relaxed);
+        break;
+      case Rewrite::kRemoved:
+        cand.refusal = kRbRemoved;
+        break;
+      case Rewrite::kUnknown:
+        cand.refusal = kRbUnknown;
+        break;
+    }
+  }
   for (const RbCand& cand : cands)
     if (cand.refusal >= 0 && cand.refusal < kRbRefusals)
       readback_refused_[cand.refusal].fetch_add(1, std::memory_order_relaxed);
+}
+
+KVClient::Rewrite KVClient::RewriteVerdict(
+    const std::string& prev,
+    const std::vector<std::pair<std::string, MemoryAnswer>>& heard) {
+  // §3.5. Ages on each node's CLOCK_MONOTONIC_RAW, compared through the
+  // client's own RAW request times; rho bounds every clock's rate, G covers
+  // a raw clock stopped for less than the nodes' pause check sees.
+  constexpr double kRho = 1e-3;
+  constexpr double kGuardMs = 1000;
+  const MemoryAnswer* p = nullptr;
+  for (const auto& [node, a] : heard)
+    if (node == prev) p = &a;
+  bool unknown = false, removed = false, refused = false;
+  for (const auto& [node, a] : heard) {
+    if (a.removed_age == kRemovedAgeUnknown) {
+      unknown = true;
+      continue;
+    }
+    if (a.removed_age == kRemovedAgeNone) continue;
+    removed = true;
+    if (p == nullptr || p->written_age == kRemovedAgeNone) {
+      refused = true;
+    } else if (node == prev) {
+      // Equal integer ages cannot say whether a same-ms rewrite happened
+      // before or after this REMOVE. A joint snapshot orders reads, not those
+      // completed operations, so a tie must not amortize a read-back.
+      if (a.removed_age <= p->written_age) refused = true;
+    } else {
+      const double lhs = a.removed_age / (1 + kRho) -
+                         (static_cast<double>(p->written_age) + 1) / (1 - kRho);
+      const double rhs =
+          std::max(0.0, a.answered_ms - p->sent_ms) / (1 - kRho) + kGuardMs;
+      if (!(lhs > rhs)) refused = true;
+    }
+  }
+  if (refused) return Rewrite::kRemoved;  // removed wins over unknown
+  if (unknown) return Rewrite::kUnknown;
+  return removed ? Rewrite::kAfterEvery : Rewrite::kNoRemove;
 }
 
 void KVClient::CheckSubstituteReads(const std::vector<std::string>& keys,
@@ -1972,6 +2051,97 @@ Status KVClient::RemovedWithin(const std::string& node,
   return Status::kOk;
 }
 
+Status KVClient::RemovedWithinAges(const std::string& node,
+                                   const std::vector<std::string>& keys,
+                                   uint32_t age_ms,
+                                   std::vector<MemoryAnswer>* answers,
+                                   uint32_t* covered_ms) {
+  constexpr uint64_t kRecheckMs = 60000;
+  answers->assign(keys.size(), MemoryAnswer{});
+  if (covered_ms) *covered_ms = 0;
+  if (keys.empty()) return Status::kOk;
+  const uint64_t now = NowMs();
+  bool ages = true;
+  {
+    std::lock_guard<std::mutex> lk(no_memory_mu_);
+    const auto it = no_memory_until_.find(node);
+    if (it != no_memory_until_.end()) {
+      if (now < it->second) return Status::kInvalid;
+      no_memory_until_.erase(it);
+    }
+    const auto at = no_ages_until_.find(node);
+    if (at != no_ages_until_.end()) {
+      if (now < at->second)
+        ages = false;
+      else
+        no_ages_until_.erase(at);
+    }
+  }
+  if (!health_.Healthy(node, now)) return Status::kIOError;
+  uint32_t covered = UINT32_MAX;
+  for (size_t begin = 0; begin < keys.size();
+       begin += kRemovedWithinMaxKeys) {
+    const size_t n = std::min(kRemovedWithinMaxKeys, keys.size() - begin);
+    std::vector<BlockKey> bkeys;
+    bkeys.reserve(n);
+    for (size_t i = 0; i < n; ++i) bkeys.push_back(block_key_(keys[begin + i]));
+    const std::string payload =
+        EncodeRemovedWithinPayload(age_ms, bkeys.data(), n);
+    // Times per request actually answered (§3.5): a fallback or a later
+    // chunk has its own.
+    std::string out;
+    double sent = RawMsExact();
+    Status st = Status::kInvalid;
+    if (ages) {
+      st = t_->RemovedWithinAges(node, bkeys[0].tenant_hash, n, payload, &out);
+      if (st == Status::kInvalid) {
+        // No op 26 there (an older node, or one without M): op 25 instead.
+        std::lock_guard<std::mutex> lk(no_memory_mu_);
+        no_ages_until_[node] = NowMs() + kRecheckMs;
+        ages = false;
+      }
+    }
+    if (!ages) {
+      out.clear();
+      sent = RawMsExact();
+      st = t_->RemovedWithin(node, bkeys[0].tenant_hash, n, payload, &out);
+    }
+    const double answered = RawMsExact();
+    ReportPeer(node, st);
+    if (st == Status::kInvalid) {
+      std::lock_guard<std::mutex> lk(no_memory_mu_);
+      no_memory_until_[node] = NowMs() + kRecheckMs;
+      answers->assign(keys.size(), MemoryAnswer{});
+      return Status::kInvalid;
+    }
+    const size_t want = ages ? 4 + n * kRemovedWithinAgesKeyBytes : 4 + n;
+    if (st != Status::kOk || out.size() != want) {
+      answers->assign(keys.size(), MemoryAnswer{});
+      return st == Status::kOk ? Status::kIOError : st;
+    }
+    covered = std::min(covered, net::GetU32(out.data()));
+    for (size_t i = 0; i < n; ++i) {
+      MemoryAnswer& a = (*answers)[begin + i];
+      a.sent_ms = sent;
+      a.answered_ms = answered;
+      if (ages) {
+        a.removed_age = net::GetU32(&out[4 + i * 8]);
+        a.written_age = net::GetU32(&out[8 + i * 8]);
+        if (a.written_age >= kRemovedAgeUnknown) a.written_age = kRemovedAgeNone;
+      } else {
+        // Op 25: a REMOVE counts as just now; no write ages.
+        const uint8_t bit = static_cast<uint8_t>(out[4 + i]);
+        a.removed_age = bit == 0   ? kRemovedAgeNone
+                        : bit == 1 ? 0
+                                   : kRemovedAgeUnknown;
+        a.written_age = kRemovedAgeNone;
+      }
+    }
+  }
+  if (covered_ms) *covered_ms = covered;
+  return Status::kOk;
+}
+
 void KVClient::ReportPeer(const std::string& node, const Status* statuses,
                           size_t count) {
   PeerOutcome outcome;
@@ -2167,7 +2337,7 @@ std::string KVClient::MetricsSnapshot() const {
       std::lock_guard<std::mutex> lk(reroute_mu_);
       episode_pending = episode_pending_;
     }
-    s += "# HELP dfkv_client_readback_reads_total Previous-owner read-backs (DFKV_RING_READBACK_MS): hit, miss, and the candidates refused (removed or unknown in some asked node's M, a counted length mismatch, the registry gate closed, the previous owner cooling)\n";
+    s += "# HELP dfkv_client_readback_reads_total Previous-owner read-backs (DFKV_RING_READBACK_MS): hit, miss, and the candidates refused (removed or unknown in some asked node's M, a counted length mismatch, the registry gate closed, the previous owner cooling); hit_rewritten: read back because the previous owner's write followed every reported REMOVE (DFKV_RING_READBACK_REWRITE; counted in addition to hit or miss)\n";
     s += "# TYPE dfkv_client_readback_reads_total counter\n";
     s += "dfkv_client_readback_reads_total{result=\"hit\"} " + load(readback_hit_) + "\n";
     s += "dfkv_client_readback_reads_total{result=\"miss\"} " + load(readback_miss_) + "\n";
@@ -2176,6 +2346,7 @@ std::string KVClient::MetricsSnapshot() const {
     s += "dfkv_client_readback_reads_total{result=\"refused_length\"} " + load(readback_refused_[kRbLength]) + "\n";
     s += "dfkv_client_readback_reads_total{result=\"refused_gate\"} " + load(readback_refused_[kRbGate]) + "\n";
     s += "dfkv_client_readback_reads_total{result=\"refused_cooling\"} " + load(readback_refused_[kRbCooling]) + "\n";
+    s += "dfkv_client_readback_reads_total{result=\"hit_rewritten\"} " + load(readback_rewritten_) + "\n";
     s += "# HELP dfkv_client_readback_changes_refused_total Adopted write-ring changes given no read-back window: held (the guard held the change longer than settle - poll_max), chained (a second change inside an open window)\n";
     s += "# TYPE dfkv_client_readback_changes_refused_total counter\n";
     s += "dfkv_client_readback_changes_refused_total{reason=\"held\"} " + load(readback_changes_held_) + "\n";

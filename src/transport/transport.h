@@ -176,6 +176,17 @@ class Transport {
     return Status::kInvalid;
   }
 
+  // One kRemovedWithinAges round trip (op 26, the same payload); `out`
+  // receives the reply data. A node without the op answers kInvalid.
+  // Default: unsupported.
+  virtual Status RemovedWithinAges(const std::string& node,
+                                   uint64_t tenant_hash, uint64_t count,
+                                   const std::string& payload,
+                                   std::string* out) {
+    (void)node; (void)tenant_hash; (void)count; (void)payload; (void)out;
+    return Status::kInvalid;
+  }
+
   // One kRetain round trip: `payload` is the encoded kRetain body (see
   // wire.h) for `count` keys of one tenant; `out` receives the reply data.
   // A node without retention answers kInvalid. Default: unsupported.

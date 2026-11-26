@@ -148,6 +148,30 @@ class KVClient {
                        const std::vector<std::string>& keys, uint32_t age_ms,
                        std::vector<uint8_t>* answers,
                        uint32_t* covered_ms = nullptr);
+  // The same question with ages (kRemovedWithinAges, op 26; CLI-35): per key
+  // the age of the latest REMOVE (kRemovedAgeNone, kRemovedAgeUnknown) and
+  // of the latest PUT (kRemovedAgeNone if not remembered), and the
+  // CLOCK_MONOTONIC_RAW times (ms) at which the request that carried the
+  // key was sent and answered. A node without op 26 is asked op 25 instead
+  // (remembered for 60 s): its REMOVEs come back as age 0, its writes as
+  // none. Every key of a failed request is unknown.
+  struct MemoryAnswer {
+    uint32_t removed_age = kRemovedAgeUnknown;
+    uint32_t written_age = kRemovedAgeNone;
+    double sent_ms = 0, answered_ms = 0;
+  };
+  Status RemovedWithinAges(const std::string& node,
+                           const std::vector<std::string>& keys,
+                           uint32_t age_ms, std::vector<MemoryAnswer>* answers,
+                           uint32_t* covered_ms = nullptr);
+  // The rewrite check (§3.5) over one candidate's answers, by node, P being
+  // `prev`: no asked node reports a REMOVE; P's write follows every
+  // reported one; some REMOVE is not shown followed; or some node could not
+  // say. Pure (public for its tests).
+  enum class Rewrite { kNoRemove, kAfterEvery, kRemoved, kUnknown };
+  static Rewrite RewriteVerdict(
+      const std::string& prev,
+      const std::vector<std::pair<std::string, MemoryAnswer>>& heard);
   void BatchRetain(const std::vector<std::string>& keys,
                    const RetainRequest& req, uint8_t* out);
   // Ring-wide limits: *supported 1 = every member answered kRetain, 0 = some
@@ -439,6 +463,7 @@ class KVClient {
   };
   std::mutex no_memory_mu_;
   std::map<std::string, uint64_t> no_memory_until_;  // node -> NowMs() bound
+  std::map<std::string, uint64_t> no_ages_until_;    // nodes without op 26
   mutable std::mutex retain_mu_;
   std::map<std::string, RetainNodeState> retain_nodes_;
   // A key the node answered as protected: when, by which node (a hash of its
@@ -530,6 +555,10 @@ class KVClient {
 
   // ---- Previous-owner read-back (CLI-02 stage B, §3.4) ----
   bool readback_on_ = false;
+  // DFKV_RING_READBACK_REWRITE (CLI-35, §3.5): read back a key removed and
+  // written again at P afterwards, as shown by op 26's ages.
+  bool rewrite_on_ = false;
+  std::atomic<uint64_t> readback_rewritten_{0};
   uint64_t readback_ms_ = 0;  // DFKV_RING_READBACK_MS
   // The write ring held for the window of the last adopted change, and its
   // addresses (ring_mu_). Empty when no window is open.
@@ -563,6 +592,7 @@ class KVClient {
   // owner, without O) and refuses on any 1 or 2; counts the refusals.
   void AskRemoved(const std::vector<std::string>& keys, uint64_t now,
                   std::vector<RbCand>* cands);
+
   // Revision 11: a substitute read of a key outside this client's current
   // episode is a read-back: asks M (ask set without the owner) and blanks
   // subs[k] (a miss) unless every answer is 0.
