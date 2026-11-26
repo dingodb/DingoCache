@@ -461,7 +461,7 @@ Prometheus 调用。vLLM 使用同一 allowlist，区别只是在 family 前加 
 | `dfkv_read_scheduler_node_limit_waits_total` | counter | 空闲 read worker 被唤醒后，发现待执行的 shard 全部属于已达单节点上限的节点的次数。正常运行中也会出现（例如小环上对单个节点的大 batch）；若其他节点的读同时变慢且该计数持续高速增长，说明有慢节点 |
 | `dfkv_client_ring_members` / `dfkv_client_mds_reachable` / `dfkv_client_mds_unreachable_polls_total` | gauge / gauge / counter | 当前环节点数 / 最近发现轮询是否可达 MDS / 不可达轮询累计 |
 | `dfkv_client_ring_draining_members` | gauge | 环里正在排空的节点数（DEPLOY §4c-1）：不再写入，读在新 owner 未命中后才问它 |
-| `dfkv_client_ring_absent_members` | gauge | 缺席成员数（DEPLOY §4c-2，`DFKV_RING_ABSENT_GRACE_MS`）：从视图消失、仍在宽限期内的成员，不再写入也不读，REMOVE 和 RETAIN 也发给它 |
+| `dfkv_client_ring_absent_members` | gauge | 缺席成员数（DEPLOY §4c-2，`DFKV_RING_ABSENT_GRACE_MS`）：从视图消失、仍在宽限期内的成员，不再写入也不做普通读（只经 B 的 M/W 安全检查回读），REMOVE 和 RETAIN 也发给它 |
 | `dfkv_client_ring_absent_dropped_total{reason}` | counter | 移出的缺席成员：`grace` 宽限期满，`bound` 超过 `max(1, N/8)` 的上限立即移出，`planned` 排空后下线、不保留 |
 | `dfkv_client_ring_absent_removes_unconfirmed_total` / `_retried_total` / `_dropped_total` | counter | 缺席成员没确认的 REMOVE / 它回来后重发的次数（每次发送都计）/ 最终没确认的（超出队列上限、成员被移出、回来后一个宽限期仍未确认） |
 | `dfkv_client_cooldown_reroutes_total{op}` | counter | 冷却改道（DEPLOY §4c-3）：owner 在本客户端回避期内、改走替补的 key（`get`、`exist`、`put`、`retain`）；`none`：owner 在回避期内但前几个候选都不能用，照旧跳过 |

@@ -1550,6 +1550,12 @@ uint64_t KVClient::RecentKeepMsForTest() const {
   return recent_keep_ms_.load(std::memory_order_relaxed);
 }
 
+void KVClient::AgeAbsentForTest(const std::string& id, uint64_t age_ms) {
+  std::lock_guard<std::mutex> lk(ring_mu_);
+  const auto it = absent_.find(id);
+  if (it != absent_.end()) it->second.since_ms = NowMs() - age_ms;
+}
+
 void KVClient::UseRegistryGateForTest(int poll_ms) {
   std::lock_guard<std::mutex> lk(gate_mu_);
   own_poll_ms_ = poll_ms;
@@ -1639,6 +1645,11 @@ std::map<std::string, std::vector<size_t>> KVClient::PlanReadBack(
   std::map<std::string, std::vector<size_t>> plan;
   if (!readback_on_ || keys.empty()) return plan;
   const uint64_t now = NowMs();
+  const uint64_t poll =
+      std::max<uint64_t>(poll_max_now_ms_.load(std::memory_order_relaxed),
+                         static_cast<uint64_t>(own_poll_ms_));
+  const uint64_t absence_horizon =
+      std::min<uint64_t>(readback_ms_ + 10 * poll, UINT32_MAX);
   std::vector<RbCand> cands;
   {
     std::lock_guard<std::mutex> lk(ring_mu_);
@@ -1661,17 +1672,43 @@ std::map<std::string, std::vector<size_t>> KVClient::PlanReadBack(
         if (ep != episode_readback_.end() && now < ep->second.second)
           prev = ep->second.first;
       }
-      if (prev.empty() || prev == oa->second)
-        continue;  // the owner did not change
       RbCand c{i, oa->second, prev, {}, -1};
-      c.ask.insert(prev);
-      AddAskSetLocked(hash, now, &c.ask);
+      if (!prev.empty() && prev != oa->second) {
+        c.ask.insert(prev);
+        AddAskSetLocked(hash, now, &c.ask);
+      }
       cands.push_back(std::move(c));
     }
   }
+  size_t kept = 0;
+  for (size_t n = 0; n < cands.size(); ++n) {
+    RbCand cand = std::move(cands[n]);
+    if (cand.prev.empty() || cand.prev == cand.owner) {
+      // A live process whose membership record vanished is the absent
+      // owner, independently of the held-ring/episode candidates above.
+      // AbsentRoute takes ring_mu_, so select it outside the snapshot lock.
+      std::string absent_id;
+      uint64_t absent_since = 0;
+      cand.prev = AbsentRoute(keys[cand.i], &absent_id, &absent_since);
+      if (!cand.prev.empty() && cand.prev != cand.owner) {
+        // M/W cannot see a REMOVE older than H. Since absent members are
+        // never read ordinarily, their read-back is safe only while their
+        // entire absence is inside that same asked horizon.
+        if (now >= absent_since && now - absent_since >= absence_horizon)
+          cand.refusal = kRbUnknown;
+        cand.ask.insert(cand.prev);
+        std::lock_guard<std::mutex> lk(ring_mu_);
+        AddAskSetLocked(ConHash::KeyHash(keys[cand.i]), now, &cand.ask);
+      }
+    }
+    if (!cand.prev.empty() && cand.prev != cand.owner)
+      cands[kept++] = std::move(cand);
+  }
+  cands.resize(kept);
   if (cands.empty()) return plan;
   const bool gate = gate_open_.load(std::memory_order_acquire);
   for (RbCand& cand : cands) {
+    if (cand.refusal >= 0) continue;  // absence is older than M/W's horizon
     // A not found from a substitute (the owner cools here) is not the
     // owner's answer: not a candidate.
     if (gate && health_.Cooling(cand.owner, now))
@@ -2308,7 +2345,7 @@ std::string KVClient::MetricsSnapshot() const {
       std::lock_guard<std::mutex> lk(ring_mu_);
       absent = absent_.size();
     }
-    s += "# HELP dfkv_client_ring_absent_members Members kept absent (DFKV_RING_ABSENT_GRACE_MS): vanished from the view; no writes and no reads; REMOVE and RETAIN reach them; their unconfirmed REMOVEs are retried when they return\n";
+    s += "# HELP dfkv_client_ring_absent_members Members kept absent (DFKV_RING_ABSENT_GRACE_MS): vanished from the view; no writes and no ordinary reads (only checked read-back); REMOVE and RETAIN reach them; their unconfirmed REMOVEs are retried when they return\n";
     s += "# TYPE dfkv_client_ring_absent_members gauge\n";
     s += "dfkv_client_ring_absent_members " + std::to_string(absent) + "\n";
     s += "# HELP dfkv_client_ring_absent_dropped_total Absent members dropped: grace over, over the bound of max(1, N/8), or a planned leave (it drained) that is not kept\n";
@@ -2482,8 +2519,8 @@ std::string KVClient::DrainRoute(const std::string& key) const {
   return it == addr_.end() ? "" : it->second;
 }
 
-std::string KVClient::AbsentRoute(const std::string& key,
-                                  std::string* id) const {
+std::string KVClient::AbsentRoute(const std::string& key, std::string* id,
+                                  uint64_t* since_ms) const {
   if (!any_absent_.load(std::memory_order_relaxed)) return "";
   const uint32_t hash = ConHash::KeyHash(key);
   std::lock_guard<std::mutex> lk(ring_mu_);
@@ -2492,6 +2529,7 @@ std::string KVClient::AbsentRoute(const std::string& key,
   const auto it = absent_.find(name);
   if (it == absent_.end()) return "";
   *id = name;
+  if (since_ms) *since_ms = it->second.since_ms;
   return it->second.addr;
 }
 
@@ -2604,14 +2642,32 @@ bool KVClient::GetDirect(const std::string& key, void* out, size_t n,
 
 bool KVClient::GetAutoDirect(const std::string& key, std::string* out,
                              size_t max_bytes) {
-  if (GetAutoDirectRouted(key, out, max_bytes)) return true;
-  if (t_drain_pass || DrainRoute(key).empty()) return false;
+  ItemStatus first = ItemStatus::kNoRoute;
+  if (GetAutoDirectRouted(key, out, max_bytes, &first)) return true;
+  if (!t_drain_pass && !DrainRoute(key).empty()) {
+    ItemStatus second = ItemStatus::kNoRoute;
+    bool hit;
+    {
+      DrainPass pass;
+      hit = GetAutoDirectRouted(key, out, max_bytes, &second);
+    }
+    CountDrainRead(hit);
+    if (hit) return true;
+  }
+  if (!readback_on_ || first != ItemStatus::kNotFound || t_drain_pass ||
+      t_route_to != nullptr)
+    return false;
+  const auto plan = PlanReadBack({key});
+  if (plan.empty()) return false;
+  ItemStatus back = ItemStatus::kNoRoute;
   bool hit;
   {
-    DrainPass pass;
-    hit = GetAutoDirectRouted(key, out, max_bytes);
+    RouteTo to(plan.begin()->first);
+    hit = GetAutoDirectRouted(key, out, max_bytes, &back);
   }
-  CountDrainRead(hit);
+  CountReadBack(hit);
+  if (back == ItemStatus::kLengthMismatch)
+    length_mismatch_seen_.store(true, std::memory_order_relaxed);
   return hit;
 }
 
@@ -3074,9 +3130,13 @@ bool KVClient::GetAuto(const std::string& key, std::string* out,
 }
 
 bool KVClient::GetAutoDirectRouted(const std::string& key, std::string* out,
-                                   size_t max_bytes) {
+                                   size_t max_bytes, ItemStatus* status) {
+  ItemStatus unused;
+  ItemStatus& outcome = status ? *status : unused;
+  outcome = ItemStatus::kNoRoute;
   std::string node = RouteFor(key, RouteOp::kGet);
   if (node.empty()) return false;
+  outcome = ItemStatus::kPeerCooling;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
   const BlockKey bk = block_key_(key);
@@ -3090,6 +3150,7 @@ bool KVClient::GetAutoDirectRouted(const std::string& key, std::string* out,
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
+  outcome = ReadItemStatus(st, value_len, max_bytes, /*exact=*/false);
   ReportPeer(node, st);
   out->clear();
   if (st != Status::kOk || value_len > max_bytes) return false;
