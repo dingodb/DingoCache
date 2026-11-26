@@ -112,7 +112,11 @@ DISRUPTION_MAX_MEAN = 0.75
 # absolute clean-run number (the pattern CLI-35 uses).
 AMB_MIN_PRE_ABSENCE_FRACTION = 0.90
 POST_MIN_PRE_ABSENCE_FRACTION = 0.90
-MIN_AMB_CONTRAST = 0.20
+# A is a stronger control than base: its absent-member REMOVE path heals much
+# of the churn disruption without reading the stale copy.  Require a clear
+# 10-point full-prefix gain over both controls; the binary victim hit/refusal
+# counters remain the primary AMB proof.
+MIN_AMB_CONTRAST = 0.10
 VICTIM_MIN_READBACK_HITS = 100    # amb within-H dfkv_cache_hit delta on n2
 KEEPER_PERIOD_S = 0.4
 REANNOUNCE_TIMEOUT_S = 30.0
