@@ -348,6 +348,9 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_put_wait_timeouts_total` | counter | 等待时间用完（从所在请求批次到达算起 `DFKV_RAM_PUT_WAIT_MS`）后回 `kCacheFull` 的 PUT 数，停止期间到时的也算在这里；值本身仍在 RAM 里继续刷盘 |
 | `dfkv_ram_put_waits_canceled_total` | counter | 停止时被提前回 `kCacheFull` 的等待中 PUT 数（含停止开始后本来需要等待的 PUT） |
 | `dfkv_ram_ack_backpressure_total` | counter | 正的 RAM-ACK dirty 水位触发的新 key 接纳拒绝；水位为 0 时计数强制等待落盘的请求。已有 key 先解析 owner，不因水位切换覆盖首写者 |
+| `dfkv_ram_ack_backpressure_waits_total` | counter | 在水位处等待过的 RAM-ACK 新 key PUT 数（`DFKV_RAM_ACK_BACKPRESSURE_WAIT_MS`） |
+| `dfkv_ram_ack_backpressure_wait_timeouts_total` | counter | 等待结束时仍被水位拒绝（回 `kCacheFull`）的 PUT 数；也计入 `dfkv_ram_ack_backpressure_total` |
+| `dfkv_ram_ack_backpressure_wait_microseconds_total` | counter | PUT 在水位处等待的总时长（微秒），除以 waits 得平均等待 |
 | `dfkv_ram_promoted_total` | counter | 整值冷读晋升：优先让 O_DIRECT 直接读入隐藏 arena reservation，成功后以 born-durable 身份发布；staged fallback 则读后复制晋升。不进 flushq、零重复刷盘、随时可驱逐；健康冷→热运行中首次读增长，随后应转为 `dfkv_ram_hit_total` 增长且磁盘字节不再增加 |
 | `dfkv_ram_promote_declined_total` | counter | RAM 没有接收的晋升（没有空间，或这类值不进 RAM） |
 | `dfkv_ram_promote_deferred_total` | counter | 仅 `DFKV_RAM_PROMOTE=second` 时输出：因为这个 key 在 `DFKV_RAM_PROMOTE_WINDOW_MS` 内没被读过而没有装进 RAM 的整值冷读。与 `dfkv_ram_promoted_total` 之比高 = 读的多半是只读一次的数据（扫描）；热数据的命中率却不涨，说明窗口比复用间隔短 |

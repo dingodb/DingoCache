@@ -66,6 +66,24 @@ class RamTierTestPeer {
   static void AfterDrop(RamTier& tier, std::function<void()> hook) {
     tier.after_drop_for_test_ = std::move(hook);
   }
+  static void BeforeBackpressureWaitRegistration(
+      RamTier& tier, std::function<void()> hook) {
+    tier.before_backpressure_wait_registration_for_test_ = std::move(hook);
+  }
+  static void AfterBackpressureWaitRegistration(
+      RamTier& tier, std::function<void()> hook) {
+    tier.after_backpressure_wait_registration_for_test_ = std::move(hook);
+  }
+  static uint64_t DirtyDropGeneration(const RamTier& tier) {
+    return tier.dirty_drop_generation_.load(std::memory_order_acquire);
+  }
+  static bool AwaitDirtyDropGeneration(RamTier& tier, uint64_t seen) {
+    std::unique_lock<std::mutex> lock(tier.dirty_drop_mu_);
+    return tier.dirty_drop_cv_.wait_for(lock, 2s, [&] {
+      return tier.dirty_drop_generation_.load(std::memory_order_acquire) !=
+             seen;
+    });
+  }
   // One reclaimer pass over every shard, as the background thread runs it.
   static void ReclaimTick(RamTier& tier) {
     for (size_t i = 0; i < tier.shards_.size(); ++i)
@@ -94,13 +112,16 @@ struct FlushSink {
   bool gate_open = true;      // when false, flush blocks
   bool fail = false;          // when true, flush returns false
   int calls = 0;
+  int allowed_calls = 0;      // with a closed gate: completions released
 
   RamTier::FlushFn fn() {
     return [this](const BlockKey& k, char* data, size_t len, size_t) {
       std::unique_lock<std::mutex> lk(m);
-      ++calls;
+      const int call = ++calls;
       cv.notify_all();
-      cv.wait(lk, [this] { return gate_open; });
+      // Release the oldest N callbacks, not every thread whose entry precedes
+      // the current global callback count (which can never advance past them).
+      cv.wait(lk, [this, call] { return gate_open || call <= allowed_calls; });
       if (fail) return Status::kIOError;
       flushed.insert(k.Filename());
       values.emplace(k.Filename(), std::string(data, len));
@@ -109,7 +130,15 @@ struct FlushSink {
     };
   }
   void open() { { std::lock_guard<std::mutex> lk(m); gate_open = true; } cv.notify_all(); }
-  void close() { std::lock_guard<std::mutex> lk(m); gate_open = false; }
+  void close() {
+    std::lock_guard<std::mutex> lk(m);
+    gate_open = false;
+    allowed_calls = 0;
+  }
+  void allow_one() {
+    { std::lock_guard<std::mutex> lk(m); ++allowed_calls; }
+    cv.notify_all();
+  }
   bool await_calls(int count) {
     std::unique_lock<std::mutex> lk(m);
     return cv.wait_for(lk, 2s, [&] { return calls >= count; });
@@ -439,6 +468,13 @@ TEST(RamTier, PositiveWatermarkRejectsNewKeysButPreservesExistingOwners) {
   EXPECT_FALSE(rt.Contains(K(106)));
   EXPECT_EQ(rt.DirtyBytes(), 4096u);
   EXPECT_EQ(rt.PutBypass(), 0u);
+  // No refusal has been published yet. The sink gate intentionally stays
+  // closed, so the duplicated leader is unfinished; counters must count a
+  // terminal refusal instead of intermediate admission checks. Completion
+  // is checked below after sink.open releases the first flush.
+  EXPECT_EQ(rt.AckBackpressure(), 0u);
+  EXPECT_EQ(rt.PutWriteBack(K(106), different.data(), different.size()).status,
+            Status::kCacheFull);
   EXPECT_EQ(rt.AckBackpressure(), 1u);
 
   // Tombstones also resolve before the watermark and retain their error.
@@ -737,6 +773,147 @@ TEST(RamTier, InflightDuplicateSharesTerminalLeaderFailure) {
   EXPECT_EQ(rt.PutBypass(), 0u);
   EXPECT_FALSE(rt.healthy());
   EXPECT_FALSE(rt.Contains(K(32)));
+}
+
+// A last drain after the initial refusal but before waiter registration must
+// still be observed. The hook, not a sleep, freezes that exact window. The
+// old implementation missed it because SubDirty advanced its generation only
+// when the waiter count was already nonzero.
+TEST(RamTier, BackpressureWaitObservesDrainBeforeRegistration) {
+  FlushSink sink;
+  sink.close();
+  RamTier::Options options = Opts(4 * 4096);
+  options.large_reserve_bytes = 0;
+  options.ack_high_watermark_pct = 25;
+  options.put_wait_ms = 50;
+  options.ack_backpressure_wait_ms = 50;
+  RamTier rt(options, sink.fn());
+  OpenFlushOnExit cleanup{sink};
+  const std::string first(500, 'a'), second(500, 'b');
+  ASSERT_EQ(rt.PutWriteBack(K(64), first.data(), first.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(sink.await_calls(1));
+  ASSERT_EQ(rt.DirtyBytes(), 4096u);
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool entered = false, resume = false;
+  RamTierTestPeer::BeforeBackpressureWaitRegistration(rt, [&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    entered = true;
+    cv.notify_all();
+    cv.wait(lock, [&] { return resume; });
+  });
+  RamTier::PutResult result{Status::kInvalid};
+  std::thread writer([&] {
+    result = rt.PutWriteBack(K(65), second.data(), second.size());
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(cv.wait_for(lock, 2s, [&] { return entered; }));
+  }
+  sink.open();
+  ASSERT_TRUE(rt.WaitForDrain(2s));
+  ASSERT_EQ(rt.DirtyBytes(), 0u);
+
+  const auto resumed = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    resume = true;
+  }
+  cv.notify_all();
+  writer.join();
+  const auto waited = std::chrono::steady_clock::now() - resumed;
+  EXPECT_EQ(result.status, Status::kOk);
+  EXPECT_LT(waited, 25ms) << "the already-completed drain was missed";
+  EXPECT_TRUE(rt.Contains(K(65)));
+  EXPECT_EQ(rt.BackpressureWaits(), 1u);
+  EXPECT_EQ(rt.BackpressureWaitTimeouts(), 0u);
+  EXPECT_EQ(rt.AckBackpressure(), 0u);
+}
+
+// Every drain advances both the CV predicate and the remaining absolute
+// deadline: two completions still at or above the watermark can retrigger a
+// retry before the third admits. Refusal counters remain terminal-only.
+TEST(RamTier, BackpressureWaitAcceptsMultipleDrainRetriggers) {
+  FlushSink sink;
+  sink.close();
+  RamTier::Options options = Opts(8 * 4096);
+  options.large_reserve_bytes = 0;
+  options.ack_high_watermark_pct = 25;
+  options.put_wait_ms = 50;
+  options.ack_backpressure_wait_ms = 50;
+  options.flush_threads = 4;
+  RamTier rt(options, sink.fn());
+  OpenFlushOnExit cleanup{sink};
+  const std::string value(500, 'r');
+  int entered = 0;
+  for (uint64_t id = 66; id < 70; ++id) {
+    // Each callback must be a singleton batch: a second blocked callback in
+    // one batch would hold back dirty-drop of the released item too.
+    ASSERT_EQ(RamTierTestPeer::Admit(rt, K(id), value, nullptr),
+              RamTierTestPeer::Admission::kAccepted);
+    ASSERT_TRUE(sink.await_calls(++entered));
+  }
+  ASSERT_EQ(rt.DirtyBytes(), 4 * 4096u);
+  ASSERT_TRUE(sink.await_calls(1));
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool registered = false;
+  RamTierTestPeer::AfterBackpressureWaitRegistration(rt, [&] {
+    std::lock_guard<std::mutex> lock(mutex);
+    registered = true;
+    cv.notify_all();
+  });
+  RamTier::PutResult result{Status::kInvalid};
+  std::atomic<bool> returned{false};
+  auto sink_state = [&] {
+    std::lock_guard<std::mutex> lock(sink.m);
+    return "calls=" + std::to_string(sink.calls) +
+           " allowed=" + std::to_string(sink.allowed_calls) +
+           " generation=" +
+           std::to_string(RamTierTestPeer::DirtyDropGeneration(rt));
+  };
+  struct JoinWriter {
+    std::thread thread;
+    ~JoinWriter() { if (thread.joinable()) thread.join(); }
+  } writer{std::thread([&] {
+    result = rt.PutWriteBack(K(70), value.data(), value.size());
+    returned.store(true, std::memory_order_release);
+  })};
+  auto expect_generation = [&](uint64_t seen, int completions) {
+    if (RamTierTestPeer::AwaitDirtyDropGeneration(rt, seen)) return true;
+    ADD_FAILURE() << "no generation advance after " << completions
+                  << " completion(s): " << sink_state();
+    writer.thread.join();
+    return false;
+  };
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(cv.wait_for(lock, 2s, [&] { return registered; }));
+  }
+  for (int completed = 1; completed <= 2; ++completed) {
+    const uint64_t seen = RamTierTestPeer::DirtyDropGeneration(rt);
+    sink.allow_one();
+    if (!expect_generation(seen, completed)) return;
+    EXPECT_EQ(rt.DirtyBytes(), static_cast<uint64_t>(4 - completed) * 4096u)
+        << sink_state();
+    EXPECT_FALSE(returned.load(std::memory_order_acquire))
+        << "the watermark must remain reached after " << completed;
+  }
+
+  const uint64_t seen = RamTierTestPeer::DirtyDropGeneration(rt);
+  const auto resumed = std::chrono::steady_clock::now();
+  sink.allow_one();
+  if (!expect_generation(seen, 3)) return;
+  writer.thread.join();
+  EXPECT_LT(std::chrono::steady_clock::now() - resumed, 25ms);
+  EXPECT_EQ(result.status, Status::kOk);
+  EXPECT_TRUE(rt.Contains(K(70)));
+  EXPECT_EQ(rt.BackpressureWaits(), 1u);
+  EXPECT_EQ(rt.BackpressureWaitTimeouts(), 0u);
+  EXPECT_EQ(rt.AckBackpressure(), 0u);
 }
 
 // A PUT that waits for the flush of the value owning its key (here a
