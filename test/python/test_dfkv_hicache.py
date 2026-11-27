@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.request
 import warnings
 from types import SimpleNamespace
 from contextlib import contextmanager
@@ -209,8 +210,12 @@ class FakeTupleNoneAnchorPool:
         return (None, None)
 
 
-def _spawn_node(tag, engine_args=("--store-engine", "file"), env=None):
-    d = tempfile.mkdtemp(prefix=f"dfkv_py_{tag}_")
+def _spawn_node(tag, engine_args=("--store-engine", "file"), env=None,
+                directory=None):
+    # Supplying a directory is only for reopening a test-owned node; the
+    # default keeps its original fresh-file-engine behavior.
+    d = (tempfile.mkdtemp(prefix=f"dfkv_py_{tag}_") if directory is None
+         else directory)
     p = subprocess.Popen(
         [SERVER_BIN, "--dir", d, "--port", "0", "--cap", str(1 << 30),
          *engine_args],
@@ -227,6 +232,18 @@ def _count_objects(node_dir):
     for root, _dirs, files in os.walk(os.path.join(node_dir, "blocks")):
         n += sum(1 for f in files if not f.endswith(".tmp"))
     return n
+
+
+def _server_used_bytes(port):
+    """The store's dfkv_used_bytes gauge: live record/slot bytes, not payload."""
+    with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/metrics", timeout=5) as response:
+        text = response.read().decode("utf-8")
+    values = [line.split()[1] for line in text.splitlines()
+              if line.startswith("dfkv_used_bytes ")]
+    if len(values) != 1:
+        raise AssertionError(f"expected one dfkv_used_bytes gauge, got {values}")
+    return int(values[0])
 
 
 class DingoFSHiCacheTest(unittest.TestCase):
@@ -1240,6 +1257,115 @@ class DingoFSHiCacheTest(unittest.TestCase):
                                       host_indices=hi[2 * self.PAGE_SIZE:],
                                       keys=keys[2:])])
         self.assertEqual(st.batch_exists_v2(keys, trs).kv_hit_pages, 3)
+
+    def test_lse_anchor_one_byte_values_prefix_occupancy_and_reopen(self):
+        """Real connector+LSE marker evidence for both no-layout wire forms."""
+        from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+
+        for pool_type in (FakeLogicalAnchorPool, FakeTupleNoneAnchorPool):
+            with self.subTest(pool=pool_type.__name__):
+                tag = "lseanchor_" + pool_type.__name__
+                members, port, ndir = self._node(
+                    tag, engine_args=("--store-engine", "log"))
+                st = self._plugin(self._cfg(members, model="glm-5.2"),
+                                  pool_type(self.PAGE_SIZE))
+                keys = ["lse0", "lse1", "lse2"]
+                missing = "lse_missing"
+                all_keys = keys + [missing]
+                hi = list(range(4 * self.PAGE_SIZE))
+                self.assertEqual(st.batch_set_v1(keys, hi[:3 * self.PAGE_SIZE]),
+                                 [True, True, True])
+                # One-byte values fit inline. dfkv_used_bytes charges each live
+                # LSE record block (4096B), not 1B payload, 64KiB ctypes scratch,
+                # or the separate 64B sealed-summary entry.
+                self.assertEqual(_server_used_bytes(port), 3 * 4096)
+                self.assertEqual(st.batch_exists(all_keys), 3)
+
+                side = FakeMlaPool(4, self.PAGE_BYTES, self.PAGE_SIZE)
+                st.register_mem_host_pool_v2(side, "side")
+                expected_side = []
+                for i in range(4):
+                    side.fill_page(i, 71 + i)
+                    expected_side.append(side.page_bytes_at(i))
+                side_all = PoolTransfer(name="side", host_indices=hi,
+                                        keys=all_keys)
+                self.assertEqual(st.batch_set_v2([PoolTransfer(
+                    name="side", host_indices=hi[:2 * self.PAGE_SIZE],
+                    keys=keys[:2])])["side"], [True, True])
+                # PAGE_BYTES is 4096, above LSE's 4008B inline ceiling: each
+                # non-inline side value costs 4096 + round_up(4096, 4096).
+                occupied = 3 * 4096 + 2 * 8192
+                self.assertEqual(_server_used_bytes(port), occupied)
+                self.assertEqual(st.batch_exists_v2(all_keys, [side_all]).kv_hit_pages,
+                                 2)
+                self.assertEqual(st.batch_set_v2([PoolTransfer(
+                    name="side", host_indices=hi[2 * self.PAGE_SIZE:3 * self.PAGE_SIZE],
+                    keys=keys[2:3])])["side"], [True])
+                occupied = 3 * 4096 + 3 * 8192
+                self.assertEqual(_server_used_bytes(port), occupied)
+                self.assertEqual(st.batch_exists_v2(all_keys, [side_all]).kv_hit_pages,
+                                 3)
+
+                get_name = ("dfkv_batch_get_st"
+                            if hasattr(st._lib, "dfkv_batch_get_st")
+                            else "dfkv_batch_get")
+
+                def assert_exact_markers(plugin, call):
+                    original_get = getattr(plugin._lib, get_name)
+
+                    def checked_get(handle, karr, klens, ptrs, sizes, n, out,
+                                    *status):
+                        rc = original_get(handle, karr, klens, ptrs, sizes, n,
+                                          out, *status)
+                        hits = [i for i in range(n)
+                                if sizes[i] == 1 and out[i] == 1]
+                        self.assertEqual(len(hits), 3)
+                        for i in hits:
+                            self.assertEqual(ctypes.string_at(ptrs[i], 1), b"\0")
+                        self.assertTrue(any(
+                            sizes[i] == 1 and out[i] != 1 for i in range(n)))
+                        return rc
+
+                    with patch.object(plugin._lib, get_name, checked_get):
+                        return call()
+
+                self.assertEqual(
+                    assert_exact_markers(
+                        st, lambda: st.batch_get_v1(all_keys, hi)),
+                    [True, True, True, False])
+
+                # Close this connector and its explicitly selected log server,
+                # then reopen the same test-owned directory with log again.
+                st.__del__()
+                old_process = self.procs[-1]
+                old_process.terminate()
+                old_process.wait(timeout=5)
+                reopened, reopened_dir, port = _spawn_node(
+                    tag + "_reopen", engine_args=("--store-engine", "log"),
+                    directory=ndir)
+                self.assertEqual(reopened_dir, ndir)
+                self.procs.append(reopened)
+                members = f"{tag}=127.0.0.1:{port}"
+                st2 = self._plugin(self._cfg(members, model="glm-5.2"),
+                                   pool_type(self.PAGE_SIZE))
+                st2.register_mem_host_pool_v2(pool_type(self.PAGE_SIZE), "kv")
+                side2 = FakeMlaPool(4, self.PAGE_BYTES, self.PAGE_SIZE)
+                st2.register_mem_host_pool_v2(side2, "side")
+                self.assertEqual(_server_used_bytes(port), occupied)
+                self.assertEqual(st2.batch_exists(all_keys), 3)
+                self.assertEqual(st2.batch_exists_v2(all_keys, [side_all]).kv_hit_pages,
+                                 3)
+
+                def read_reopened():
+                    return st2.batch_get_v2([
+                        PoolTransfer(name="kv", host_indices=hi, keys=all_keys),
+                        side_all])
+
+                restored = assert_exact_markers(st2, read_reopened)
+                self.assertEqual(restored["kv"], [True, True, True, False])
+                self.assertEqual(restored["side"], [True, True, True, False])
+                for i in range(3):
+                    self.assertEqual(side2.page_bytes_at(i), expected_side[i])
 
     def test_v2_exists_trailing_pool_sliding_window(self):
         # TRAILING_PAGES (SWA / Mamba state): only the last N pages of a prefix

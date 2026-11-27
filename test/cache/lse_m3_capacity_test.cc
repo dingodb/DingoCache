@@ -45,6 +45,7 @@
 
 #include "cache/disk_slab_store.h"
 #include "cache/log_store.h"
+#include "cache/lse_format.h"
 #include "common/status.h"
 
 namespace dfkv {
@@ -103,6 +104,7 @@ static_assert(kValueBytes == static_cast<uint64_t>(2.74 * (1ull << 20) + 0.5),
 struct Config {
   fs::path root;
   uint64_t capacity = kStandardCapacity;
+  uint64_t value_bytes = kValueBytes;
   uint32_t repetitions = kStandardRepetitions;
   uint64_t puts_per_run = 0;
   bool capacity_override = false;
@@ -747,6 +749,7 @@ struct RunRecord {
   EngineKind engine = EngineKind::kSlab;
   fs::path dir;
   uint64_t capacity_bytes = 0;
+  uint64_t value_bytes = 0;
   uint64_t first_key = 0;
   uint64_t planned_puts = 0;
   uint64_t attempted_puts = 0;
@@ -879,6 +882,38 @@ bool KeyOrder(const BlockKey& left, const BlockKey& right) {
   return left.tenant_hash < right.tenant_hash;
 }
 
+// Independently reproduce the allocator's fixed max_waste=0.25 class lattice;
+// this is deliberately not just round_up(value, 1 MiB).
+uint64_t SlabSlotBytes(uint64_t value_bytes) {
+  const uint64_t aligned =
+      (value_bytes + kSlabGranularity - 1) / kSlabGranularity * kSlabGranularity;
+  uint64_t current = kSlabGranularity;
+  while (current < aligned) {
+    const uint64_t minimum = current + kSlabGranularity;
+    uint64_t candidate = static_cast<uint64_t>(
+        static_cast<double>(minimum) / (1.0 - 0.25));
+    candidate = candidate / kSlabGranularity * kSlabGranularity;
+    candidate = std::max(minimum, std::min(candidate, kSlabExtent));
+    if (candidate <= current) return aligned;
+    current = candidate;
+  }
+  return current;
+}
+
+uint64_t LogRecordBytes(uint64_t value_bytes) {
+  return dfkv::lse::RecordFitsInline(value_bytes)
+             ? kIoAlignment
+             : kIoAlignment +
+                   (value_bytes + kIoAlignment - 1) / kIoAlignment * kIoAlignment;
+}
+
+uint64_t ExpectedUsedBytes(const RunRecord& run) {
+  const uint64_t footprint = run.engine == EngineKind::kSlab
+                                 ? SlabSlotBytes(run.value_bytes)
+                                 : LogRecordBytes(run.value_bytes);
+  return run.key_count_at_end * footprint;
+}
+
 void EnumerateAndReadBack(StoreEngine* store, RunRecord* run) {
   std::vector<BlockKey> keys;
   store->ForEachKey([&](const BlockKey& key) { keys.push_back(key); });
@@ -887,7 +922,7 @@ void EnumerateAndReadBack(StoreEngine* store, RunRecord* run) {
   for (size_t i = 1; i < keys.size(); ++i) {
     if (keys[i] == keys[i - 1]) ++run->duplicate_enumerated_keys;
   }
-  std::string expected(kValueBytes, '\0');
+  std::string expected(run->value_bytes, '\0');
 
   for (const BlockKey& key : keys) {
     if (key.digest_lo < run->first_key ||
@@ -900,7 +935,7 @@ void EnumerateAndReadBack(StoreEngine* store, RunRecord* run) {
     if (lookup == Status::kOk) {
       ++run->lookup_ok;
       run->resident_value_bytes += metadata.value_len;
-      if (metadata.value_len != kValueBytes) ++run->lookup_length_mismatch;
+      if (metadata.value_len != run->value_bytes) ++run->lookup_length_mismatch;
     } else if (lookup == Status::kNotFound) {
       ++run->lookup_not_found;
     } else if (lookup == Status::kIOError) {
@@ -914,8 +949,8 @@ void EnumerateAndReadBack(StoreEngine* store, RunRecord* run) {
     const Status read = store->Range(key, 0, 0, &payload, &value_len);
     if (read == Status::kOk) {
       ++run->read_ok;
-      if (payload.size() != kValueBytes) ++run->read_length_mismatch;
-      if (value_len != kValueBytes) ++run->read_value_length_mismatch;
+      if (payload.size() != run->value_bytes) ++run->read_length_mismatch;
+      if (value_len != run->value_bytes) ++run->read_value_length_mismatch;
       FillValue(key.digest_lo, expected.data(), expected.size());
       if (payload != expected) ++run->payload_mismatch;
     } else if (read == Status::kNotFound) {
@@ -936,6 +971,7 @@ RunRecord RunOne(EngineKind kind, uint32_t pair, uint32_t order,
   run.engine = kind;
   run.dir = config.root / ("pair_" + ZeroPadding(pair)) / EngineName(kind);
   run.capacity_bytes = config.capacity;
+  run.value_bytes = config.value_bytes;
   run.first_key = static_cast<uint64_t>(pair) * config.puts_per_run;
   run.planned_puts = config.puts_per_run;
   run.direct_probe_ok = direct_probe_ok;
@@ -1049,8 +1085,8 @@ RunRecord RunOne(EngineKind kind, uint32_t pair, uint32_t order,
   }
 
   const auto write_start = Clock::now();
-  constexpr size_t kIoCapacity = (kValueBytes + kIoAlignment - 1) /
-                                 kIoAlignment * kIoAlignment;
+  const size_t io_capacity = (run.value_bytes + kIoAlignment - 1) /
+                             kIoAlignment * kIoAlignment;
   std::atomic<uint64_t> next{0};
   std::atomic<bool> stop{false};
   PutCounters counters;
@@ -1059,7 +1095,7 @@ RunRecord RunOne(EngineKind kind, uint32_t pair, uint32_t order,
     writers.reserve(kWriters);
     for (uint32_t writer = 0; writer < kWriters; ++writer) {
       writers.emplace_back([&] {
-        AlignedBuffer buffer(kIoCapacity);
+        AlignedBuffer buffer(io_capacity);
         if (!buffer) {
           counters.allocation_failures.fetch_add(1, std::memory_order_relaxed);
           stop.store(true, std::memory_order_relaxed);
@@ -1069,9 +1105,9 @@ RunRecord RunOne(EngineKind kind, uint32_t pair, uint32_t order,
           const uint64_t sequence = next.fetch_add(1, std::memory_order_relaxed);
           if (sequence >= config.puts_per_run) break;
           const uint64_t id = run.first_key + sequence;
-          FillValue(id, buffer.data(), kValueBytes);
+          FillValue(id, buffer.data(), run.value_bytes);
           const Status status = store->CacheDirect(
-              MakeKey(id), buffer.data(), kValueBytes, buffer.size());
+              MakeKey(id), buffer.data(), run.value_bytes, buffer.size());
           counters.Add(status);
           if (status != Status::kOk && status != Status::kCacheFull)
             stop.store(true, std::memory_order_relaxed);
@@ -1184,6 +1220,14 @@ RunRecord RunOne(EngineKind kind, uint32_t pair, uint32_t order,
     Violate(&run, "engine health or clean Close failed");
   if (run.used_bytes > config.capacity)
     Violate(&run, "UsedBytes exceeds capacity");
+  if (run.used_bytes != ExpectedUsedBytes(run))
+    Violate(&run, "UsedBytes differs from live-count times physical record/slot bytes");
+  if (run.key_count_at_end != run.enumerated_keys)
+    Violate(&run, "Count differs from independently enumerated resident keys");
+  if (run.evictions + run.key_count_at_end != run.put_ok)
+    Violate(&run, "successful PUTs do not equal live keys plus evictions");
+  if (run.resident_value_bytes != run.key_count_at_end * run.value_bytes)
+    Violate(&run, "resident payload bytes differ from live-count times value_bytes");
   if (run.resident_value_bytes > config.capacity)
     Violate(&run, "sum of resident value_len exceeds capacity");
   if (kind == EngineKind::kSlab) {
@@ -1213,7 +1257,7 @@ std::string RunJson(const RunRecord& run, const Config& config) {
       << ",\"engine_order\":" << run.order
       << ",\"engine\":" << JsonString(EngineName(run.engine))
       << ",\"directory\":" << JsonString(run.dir.string())
-      << ",\"value_bytes\":" << kValueBytes
+      << ",\"value_bytes\":" << run.value_bytes
       << ",\"capacity_bytes\":" << run.capacity_bytes
       << ",\"first_key_id\":" << run.first_key
       << ",\"planned_puts\":" << run.planned_puts
@@ -1264,6 +1308,13 @@ std::string RunJson(const RunRecord& run, const Config& config) {
       << ",\"read_value_len_mismatch\":" << run.read_value_length_mismatch
       << ",\"payload_mismatch\":" << run.payload_mismatch
       << ",\"used_bytes\":" << run.used_bytes
+      << ",\"slab_slot_bytes\":" << SlabSlotBytes(run.value_bytes)
+      << ",\"log_record_bytes\":" << LogRecordBytes(run.value_bytes)
+      << ",\"expected_used_bytes\":" << ExpectedUsedBytes(run)
+      << ",\"used_bytes_matches_live_records\":"
+      << (run.used_bytes == ExpectedUsedBytes(run))
+      << ",\"live_plus_evictions_equals_put_ok\":"
+      << (run.key_count_at_end + run.evictions == run.put_ok)
       << ",\"used_within_capacity\":" << (run.used_bytes <= config.capacity)
       << ",\"evictions\":" << run.evictions
       << ",\"slab_put_no_slot\":" << run.slab_put_no_slot
@@ -3099,6 +3150,230 @@ TEST(LseM3Quality, SteadyIoAndZipfEviction) {
   reporter.Emit(aggregate.str());
   if (!all_valid || !reporter.good()) {
     ADD_FAILURE() << "LSE M3 I/O evidence validity failed; see " << reporter.path();
+  }
+}
+
+struct SizeProfile {
+  const char* name;
+  const char* nominal;
+  const char* source;
+  uint64_t value_bytes;
+};
+
+// Exact source geometries, not floating-point conversions of the display names.
+// The earlier 1.02 MiB development harness used round(1.02*2^20)=1,069,548 B;
+// this current-main case instead tests the documented L2-bypass page itself,
+// 29*64*576=1,069,056 B, and keeps that distinction explicit in raw evidence.
+constexpr SizeProfile kSizeProfiles[] = {
+    {"glm52_l2_bypass_page", "1.02 MiB (nominal)",
+     "29 * 64 * 576 bytes (L2-bypass connector source table)", 29ull * 64 * 576},
+    {"k3_tp16_temporal_fp32", "25.875 MiB (design shorthand 25.9 MiB)",
+     "69 layers * (96/16) heads/rank * 128 * 128 * sizeof(fp32)",
+     69ull * (96 / 16) * 128 * 128 * 4},
+    {"k3_tp8_temporal_fp32", "51.75 MiB",
+     "69 layers * (96/8) heads/rank * 128 * 128 * sizeof(fp32)",
+     69ull * (96 / 8) * 128 * 128 * 4},
+};
+static_assert(kSizeProfiles[0].value_bytes == 1069056);
+static_assert(kSizeProfiles[1].value_bytes == 27131904);
+static_assert(kSizeProfiles[2].value_bytes == 54263808);
+
+TEST(LseM3Capacity, SourceDefinedSizeProfiles) {
+  const char* const root_text = std::getenv("DFKV_LSE_M3_SIZE_ROOT");
+  if (root_text == nullptr || *root_text == '\0') {
+    EmitStdout(
+        "{\"record\":\"size_preflight\",\"schema_version\":1,"
+        "\"result\":\"SKIP\",\"reason\":\"DFKV_LSE_M3_SIZE_ROOT is required\"}");
+    GTEST_SKIP() << "set DFKV_LSE_M3_SIZE_ROOT to a new absolute NVMe directory";
+  }
+  for (const char* name : {"DFKV_SLAB_EVICT_HEADROOM_BYTES",
+                           "DFKV_SLAB_EVICT_BAND_BYTES"}) {
+    if (const char* value = std::getenv(name)) {
+      uint64_t parsed = 0;
+      if (!ParseUnsigned(value, &parsed) || parsed != 0) {
+        PreflightFailure(std::string(name) +
+                         " must be unset or zero for size-profile evidence");
+        return;
+      }
+    }
+  }
+
+  Config base;
+  base.root = fs::path(root_text);
+  if (!base.root.is_absolute()) {
+    PreflightFailure("size-profile root must be absolute");
+    return;
+  }
+  RootEvidence root_evidence;
+  std::string root_error;
+  if (!PrepareFreshNvmeRoot(base.root, &root_evidence, &root_error)) {
+    PreflightFailure(root_error, &root_evidence);
+    return;
+  }
+  base.root = root_evidence.normalized_root;
+  JsonlReporter reporter(base.root / "lse_m3_size_profiles.jsonl");
+  std::ostringstream configuration;
+  configuration << std::boolalpha
+                << "{\"record\":\"size_configuration\",\"schema_version\":1"
+                << ",\"root\":" << JsonString(base.root.string())
+                << ",\"capacity_bytes\":" << base.capacity
+                << ",\"repetitions_per_profile\":" << base.repetitions
+                << ",\"writers\":" << kWriters
+                << ",\"backing_device\":\"" << root_evidence.device_major << ':'
+                << root_evidence.device_minor << '"'
+                << ",\"resolved_device\":" << JsonString(root_evidence.resolved_device)
+                << ",\"backing_physical_leaf_count\":"
+                << root_evidence.physical_leaf_count
+                << ",\"backing_all_leaves_nvme\":"
+                << root_evidence.all_leaves_nvme
+                << ",\"backing_candidates\":"
+                << BackingCandidatesJson(root_evidence)
+                << ",\"backing_nvme_verified\":true"
+                << ",\"filesystem_available_bytes\":"
+                << root_evidence.available_bytes
+                << ",\"minimum_free_bytes\":" << kRequiredFreeBytes
+                << ",\"log_segment_bytes\":" << kLogSegment
+                << ",\"slab_granularity_bytes\":" << kSlabGranularity
+                << ",\"slab_extent_bytes\":" << kSlabExtent
+                << ",\"slab_max_waste\":0.25"
+                << ",\"used_bytes_semantics\":"
+                   "\"live slab slots or LSE live record footprints; excludes LSE 64B summaries and shared segment overhead\""
+                << ",\"effective_capacity_limit\":"
+                   "\"observed residency also includes eviction, watermark and segment-reserve effects\""
+                << ",\"performance_gate\":\"none\""
+                << ",\"jsonl\":" << JsonString(reporter.path().string())
+                << ",\"head_provenance\":\"exact HEAD reported separately by runner\""
+                << '}';
+  reporter.Emit(configuration.str());
+
+  bool all_valid = reporter.good();
+  std::string infrastructure_error;
+  for (const auto& profile : kSizeProfiles) {
+    if (!infrastructure_error.empty()) break;
+    Config config = base;
+    config.value_bytes = profile.value_bytes;
+    config.root = base.root / profile.name;
+    config.puts_per_run =
+        (2 * config.capacity + config.value_bytes - 1) / config.value_bytes;
+    std::error_code ec;
+    if (!fs::create_directory(config.root, ec) || ec) {
+      infrastructure_error = "cannot create fresh size-profile directory " +
+                             config.root.string() + ": " +
+                             (ec ? ec.message() : "already exists");
+      break;
+    }
+    std::ostringstream profile_record;
+    profile_record << std::boolalpha
+                   << "{\"record\":\"size_profile\",\"schema_version\":1"
+                   << ",\"profile\":" << JsonString(profile.name)
+                   << ",\"nominal\":" << JsonString(profile.nominal)
+                   << ",\"source\":" << JsonString(profile.source)
+                   << ",\"value_bytes\":" << config.value_bytes
+                   << ",\"puts_per_engine_run\":" << config.puts_per_run
+                   << ",\"slab_slot_bytes\":" << SlabSlotBytes(config.value_bytes)
+                   << ",\"log_record_bytes\":" << LogRecordBytes(config.value_bytes)
+                   << '}';
+    reporter.Emit(profile_record.str());
+
+    std::vector<RunRecord> runs;
+    for (uint32_t pair = 0; pair < config.repetitions; ++pair) {
+      const fs::path pair_dir = config.root / ("pair_" + ZeroPadding(pair));
+      if (!fs::create_directory(pair_dir, ec) || ec) {
+        infrastructure_error = "cannot create fresh size pair directory " +
+                               pair_dir.string() + ": " +
+                               (ec ? ec.message() : "already exists");
+        break;
+      }
+      const fs::path probe = pair_dir / "direct_io.probe";
+      std::string probe_error;
+      const bool direct_ok = ProbeDirectIo(probe, &probe_error);
+      std::ostringstream probe_record;
+      probe_record << std::boolalpha
+                   << "{\"record\":\"size_direct_io_probe\",\"schema_version\":1"
+                   << ",\"profile\":" << JsonString(profile.name)
+                   << ",\"pair\":" << pair << ",\"ok\":" << direct_ok
+                   << ",\"path\":" << JsonString(probe.string())
+                   << ",\"error\":" << JsonString(probe_error) << '}';
+      reporter.Emit(probe_record.str());
+      if (!direct_ok) {
+        infrastructure_error = "size-profile O_DIRECT probe failed: " + probe_error;
+        break;
+      }
+      const EngineKind first = pair % 2 == 0 ? EngineKind::kSlab : EngineKind::kLog;
+      const EngineKind second = first == EngineKind::kSlab ? EngineKind::kLog
+                                                           : EngineKind::kSlab;
+      runs.push_back(RunOne(first, pair, 0, config, direct_ok));
+      reporter.Emit(RunJson(runs.back(), config));
+      runs.push_back(RunOne(second, pair, 1, config, direct_ok));
+      reporter.Emit(RunJson(runs.back(), config));
+    }
+
+    std::vector<double> deltas, slab_fractions, log_fractions;
+    for (uint32_t pair = 0; pair < config.repetitions; ++pair) {
+      const RunRecord* slab = FindRun(runs, EngineKind::kSlab, pair);
+      const RunRecord* log = FindRun(runs, EngineKind::kLog, pair);
+      if (slab == nullptr || log == nullptr) {
+        all_valid = false;
+        continue;
+      }
+      slab_fractions.push_back(slab->Fraction());
+      log_fractions.push_back(log->Fraction());
+      deltas.push_back(log->Fraction() - slab->Fraction());
+    }
+    const double slab_spread = Spread(slab_fractions);
+    const double log_spread = Spread(log_fractions);
+    for (uint32_t pair = 0; pair < config.repetitions; ++pair) {
+      const RunRecord* slab = FindRun(runs, EngineKind::kSlab, pair);
+      const RunRecord* log = FindRun(runs, EngineKind::kLog, pair);
+      if (slab == nullptr || log == nullptr) continue;
+      std::ostringstream pair_record;
+      pair_record << std::setprecision(17) << std::boolalpha
+                  << "{\"record\":\"size_pair\",\"schema_version\":1"
+                  << ",\"profile\":" << JsonString(profile.name)
+                  << ",\"pair\":" << pair
+                  << ",\"value_bytes\":" << config.value_bytes
+                  << ",\"slab_live_keys\":" << slab->key_count_at_end
+                  << ",\"log_live_keys\":" << log->key_count_at_end
+                  << ",\"slab_fraction\":" << slab->Fraction()
+                  << ",\"log_fraction\":" << log->Fraction()
+                  << ",\"D\":" << log->Fraction() - slab->Fraction()
+                  << ",\"slab_spread\":" << slab_spread
+                  << ",\"log_spread\":" << log_spread
+                  << ",\"result\":"
+                  << JsonString(slab->valid && log->valid ? "VALID" : "FAIL")
+                  << ",\"performance_gate\":\"none\""
+                  << ",\"D_gate\":\"report only; no improvement threshold\"" << '}';
+      reporter.Emit(pair_record.str());
+    }
+    const bool profile_valid =
+        runs.size() == 2 * config.repetitions &&
+        static_cast<size_t>(std::count_if(runs.begin(), runs.end(),
+                                         [](const RunRecord& run) {
+                                           return run.valid;
+                                         })) == runs.size() &&
+        deltas.size() == config.repetitions && reporter.good();
+    all_valid = all_valid && profile_valid;
+    std::ostringstream aggregate;
+    aggregate << std::setprecision(17) << std::boolalpha
+              << "{\"record\":\"size_aggregate\",\"schema_version\":1"
+              << ",\"profile\":" << JsonString(profile.name)
+              << ",\"value_bytes\":" << config.value_bytes
+              << ",\"run_records\":" << runs.size()
+              << ",\"pair_records\":" << deltas.size()
+              << ",\"slab_spread\":" << slab_spread
+              << ",\"log_spread\":" << log_spread
+              << ",\"result\":" << JsonString(profile_valid ? "PASS" : "FAIL")
+              << ",\"performance_gate\":\"none\""
+              << ",\"D_gate\":\"report only; no improvement threshold\""
+              << ",\"infrastructure_error\":" << JsonString(infrastructure_error)
+              << '}';
+    reporter.Emit(aggregate.str());
+  }
+  all_valid = all_valid && infrastructure_error.empty() && reporter.good();
+  if (!all_valid) {
+    ADD_FAILURE() << "LSE M3 source-defined size evidence failed"
+                  << (infrastructure_error.empty() ? "" : ": " + infrastructure_error)
+                  << "; evidence path: " << reporter.path();
   }
 }
 
