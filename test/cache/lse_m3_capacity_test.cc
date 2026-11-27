@@ -73,6 +73,19 @@ struct Config {
   bool acceptance_eligible = true;
 };
 
+struct BackingCandidate {
+  fs::path source;
+  fs::path resolved;
+  bool physical_leaf = false;
+  bool verified = false;
+  fs::path nvme_subsystem_link;
+  fs::path nvme_controller_link;
+  fs::path nvme_controller_device;
+  fs::path nvme_block_link;
+  fs::path block_device;
+  std::string error;
+};
+
 struct RootEvidence {
   fs::path supplied_root;
   fs::path normalized_root;
@@ -84,6 +97,11 @@ struct RootEvidence {
   std::string resolved_device;
   std::string nvme_subsystem_link;
   std::string nvme_subsystem;
+  fs::path nvme_controller_link;
+  fs::path nvme_controller_device;
+  std::vector<BackingCandidate> candidates;
+  size_t physical_leaf_count = 0;
+  bool all_leaves_nvme = false;
 };
 
 enum class EngineKind { kSlab, kLog };
@@ -123,6 +141,31 @@ std::string JsonStrings(const std::vector<std::string>& values) {
   for (size_t i = 0; i < values.size(); ++i) {
     if (i != 0) out << ',';
     out << JsonString(values[i]);
+  }
+  out << ']';
+  return out.str();
+}
+
+std::string BackingCandidatesJson(const RootEvidence& evidence) {
+  std::ostringstream out;
+  out << std::boolalpha << '[';
+  for (size_t i = 0; i < evidence.candidates.size(); ++i) {
+    const BackingCandidate& candidate = evidence.candidates[i];
+    if (i != 0) out << ',';
+    out << "{\"source\":" << JsonString(candidate.source.string())
+        << ",\"resolved\":" << JsonString(candidate.resolved.string())
+        << ",\"physical_leaf\":" << candidate.physical_leaf
+        << ",\"verified\":" << candidate.verified
+        << ",\"nvme_subsystem_link\":"
+        << JsonString(candidate.nvme_subsystem_link.string())
+        << ",\"nvme_controller_link\":"
+        << JsonString(candidate.nvme_controller_link.string())
+        << ",\"nvme_controller_device\":"
+        << JsonString(candidate.nvme_controller_device.string())
+        << ",\"nvme_block_link\":"
+        << JsonString(candidate.nvme_block_link.string())
+        << ",\"block_device\":" << JsonString(candidate.block_device.string())
+        << ",\"error\":" << JsonString(candidate.error) << '}';
   }
   out << ']';
   return out.str();
@@ -191,9 +234,204 @@ class ScopedFd {
   int fd_ = -1;
 };
 
-// Resolve the mounted st_dev through the kernel's block-device links.  NVMe is
-// established only by an actual sysfs bus/subsystem relationship, never by a
-// device, mount, or partition filename.  Walking ancestors covers partitions.
+struct NvmeController {
+  fs::path class_link;
+  fs::path resolved;
+};
+
+bool SameOrAncestorPath(const fs::path& ancestor, const fs::path& descendant) {
+  auto a = ancestor.begin();
+  auto d = descendant.begin();
+  for (; a != ancestor.end(); ++a, ++d) {
+    if (d == descendant.end() || *a != *d) return false;
+  }
+  return true;
+}
+
+std::vector<NvmeController> NvmeControllerInventory() {
+  std::vector<NvmeController> controllers;
+  // The class is the primary authority.  The bus-device directory is an
+  // equivalent kernel-owned controller inventory on systems exposing both.
+  for (const char* root : {"/sys/class/nvme", "/sys/bus/nvme/devices"}) {
+    std::error_code ec;
+    fs::directory_iterator it(root, ec), end;
+    if (ec) continue;
+    for (; !ec && it != end; it.increment(ec)) {
+      const fs::path resolved = fs::canonical(it->path(), ec);
+      if (!ec) controllers.push_back({it->path(), resolved});
+      ec.clear();
+    }
+  }
+  std::sort(controllers.begin(), controllers.end(),
+            [](const NvmeController& a, const NvmeController& b) {
+              return a.class_link.string() < b.class_link.string();
+            });
+  return controllers;
+}
+
+// Validate one physical block leaf without trusting its filename.  Prefer a
+// real NVMe subsystem link; otherwise require the class-block device identity
+// to match a resolved NVMe controller (or its namespace/partition descendant).
+bool VerifyPhysicalNvmeLeaf(const fs::path& nvme_bus,
+                            const std::vector<NvmeController>& controllers,
+                            BackingCandidate* candidate) {
+  if (!nvme_bus.empty()) {
+    for (fs::path current = candidate->resolved;; current = current.parent_path()) {
+      for (const char* suffix : {"subsystem", "device/subsystem"}) {
+        const fs::path link = current / suffix;
+        std::error_code ec;
+        const fs::file_status status = fs::symlink_status(link, ec);
+        if (ec || !fs::is_symlink(status)) continue;
+        const fs::path subsystem = fs::canonical(link, ec);
+        if (!ec && subsystem == nvme_bus) {
+          candidate->nvme_subsystem_link = link;
+          candidate->verified = true;
+          break;
+        }
+      }
+      if (candidate->verified || current == "/sys" || current == "/" ||
+          current.parent_path() == current) {
+        break;
+      }
+    }
+  }
+
+  // /sys/class/block/<leaf>/device is an actual kernel link to the device whose
+  // class identity is being validated, not a lookup based on a name prefix.
+  const fs::path block_device_link =
+      "/sys/class/block" / candidate->resolved.filename() / "device";
+  std::error_code block_ec;
+  const fs::path block_device = fs::canonical(block_device_link, block_ec);
+  if (!block_ec) {
+    candidate->nvme_block_link = block_device_link;
+    candidate->block_device = block_device;
+  }
+  for (const auto& controller : controllers) {
+    const bool class_match =
+        !block_device.empty() && controller.resolved == block_device;
+    const bool ancestry_match =
+        SameOrAncestorPath(controller.resolved, candidate->resolved);
+    if (class_match || ancestry_match) {
+      candidate->nvme_controller_link = controller.class_link;
+      candidate->nvme_controller_device = controller.resolved;
+      candidate->verified = true;
+      break;
+    }
+  }
+  if (!candidate->verified) {
+    candidate->error = "physical leaf has no NVMe subsystem link and no resolved "
+                       "NVMe class/controller match";
+  }
+  return candidate->verified;
+}
+
+// Recursively resolve device-mapper slaves and record every root/slave/leaf.
+// Mixed NVMe/non-NVMe, empty, cyclic, and unresolvable trees all fail closed.
+bool ResolveBackingTree(const fs::path& source,
+                        const std::vector<NvmeController>& controllers,
+                        const fs::path& nvme_bus, RootEvidence* evidence,
+                        std::vector<std::string>* active,
+                        std::vector<std::string>* problems, unsigned depth) {
+  BackingCandidate candidate;
+  candidate.source = source;
+  const size_t candidate_index = evidence->candidates.size();
+  evidence->candidates.push_back(candidate);
+  if (depth > 32) {
+    evidence->candidates[candidate_index].error =
+        "device-slave nesting exceeds 32 levels";
+    problems->push_back(source.string() + ": nesting exceeds 32 levels");
+    return false;
+  }
+
+  std::error_code ec;
+  const fs::path resolved = fs::canonical(source, ec);
+  if (ec) {
+    evidence->candidates[candidate_index].error =
+        "canonical resolution failed: " + ec.message();
+    problems->push_back(source.string() + ": " + ec.message());
+    return false;
+  }
+  evidence->candidates[candidate_index].resolved = resolved;
+  if (std::find(active->begin(), active->end(), resolved.string()) !=
+      active->end()) {
+    evidence->candidates[candidate_index].error = "cycle in device-slave links";
+    problems->push_back(resolved.string() + ": device-slave cycle");
+    return false;
+  }
+  active->push_back(resolved.string());
+
+  bool has_slaves = false;
+  bool inspection_failed = false;
+  std::vector<fs::path> slaves;
+  const fs::path slaves_dir = resolved / "slaves";
+  const fs::file_status slaves_status = fs::symlink_status(slaves_dir, ec);
+  if (!ec && fs::is_directory(slaves_status)) {
+    has_slaves = true;
+    fs::directory_iterator it(slaves_dir, ec), end;
+    for (; !ec && it != end; it.increment(ec)) slaves.push_back(it->path());
+    if (ec) {
+      inspection_failed = true;
+      problems->push_back("cannot enumerate " + slaves_dir.string() + ": " +
+                          ec.message());
+    }
+  } else if (ec && ec != std::errc::no_such_file_or_directory) {
+    inspection_failed = true;
+    problems->push_back("cannot inspect " + slaves_dir.string() + ": " +
+                        ec.message());
+  } else if (!ec && slaves_status.type() != fs::file_type::not_found &&
+             !fs::is_directory(slaves_status)) {
+    inspection_failed = true;
+    problems->push_back(slaves_dir.string() +
+                        ": slaves entry is not a real directory");
+  }
+  std::sort(slaves.begin(), slaves.end());
+
+  if (inspection_failed)
+    evidence->candidates[candidate_index].error =
+        "device-slave inspection failed";
+  if (has_slaves && !slaves.empty()) {
+    bool children_ok = !inspection_failed;
+    for (const fs::path& slave : slaves) {
+      const bool child_ok = ResolveBackingTree(
+          slave, controllers, nvme_bus, evidence, active, problems, depth + 1);
+      children_ok = children_ok && child_ok;
+    }
+    evidence->candidates[candidate_index].verified = children_ok;
+    active->pop_back();
+    return children_ok;
+  }
+  if (inspection_failed) {
+    active->pop_back();
+    return false;
+  }
+
+  // Empty and absent slaves both mean this candidate itself is the physical
+  // leaf.  A virtual/device-mapper leaf still fails NVMe verification below.
+  evidence->candidates[candidate_index].physical_leaf = true;
+  ++evidence->physical_leaf_count;
+  const bool verified = VerifyPhysicalNvmeLeaf(
+      nvme_bus, controllers, &evidence->candidates[candidate_index]);
+  if (verified) {
+    if (evidence->nvme_subsystem_link.empty() &&
+        !evidence->candidates[candidate_index].nvme_subsystem_link.empty()) {
+      evidence->nvme_subsystem_link =
+          evidence->candidates[candidate_index].nvme_subsystem_link.string();
+    }
+    if (evidence->nvme_controller_link.empty() &&
+        !evidence->candidates[candidate_index].nvme_controller_link.empty()) {
+      evidence->nvme_controller_link =
+          evidence->candidates[candidate_index].nvme_controller_link;
+      evidence->nvme_controller_device =
+          evidence->candidates[candidate_index].nvme_controller_device;
+    }
+  } else {
+    problems->push_back(resolved.string() + ": " +
+                        evidence->candidates[candidate_index].error);
+  }
+  active->pop_back();
+  return verified;
+}
+
 bool ResolveNvmeBacking(dev_t device, RootEvidence* evidence,
                         std::string* error) {
   evidence->device_major = major(device);
@@ -203,56 +441,24 @@ bool ResolveNvmeBacking(dev_t device, RootEvidence* evidence,
   evidence->sysfs_dev_block = "/sys/dev/block/" + device_id;
   std::error_code ec;
   const fs::path resolved = fs::canonical(evidence->sysfs_dev_block, ec);
-  if (ec) {
-    *error = "cannot resolve mounted backing device " + device_id + " via " +
-             evidence->sysfs_dev_block + ": " + ec.message();
-    return false;
-  }
-  evidence->resolved_device = resolved.string();
+  if (!ec) evidence->resolved_device = resolved.string();
   const fs::path nvme_bus = fs::canonical("/sys/bus/nvme", ec);
-  if (ec) {
-    *error = "backing device " + device_id + " resolved to " +
-             evidence->resolved_device +
-             ", but the kernel NVMe bus /sys/bus/nvme cannot be resolved: " +
-             ec.message();
-    return false;
-  }
-  evidence->nvme_subsystem = nvme_bus.string();
-
-  for (fs::path current = resolved;; current = current.parent_path()) {
-    for (const char* suffix : {"subsystem", "device/subsystem"}) {
-      const fs::path link = current / suffix;
-      std::error_code link_ec;
-      const fs::file_status status = fs::symlink_status(link, link_ec);
-      if (link_ec || status.type() == fs::file_type::not_found) {
-        if (link_ec && link_ec != std::errc::no_such_file_or_directory) {
-          *error = "cannot inspect backing-device subsystem link " +
-                   link.string() + ": " + link_ec.message();
-          return false;
-        }
-        continue;
-      }
-      if (!fs::is_symlink(status)) continue;
-      const fs::path subsystem = fs::canonical(link, link_ec);
-      if (link_ec) {
-        *error = "cannot resolve backing-device subsystem link " +
-                 link.string() + ": " + link_ec.message();
-        return false;
-      }
-      if (subsystem == nvme_bus) {
-        evidence->nvme_subsystem_link = link.string();
-        return true;
-      }
-    }
-    if (current == "/sys" || current == "/" ||
-        current.parent_path() == current) {
-      break;
-    }
-  }
+  if (!ec) evidence->nvme_subsystem = nvme_bus.string();
+  const auto controllers = NvmeControllerInventory();
+  std::vector<std::string> active;
+  std::vector<std::string> problems;
+  const bool tree_ok = ResolveBackingTree(
+      evidence->sysfs_dev_block, controllers, nvme_bus, evidence, &active,
+      &problems, 0);
+  evidence->all_leaves_nvme = tree_ok && evidence->physical_leaf_count > 0;
+  if (evidence->all_leaves_nvme) return true;
+  if (problems.empty()) problems.push_back("no physical NVMe leaf was resolved");
   *error = "mounted backing device " + device_id + " resolved to " +
-           evidence->resolved_device +
-           ", but no ancestor has a subsystem link to " +
-           evidence->nvme_subsystem + "; NVMe backing is required";
+           evidence->resolved_device + ": ";
+  for (size_t i = 0; i < problems.size(); ++i) {
+    if (i != 0) *error += "; ";
+    *error += problems[i];
+  }
   return false;
 }
 
@@ -1067,10 +1273,22 @@ double Spread(const std::vector<double>& values) {
   return *bounds.second - *bounds.first;
 }
 
-void PreflightFailure(const std::string& reason) {
+void PreflightFailure(const std::string& reason,
+                      const RootEvidence* evidence = nullptr) {
   std::ostringstream line;
-  line << "{\"record\":\"preflight\",\"schema_version\":1"
-       << ",\"result\":\"FAIL\",\"reason\":" << JsonString(reason) << '}';
+  line << std::boolalpha
+       << "{\"record\":\"preflight\",\"schema_version\":1"
+       << ",\"result\":\"FAIL\",\"reason\":" << JsonString(reason);
+  if (evidence != nullptr && !evidence->candidates.empty()) {
+    line << ",\"backing_device\":\"" << evidence->device_major << ':'
+         << evidence->device_minor << '"'
+         << ",\"sysfs_dev_block\":" << JsonString(evidence->sysfs_dev_block)
+         << ",\"resolved_device\":" << JsonString(evidence->resolved_device)
+         << ",\"backing_physical_leaf_count\":" << evidence->physical_leaf_count
+         << ",\"backing_all_leaves_nvme\":" << evidence->all_leaves_nvme
+         << ",\"backing_candidates\":" << BackingCandidatesJson(*evidence);
+  }
+  line << '}';
   EmitStdout(line.str());
   FAIL() << reason;
 }
@@ -1142,7 +1360,7 @@ TEST(LseM3Capacity, EffectiveCapacity274MiB) {
   RootEvidence root_evidence;
   std::string root_error;
   if (!PrepareFreshNvmeRoot(config.root, &root_evidence, &root_error)) {
-    PreflightFailure(root_error);
+    PreflightFailure(root_error, &root_evidence);
     return;
   }
   config.root = root_evidence.normalized_root;
@@ -1171,6 +1389,16 @@ TEST(LseM3Capacity, EffectiveCapacity274MiB) {
                 << JsonString(root_evidence.nvme_subsystem_link)
                 << ",\"nvme_subsystem\":"
                 << JsonString(root_evidence.nvme_subsystem)
+                << ",\"nvme_controller_link\":"
+                << JsonString(root_evidence.nvme_controller_link.string())
+                << ",\"nvme_controller_device\":"
+                << JsonString(root_evidence.nvme_controller_device.string())
+                << ",\"backing_physical_leaf_count\":"
+                << root_evidence.physical_leaf_count
+                << ",\"backing_all_leaves_nvme\":"
+                << root_evidence.all_leaves_nvme
+                << ",\"backing_candidates\":"
+                << BackingCandidatesJson(root_evidence)
                 << ",\"backing_nvme_verified\":true"
                 << ",\"filesystem_available_bytes\":"
                 << root_evidence.available_bytes
