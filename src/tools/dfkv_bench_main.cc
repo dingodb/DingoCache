@@ -304,47 +304,58 @@ static bool CheckHostFillPayload(const std::string& key, const void* expected,
   return false;
 }
 
-// One arm of one warmup/measured pair. The pool arm redeclares the exact same
-// base/size after refilling; the out-of-pool arm never declares its source.
-// Both use the production scalar and flat-batch entry points, then compare all
-// returned bytes against the fill that immediately preceded those PUTs.
+// One arm of one warmup/measured pair. The pool arm redeclares all three exact
+// same base/size sources after refilling; the out-of-pool sources are never
+// declared. Distinct allocations are required because BatchPut may run items
+// concurrently. Both arms use one scalar and one real two-item flat BatchPut.
 static int RunHostFillArm(KVClient* c, const std::string& run_id, size_t size,
                           bool direct, int direct_fd, bool pool_arm,
-                          size_t iteration, size_t fill_sequence, char* source,
-                          char* readback, HostFillStats* stats) {
+                          size_t iteration, size_t fill_sequence,
+                          const std::array<char*, 3>& sources, char* readback,
+                          uint64_t expected_pool_active,
+                          HostFillStats* stats) {
   const char* arm = pool_arm ? "pool" : "out_of_pool";
   const auto fill_start = Clock::now();
-  if (direct) {
-    const off_t offset = static_cast<off_t>(fill_sequence * size);
-    ssize_t got;
-    do {
-      got = ::pread(direct_fd, source, size, offset);
-    } while (got < 0 && errno == EINTR);
-    if (got < 0) {
-      return HostFillError(
-          "odirect_read",
-          std::string("errno=") + std::to_string(errno) +
-              " offset=" + std::to_string(offset) + " bytes=" +
-              std::to_string(size));
-    }
-    if (static_cast<size_t>(got) != size) {
-      return HostFillError("odirect_read",
-                           "short_read=" + std::to_string(got) +
-                               " expected=" + std::to_string(size));
-    }
-  } else {
-    for (size_t i = 0; i < size; ++i) {
-      source[i] = static_cast<char>(
-          (i * 17 + (i >> 8) * 29 + fill_sequence * 53) & 0xFF);
+  for (size_t item = 0; item < sources.size(); ++item) {
+    char* source = sources[item];
+    if (direct) {
+      const off_t offset =
+          static_cast<off_t>((fill_sequence * sources.size() + item) * size);
+      ssize_t got;
+      do {
+        got = ::pread(direct_fd, source, size, offset);
+      } while (got < 0 && errno == EINTR);
+      if (got < 0) {
+        return HostFillError(
+            "odirect_read",
+            std::string("errno=") + std::to_string(errno) +
+                " offset=" + std::to_string(offset) + " bytes=" +
+                std::to_string(size));
+      }
+      if (static_cast<size_t>(got) != size) {
+        return HostFillError("odirect_read",
+                             "short_read=" + std::to_string(got) +
+                                 " expected=" + std::to_string(size));
+      }
+    } else {
+      for (size_t i = 0; i < size; ++i) {
+        source[i] = static_cast<char>(
+            (i * 17 + (i >> 8) * 29 + fill_sequence * 53 + item * 101) &
+            0xFF);
+      }
     }
   }
   const auto fill_end = Clock::now();
 
   const std::string before_register = c->MetricsSnapshot();
   const auto register_start = Clock::now();
-  if (pool_arm && !c->RegisterMemory(source, size)) {
-    return HostFillError("pool_reregister",
-                         "same base/size registration returned false");
+  if (pool_arm) {
+    for (char* source : sources) {
+      if (!c->RegisterMemory(source, size)) {
+        return HostFillError("pool_reregister",
+                             "same base/size registration returned false");
+      }
+    }
   }
   const auto register_end = Clock::now();
   const std::string before = c->MetricsSnapshot();
@@ -353,13 +364,13 @@ static int RunHostFillArm(KVClient* c, const std::string& run_id, size_t size,
       run_id + "refill-" + std::to_string(fill_sequence) + "-";
   const std::string scalar_key = base + "scalar";
   const auto scalar_start = Clock::now();
-  const bool scalar_ok = c->Put(scalar_key, source, size);
+  const bool scalar_ok = c->Put(scalar_key, sources[0], size);
   const auto scalar_end = Clock::now();
   if (!scalar_ok) return HostFillError("scalar_put", scalar_key);
 
   std::vector<KvPutItem> puts(2);
   for (size_t i = 0; i < puts.size(); ++i) {
-    puts[i] = {base + "flat-" + std::to_string(i), source, size};
+    puts[i] = {base + "flat-" + std::to_string(i), sources[i + 1], size};
   }
   const auto batch_start = Clock::now();
   const std::vector<bool> put_oks = c->BatchPut(puts);
@@ -369,16 +380,28 @@ static int RunHostFillArm(KVClient* c, const std::string& run_id, size_t size,
     return HostFillError("flat_batch_put", base + "flat-*");
   }
 
+  std::array<std::string, 3> expected_hashes;
+  std::array<std::string, 3> actual_hashes;
+  for (size_t i = 0; i < sources.size(); ++i)
+    expected_hashes[i] = PayloadSha256(sources[i], size);
+  if (expected_hashes[0] == expected_hashes[1] ||
+      expected_hashes[0] == expected_hashes[2] ||
+      expected_hashes[1] == expected_hashes[2]) {
+    return HostFillError("payload_identity", "source digests are not distinct");
+  }
+
   const auto readback_start = Clock::now();
   std::memset(readback, 0xA5, 2 * size);
   if (!c->Get(scalar_key, readback, size)) {
     return HostFillError("scalar_readback", scalar_key);
   }
-  std::array<std::string, 3> actual_hashes;
-  if (!CheckHostFillPayload(scalar_key, source, readback, size,
+  if (!CheckHostFillPayload(scalar_key, sources[0], readback, size,
                             &actual_hashes[0])) {
     return 1;
   }
+  // Poison the entire flat arena AFTER scalar verification. In particular,
+  // flat-0 must not accidentally accept bytes left by the scalar GET.
+  std::memset(readback, 0x5A, 2 * size);
   std::vector<KvGetItem> gets(2);
   for (size_t i = 0; i < gets.size(); ++i) {
     gets[i] = {base + "flat-" + std::to_string(i), readback + i * size, size};
@@ -389,7 +412,8 @@ static int RunHostFillArm(KVClient* c, const std::string& run_id, size_t size,
     return HostFillError("flat_batch_readback", base + "flat-*");
   }
   for (size_t i = 0; i < gets.size(); ++i) {
-    if (!CheckHostFillPayload(gets[i].key, source, readback + i * size, size,
+    if (!CheckHostFillPayload(gets[i].key, sources[i + 1],
+                              readback + i * size, size,
                               &actual_hashes[i + 1])) {
       return 1;
     }
@@ -398,7 +422,7 @@ static int RunHostFillArm(KVClient* c, const std::string& run_id, size_t size,
   const std::string after = c->MetricsSnapshot();
 
   uint64_t adhoc = 0, active = 0, active_before = 0, pool_active = 0;
-  uint64_t inline_max = 0, lease_fallbacks = 0;
+  uint64_t pool_regions = 0, inline_max = 0, lease_fallbacks = 0;
   const bool metrics = PromMetricValue(
                            after, "dfkv_rdma_client_adhoc_user_mr_total",
                            &adhoc) &&
@@ -410,7 +434,9 @@ static int RunHostFillArm(KVClient* c, const std::string& run_id, size_t size,
                            &active_before) &&
                        PromMetricValue(
                            after, "dfkv_rdma_client_pool_mr_active_registrations",
-                           &pool_active);
+                           &pool_active) &&
+                       PromMetricValue(after, "dfkv_rdma_client_mr_regions",
+                                       &pool_regions);
   const bool lease_metrics = PromMetricValue(
                                  after, "dfkv_rdma_client_inline_put_max_bytes",
                                  &inline_max) &&
@@ -439,20 +465,23 @@ static int RunHostFillArm(KVClient* c, const std::string& run_id, size_t size,
       "HOSTFILL_SAMPLE phase=%s pair=%zu fill_sequence=%zu arm=%s "
       "bytes=%zu fill=%s fill_us=%.3f register_us=%.3f scalar_put_us=%.3f "
       "flat_batch_put_us=%.3f total_put_us=%.3f readback_us=%.3f "
-      "expected_sha256=%s scalar_sha256=%s flat0_sha256=%s flat1_sha256=%s "
+      "scalar_expected_sha256=%s scalar_actual_sha256=%s "
+      "flat0_expected_sha256=%s flat0_actual_sha256=%s "
+      "flat1_expected_sha256=%s flat1_actual_sha256=%s "
       "rdma_metrics=%d adhoc_mr_delta=%llu transient_before=%llu "
-      "transient_after=%llu pool_active=%llu pool_registration_delta=%llu "
-      "inline_put_max_bytes=%llu leaseput_delta=%llu "
-      "leaseput_fallback_delta=%llu timestamp_unix_ms=%lld\n",
+      "transient_after=%llu pool_active=%llu pool_regions=%llu "
+      "pool_registration_delta=%llu inline_put_max_bytes=%llu "
+      "leaseput_delta=%llu leaseput_fallback_delta=%llu timestamp_unix_ms=%lld\n",
       iteration == 0 ? "warmup" : "measure", iteration, fill_sequence, arm,
       size, direct ? "odirect" : "cpu", fill_us, register_us, scalar_us,
       batch_us, scalar_us + batch_us, readback_us,
-      PayloadSha256(source, size).c_str(), actual_hashes[0].c_str(),
-      actual_hashes[1].c_str(), actual_hashes[2].c_str(), metrics ? 1 : 0,
+      expected_hashes[0].c_str(), actual_hashes[0].c_str(),
+      expected_hashes[1].c_str(), actual_hashes[1].c_str(),
+      expected_hashes[2].c_str(), actual_hashes[2].c_str(), metrics ? 1 : 0,
       (unsigned long long)adhoc_delta, (unsigned long long)active_before,
       (unsigned long long)active, (unsigned long long)pool_active,
-      (unsigned long long)pool_reg_delta, (unsigned long long)inline_max,
-      (unsigned long long)leaseput_delta,
+      (unsigned long long)pool_regions, (unsigned long long)pool_reg_delta,
+      (unsigned long long)inline_max, (unsigned long long)leaseput_delta,
       (unsigned long long)lease_fallback_delta, (long long)unix_ms);
 
   if (metrics) {
@@ -464,13 +493,16 @@ static int RunHostFillArm(KVClient* c, const std::string& run_id, size_t size,
               std::to_string(expected_adhoc) + " actual=" +
               std::to_string(adhoc_delta));
     }
-    if (active_before != 0 || active != 0 || pool_active == 0 ||
+    if (active_before != 0 || active != 0 ||
+        pool_active != expected_pool_active || pool_regions != 4 ||
         pool_reg_delta != 0) {
       return HostFillError(
           "mr_lifetime",
           "transient_before=" + std::to_string(active_before) +
               " transient_after=" + std::to_string(active) +
               " pool_active=" + std::to_string(pool_active) +
+              " expected_pool_active=" + std::to_string(expected_pool_active) +
+              " pool_regions=" + std::to_string(pool_regions) +
               " pool_registration_delta=" + std::to_string(pool_reg_delta));
     }
   }
@@ -515,7 +547,7 @@ static int RunHostFillBenchmark(KVClient* c, const std::string& run_id,
                                 size_t size, size_t pairs, bool direct,
                                 const std::string& direct_path) {
   HostFillFd file;
-  const size_t required_segments = 2 * (pairs + 1);
+  const size_t required_segments = 6 * (pairs + 1);
   const size_t required_file_bytes = required_segments * size;
   if (direct) {
     file.fd = ::open(direct_path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
@@ -539,21 +571,45 @@ static int RunHostFillBenchmark(KVClient* c, const std::string& run_id,
               " actual_bytes=" + std::to_string(st.st_size));
     }
   }
-  HostFillAllocation pool = AllocateHostFill(size);
-  HostFillAllocation out_of_pool = AllocateHostFill(size);
+  // A guard on either side keeps independent sources noncontiguous even when
+  // the allocator places their storage allocations next to one another.
+  std::array<HostFillAllocation, 3> pool_storage = {
+      AllocateHostFill(size + 2 * kHostFillAlign),
+      AllocateHostFill(size + 2 * kHostFillAlign),
+      AllocateHostFill(size + 2 * kHostFillAlign)};
+  std::array<HostFillAllocation, 3> out_of_pool_storage = {
+      AllocateHostFill(size + 2 * kHostFillAlign),
+      AllocateHostFill(size + 2 * kHostFillAlign),
+      AllocateHostFill(size + 2 * kHostFillAlign)};
   HostFillAllocation readback = AllocateHostFill(2 * size);
-  if (!pool || !out_of_pool || !readback) {
-    return HostFillError("allocation", "aligned source/readback allocation");
+  std::array<char*, 3> pool{};
+  std::array<char*, 3> out_of_pool{};
+  for (size_t i = 0; i < pool.size(); ++i) {
+    if (!pool_storage[i] || !out_of_pool_storage[i]) {
+      return HostFillError("allocation", "aligned source allocation");
+    }
+    pool[i] = static_cast<char*>(pool_storage[i].get()) + kHostFillAlign;
+    out_of_pool[i] =
+        static_cast<char*>(out_of_pool_storage[i].get()) + kHostFillAlign;
+  }
+  if (!readback) {
+    return HostFillError("allocation", "aligned readback allocation");
   }
   const std::string setup_before = c->MetricsSnapshot();
-  if (!c->RegisterMemory(pool.get(), size) ||
-      !c->RegisterMemory(readback.get(), 2 * size)) {
+  for (char* source : pool) {
+    if (!c->RegisterMemory(source, size)) {
+      return HostFillError("setup_registration",
+                           "source persistent registration failed; "
+                           "refusing operation-scoped fallback");
+    }
+  }
+  if (!c->RegisterMemory(readback.get(), 2 * size)) {
     return HostFillError("setup_registration",
-                         "source/readback persistent registration failed; "
+                         "readback persistent registration failed; "
                          "refusing operation-scoped fallback");
   }
   const std::string setup_after = c->MetricsSnapshot();
-  uint64_t pool_active = 0, transient_active = 0;
+  uint64_t pool_active = 0, transient_active = 0, pool_regions = 0;
   const bool metrics = PromMetricValue(
                            setup_after,
                            "dfkv_rdma_client_pool_mr_active_registrations",
@@ -561,7 +617,13 @@ static int RunHostFillBenchmark(KVClient* c, const std::string& run_id,
                        PromMetricValue(
                            setup_after,
                            "dfkv_rdma_client_transient_user_mr_active",
-                           &transient_active);
+                           &transient_active) &&
+                       PromMetricValue(setup_after,
+                                       "dfkv_rdma_client_mr_regions",
+                                       &pool_regions);
+  const uint64_t setup_registrations = CounterDelta(
+      setup_before, setup_after,
+      "dfkv_rdma_client_pool_mr_registrations_total");
   std::printf(
       "HOSTFILL_CONFIG version=%s fill=%s bytes=%zu pairs=%zu "
       "odirect_alignment=%zu required_file_segments=%zu "
@@ -571,13 +633,17 @@ static int RunHostFillBenchmark(KVClient* c, const std::string& run_id,
       direct ? direct_path.c_str() : "-");
   std::printf(
       "HOSTFILL_SETUP rdma_metrics=%d pool_registrations=%llu "
-      "pool_active=%llu transient_active=%llu\n",
-      metrics ? 1 : 0,
-      (unsigned long long)CounterDelta(
-          setup_before, setup_after,
-          "dfkv_rdma_client_pool_mr_registrations_total"),
-      (unsigned long long)pool_active, (unsigned long long)transient_active);
-  if (metrics && (pool_active == 0 || transient_active != 0)) {
+      "pool_active=%llu pool_regions=%llu transient_active=%llu\n",
+      metrics ? 1 : 0, (unsigned long long)setup_registrations,
+      (unsigned long long)pool_active, (unsigned long long)pool_regions,
+      (unsigned long long)transient_active);
+  // Three PUT sources plus one readback arena are real persistent regions.
+  // Every active rail registers each region once; no initial ad-hoc fallback is
+  // accepted. Later same-base declarations must add zero registrations.
+  if (metrics &&
+      (pool_regions != 4 || setup_registrations < 4 ||
+       setup_registrations % 4 != 0 || pool_active != setup_registrations ||
+       transient_active != 0)) {
     return HostFillError("setup_lifetime", "unexpected initial MR gauges");
   }
 
@@ -587,12 +653,11 @@ static int RunHostFillBenchmark(KVClient* c, const std::string& run_id,
     const bool pool_first = iteration % 2 == 0;
     for (size_t order = 0; order < 2; ++order) {
       const bool pool_arm = (order == 0) == pool_first;
-      char* source = static_cast<char*>(pool_arm ? pool.get()
-                                                : out_of_pool.get());
       HostFillStats* stats = pool_arm ? &pool_stats : &out_of_pool_stats;
       const int rc = RunHostFillArm(
           c, run_id, size, direct, file.fd, pool_arm, iteration, fill_sequence,
-          source, static_cast<char*>(readback.get()), stats);
+          pool_arm ? pool : out_of_pool,
+          static_cast<char*>(readback.get()), pool_active, stats);
       if (rc != 0) return rc;
       ++fill_sequence;
     }
@@ -620,6 +685,10 @@ int main(int argc, char** argv) {
   }
   std::string members, mds, group = "default", op = "both", key_seed;
   std::string put_refill, put_refill_file;
+  size_t put_refill_occurrences = 0, put_refill_file_occurrences = 0;
+  std::vector<std::string> scoped_ops;
+  std::vector<size_t> scoped_sizes, scoped_counts, scoped_threads, scoped_batches,
+      scoped_put_arenas;
   size_t size = 2752512, count = 2000, threads = 8, batch = 1, bc = 0;
   size_t put_arena = 0;
   size_t ready_timeout_s = 30, mds_poll_ms = 1000;
@@ -648,23 +717,42 @@ int main(int argc, char** argv) {
     if (!std::strcmp(flag, "--members")) members = value;
     else if (!std::strcmp(flag, "--mds")) mds = value;
     else if (!std::strcmp(flag, "--group")) group = value;
-    else if (!std::strcmp(flag, "--op")) op = value;
-    else if (!std::strcmp(flag, "--key-seed")) key_seed = value;
-    else if (!std::strcmp(flag, "--put-refill")) put_refill = value;
-    else if (!std::strcmp(flag, "--put-refill-file")) put_refill_file = value;
-    else {
+    else if (!std::strcmp(flag, "--op")) {
+      op = value;
+      scoped_ops.emplace_back(value);
+    } else if (!std::strcmp(flag, "--key-seed")) key_seed = value;
+    else if (!std::strcmp(flag, "--put-refill")) {
+      ++put_refill_occurrences;
+      put_refill = value;
+    } else if (!std::strcmp(flag, "--put-refill-file")) {
+      ++put_refill_file_occurrences;
+      put_refill_file = value;
+    } else {
       size_t* target = nullptr;
+      std::vector<size_t>* occurrences = nullptr;
       if (!std::strcmp(flag, "--ready-timeout")) target = &ready_timeout_s;
-      else if (!std::strcmp(flag, "--size")) target = &size;
-      else if (!std::strcmp(flag, "--count")) target = &count;
-      else if (!std::strcmp(flag, "--threads")) target = &threads;
-      else if (!std::strcmp(flag, "--batch")) target = &batch;
-      else if (!std::strcmp(flag, "--bc")) target = &bc;
-      else if (!std::strcmp(flag, "--put-arena")) target = &put_arena;
+      else if (!std::strcmp(flag, "--size")) {
+        target = &size;
+        occurrences = &scoped_sizes;
+      } else if (!std::strcmp(flag, "--count")) {
+        target = &count;
+        occurrences = &scoped_counts;
+      } else if (!std::strcmp(flag, "--threads")) {
+        target = &threads;
+        occurrences = &scoped_threads;
+      } else if (!std::strcmp(flag, "--batch")) {
+        target = &batch;
+        occurrences = &scoped_batches;
+      } else if (!std::strcmp(flag, "--bc")) target = &bc;
+      else if (!std::strcmp(flag, "--put-arena")) {
+        target = &put_arena;
+        occurrences = &scoped_put_arenas;
+      }
       if (!ParseSize(value, target)) {
         std::fprintf(stderr, "invalid numeric value for %s: %s\n", flag, value);
         return 2;
       }
+      if (occurrences) occurrences->push_back(*target);
     }
   }
   if (put_arena > 1) {
@@ -679,38 +767,79 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--size, --count, --threads, and --batch must be greater than zero\n");
     return 2;
   }
-  if (!put_refill_file.empty() && put_refill.empty()) {
+  if (put_refill_occurrences > 1 || put_refill_file_occurrences > 1) {
+    std::fprintf(stderr,
+                 "--put-refill and --put-refill-file may each appear only once\n");
+    return 2;
+  }
+  if ((put_refill_occurrences != 0 && put_refill.empty()) ||
+      (put_refill_file_occurrences != 0 && put_refill_file.empty())) {
+    std::fprintf(stderr, "--put-refill and --put-refill-file reject empty values\n");
+    return 2;
+  }
+  if (put_refill_file_occurrences != 0 && put_refill_occurrences == 0) {
     std::fprintf(stderr, "--put-refill-file requires --put-refill odirect\n");
     return 2;
   }
-  if (!put_refill.empty()) {
+  if (put_refill_occurrences != 0) {
     if (put_refill != "cpu" && put_refill != "odirect") {
       std::fprintf(stderr, "--put-refill must be cpu or odirect\n");
       return 2;
     }
-    if (op != "put" || threads != 1 || batch != 1 || put_arena != 0) {
+    // Refill mode validates every scoped occurrence, not only the final value.
+    // This prevents a valid later flag from hiding an invalid earlier setting.
+    // Legacy argv with refill absent deliberately retains its old final-value
+    // duplicate handling.
+    const auto every_op_is_put =
+        std::all_of(scoped_ops.begin(), scoped_ops.end(),
+                    [](const std::string& value) { return value == "put"; });
+    const auto every_thread_is_one =
+        std::all_of(scoped_threads.begin(), scoped_threads.end(),
+                    [](size_t value) { return value == 1; });
+    const auto every_batch_is_one =
+        std::all_of(scoped_batches.begin(), scoped_batches.end(),
+                    [](size_t value) { return value == 1; });
+    const auto every_arena_is_zero =
+        std::all_of(scoped_put_arenas.begin(), scoped_put_arenas.end(),
+                    [](size_t value) { return value == 0; });
+    if (op != "put" || threads != 1 || batch != 1 || put_arena != 0 ||
+        !every_op_is_put || !every_thread_is_one || !every_batch_is_one ||
+        !every_arena_is_zero) {
       std::fprintf(stderr,
                    "--put-refill requires --op put --threads 1 --batch 1 "
-                   "--put-arena 0\n");
+                   "--put-arena 0 for every occurrence\n");
       return 2;
     }
-    if (count == 0 || count > kHostFillMaxPairs) {
+    const auto valid_count = [](size_t value) {
+      return value >= 1 && value <= kHostFillMaxPairs;
+    };
+    const auto valid_size = [](size_t value) {
+      return value >= 1 && value <= kHostFillMaxBytes;
+    };
+    if (!valid_count(count) ||
+        !std::all_of(scoped_counts.begin(), scoped_counts.end(), valid_count)) {
       std::fprintf(stderr, "--put-refill requires --count 1..8 measured pairs\n");
       return 2;
     }
-    if (size > kHostFillMaxBytes) {
+    if (!valid_size(size) ||
+        !std::all_of(scoped_sizes.begin(), scoped_sizes.end(), valid_size)) {
       std::fprintf(stderr, "--put-refill size must be at most 16777216 bytes\n");
       return 2;
     }
     const bool direct = put_refill == "odirect";
-    if ((direct && put_refill_file.empty()) ||
-        (!direct && !put_refill_file.empty())) {
+    if ((direct && put_refill_file_occurrences == 0) ||
+        (!direct && put_refill_file_occurrences != 0)) {
       std::fprintf(stderr,
                    "--put-refill-file PATH is required for odirect and "
                    "forbidden for cpu\n");
       return 2;
     }
-    if (direct && size % kHostFillAlign != 0) {
+    const auto aligned = [](size_t value) {
+      return value % kHostFillAlign == 0;
+    };
+    if (direct &&
+        (!aligned(size) || !std::all_of(scoped_sizes.begin(), scoped_sizes.end(),
+                                        aligned))) {
       std::fprintf(stderr,
                    "--put-refill odirect requires 4096-byte-aligned --size\n");
       return 2;
