@@ -231,6 +231,20 @@ expect_bench_usage_error "zero size" --members "n=127.0.0.1:$P" --size 0
 expect_bench_usage_error "zero count" --members "n=127.0.0.1:$P" --count 0
 expect_bench_usage_error "zero threads" --members "n=127.0.0.1:$P" --threads 0
 expect_bench_usage_error "zero batch" --members "n=127.0.0.1:$P" --batch 0
+expect_bench_usage_error "invalid refill mode" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 1 --batch 1 --op put --put-refill auto
+expect_bench_usage_error "unbounded refill pairs" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 9 --threads 1 --batch 1 --op put --put-refill cpu
+expect_bench_usage_error "refill threaded" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 2 --batch 1 --op put --put-refill cpu
+expect_bench_usage_error "cpu refill file" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 1 --batch 1 --op put --put-refill cpu \
+  --put-refill-file /unused
+expect_bench_usage_error "odirect refill missing file" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 1 --batch 1 --op put --put-refill odirect
+expect_bench_usage_error "odirect refill alignment" --members "n=127.0.0.1:$P" \
+  --size 4097 --count 1 --threads 1 --batch 1 --op put --put-refill odirect \
+  --put-refill-file /unused
 
 out=$("$BUILD/dfkv_bench" --members "n=127.0.0.1:$P" --size 4096 --count 4 \
   --threads 2 --batch 2 --op both --key-seed "tool-smoke-$$")
@@ -252,6 +266,30 @@ echo "$out" | grep -qE '^GET[[:space:]].*goodput [0-9.]+ GB/s.*ok=4 fails=0$' ||
 }
 echo "$out" | grep -qE '^DIAG phase=GET .*ring=1 .*io_errors=0 .*completion_timeouts=0 ' || {
   echo "dfkv_bench GET diagnostics missing: '$out'"
+  exit 1
+}
+
+out=$("$BUILD/dfkv_bench" --members "n=127.0.0.1:$P" --size 4096 --count 1 \
+  --threads 1 --batch 1 --op put --key-seed "tool-smoke-refill-$$" \
+  --put-refill cpu)
+[ "$(echo "$out" | grep -c '^HOSTFILL_SAMPLE ')" = 4 ] || {
+  echo "dfkv_bench refill sample count: '$out'"
+  exit 1
+}
+[ "$(echo "$out" | grep -c '^HOSTFILL_SUMMARY ')" = 2 ] || {
+  echo "dfkv_bench refill summaries missing: '$out'"
+  exit 1
+}
+echo "$out" | grep -q '^HOSTFILL_SAMPLE .*arm=pool .*expected_sha256=[0-9a-f]\{64\} .*scalar_sha256=' || {
+  echo "dfkv_bench pool refill hash evidence missing: '$out'"
+  exit 1
+}
+echo "$out" | grep -q '^HOSTFILL_SAMPLE .*arm=out_of_pool .*expected_sha256=' || {
+  echo "dfkv_bench out-of-pool refill evidence missing: '$out'"
+  exit 1
+}
+echo "$out" | grep -q '^HOSTFILL_RESULT status=PASS samples=4 put_operations=12 verified_full_readbacks=12 failures=0$' || {
+  echo "dfkv_bench refill full-readback result missing: '$out'"
   exit 1
 }
 
