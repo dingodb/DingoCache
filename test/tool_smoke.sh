@@ -245,9 +245,43 @@ expect_bench_usage_error "odirect refill missing file" --members "n=127.0.0.1:$P
 expect_bench_usage_error "odirect refill alignment" --members "n=127.0.0.1:$P" \
   --size 4097 --count 1 --threads 1 --batch 1 --op put --put-refill odirect \
   --put-refill-file /unused
+expect_bench_usage_error "empty refill mode" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 1 --batch 1 --op put --put-refill ""
+expect_bench_usage_error "empty refill file" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 1 --batch 1 --op put --put-refill odirect \
+  --put-refill-file ""
+expect_bench_usage_error "duplicate refill mode" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 1 --batch 1 --op put \
+  --put-refill cpu --put-refill cpu
+expect_bench_usage_error "conflicting refill mode" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 1 --batch 1 --op put \
+  --put-refill cpu --put-refill odirect
+expect_bench_usage_error "duplicate refill file" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 1 --batch 1 --op put --put-refill odirect \
+  --put-refill-file /unused --put-refill-file /unused
+expect_bench_usage_error "hidden invalid batch" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 1 --batch 2 --batch 1 --op put --put-refill cpu
+expect_bench_usage_error "hidden invalid threads" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 2 --threads 1 --batch 1 --op put --put-refill cpu
+expect_bench_usage_error "hidden invalid op" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 1 --batch 1 --op get --op put --put-refill cpu
+expect_bench_usage_error "hidden invalid put arena" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 1 --threads 1 --batch 1 --op put \
+  --put-arena 1 --put-arena 0 --put-refill cpu
+expect_bench_usage_error "hidden invalid count" --members "n=127.0.0.1:$P" \
+  --size 4096 --count 9 --count 1 --threads 1 --batch 1 --op put --put-refill cpu
+expect_bench_usage_error "hidden invalid size" --members "n=127.0.0.1:$P" \
+  --size 16777217 --size 4096 --count 1 --threads 1 --batch 1 --op put \
+  --put-refill cpu
+expect_bench_usage_error "hidden invalid direct alignment" --members "n=127.0.0.1:$P" \
+  --size 4097 --size 4096 --count 1 --threads 1 --batch 1 --op put \
+  --put-refill odirect --put-refill-file /unused
 
-out=$("$BUILD/dfkv_bench" --members "n=127.0.0.1:$P" --size 4096 --count 4 \
-  --threads 2 --batch 2 --op both --key-seed "tool-smoke-$$")
+# Refill-absent legacy argv keeps its final-value duplicate handling.
+out=$("$BUILD/dfkv_bench" --members "n=127.0.0.1:$P" \
+  --size 0 --size 4096 --count 0 --count 4 --threads 0 --threads 2 \
+  --batch 0 --batch 2 --op delete --op both --put-arena 1 --put-arena 0 \
+  --key-seed "tool-smoke-$$")
 echo "$out" | grep -qE '^PUT[[:space:]].*fails=0$' || {
   echo "dfkv_bench successful PUT report missing: '$out'"
   exit 1
@@ -280,12 +314,55 @@ out=$("$BUILD/dfkv_bench" --members "n=127.0.0.1:$P" --size 4096 --count 1 \
   echo "dfkv_bench refill summaries missing: '$out'"
   exit 1
 }
-echo "$out" | grep -q '^HOSTFILL_SAMPLE .*arm=pool .*expected_sha256=[0-9a-f]\{64\} .*scalar_sha256=' || {
-  echo "dfkv_bench pool refill hash evidence missing: '$out'"
-  exit 1
+# Parse every sample independently: all three expected digests must be distinct
+# and every actual digest must equal its own expected digest in both arms and
+# both warmup/measured phases. A PASS result alone is not accepted as evidence.
+echo "$out" | grep '^HOSTFILL_SAMPLE ' | awk '
+function digest(s) { return s ~ /^[0-9a-f][0-9a-f]*$/ && length(s) == 64 }
+{
+  delete v
+  for (i = 1; i <= NF; ++i) {
+    split($i, kv, "=")
+    if (kv[1] in v) { print "duplicate sample field: " $0 > "/dev/stderr"; bad = 1 }
+    v[kv[1]] = kv[2]
+  }
+  if (v["bytes"] != 4096 || v["fill"] != "cpu" ||
+      (v["arm"] != "pool" && v["arm"] != "out_of_pool") ||
+      (v["phase"] != "warmup" && v["phase"] != "measure") ||
+      (v["phase"] == "warmup" && v["pair"] != 0) ||
+      (v["phase"] == "measure" && v["pair"] != 1)) {
+    print "invalid sample identity: " $0 > "/dev/stderr"; bad = 1
+  }
+  identity = v["arm"] SUBSEP v["phase"] SUBSEP v["pair"]
+  if (++identity_count[identity] != 1) {
+    print "duplicate sample identity: " $0 > "/dev/stderr"; bad = 1
+  }
+  for (i = 0; i < 3; ++i) {
+    name = (i == 0 ? "scalar" : "flat" (i - 1))
+    expected = v[name "_expected_sha256"]
+    actual = v[name "_actual_sha256"]
+    if (!digest(expected) || !digest(actual) || actual != expected) {
+      print "digest relationship failed: " name " " $0 > "/dev/stderr"; bad = 1
+    }
+    for (j = 0; j < i; ++j) {
+      other = (j == 0 ? "scalar" : "flat" (j - 1))
+      if (expected == v[other "_expected_sha256"]) {
+        print "payloads not distinct: " $0 > "/dev/stderr"; bad = 1
+      }
+    }
+    if (!(expected in all_expected)) ++unique_expected
+    if (++all_expected[expected] != 1) {
+      print "refill payload reused: " expected > "/dev/stderr"; bad = 1
+    }
+  }
+  ++arm_count[v["arm"]]
 }
-echo "$out" | grep -q '^HOSTFILL_SAMPLE .*arm=out_of_pool .*expected_sha256=' || {
-  echo "dfkv_bench out-of-pool refill evidence missing: '$out'"
+END {
+  if (NR != 4 || arm_count["pool"] != 2 || arm_count["out_of_pool"] != 2 ||
+      unique_expected != 12) bad = 1
+  exit bad ? 1 : 0
+}' || {
+  echo "dfkv_bench refill per-payload digest validation failed: '$out'"
   exit 1
 }
 echo "$out" | grep -q '^HOSTFILL_RESULT status=PASS samples=4 put_operations=12 verified_full_readbacks=12 failures=0$' || {
