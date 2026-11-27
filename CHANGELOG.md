@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Server, RDMA: add the explicit `DFKV_RDMA_RAIL_SUSPECT_PEERS` threshold
+  (default 0 = off) over the existing per-rail, 30-second distinct-retry-peer
+  window (RDS-28). On an actual RETRY_EXC/RNR_RETRY_EXC CQ transition at an
+  operator-chosen threshold, wake only that rail's existing connections and
+  refuse new resolved-device bootstrap admission with explicit logs and new
+  `dfkv_rdma_rail_suspect{dev}` / `dfkv_rdma_suspect_rail_refusals_total`
+  telemetry. Unnamed clients exclude current suspects; sibling and ambiguous
+  PUT handling reuse existing client controls, and every unavailable rail
+  remains fail closed. Next-admission re-evaluation expires the state without
+  a new thread or permanent quarantine. This is not a physical-port or MDS
+  health verdict and does not change placement. No threshold is recommended
+  as production-validated; Soft-RoCE CQ rewriting proves the production
+  wiring, not real NIC/link black-hole timing.
+
 - Server, storage engine: complete stage-10 activation. The selector
   precedence remains option > `DFKV_STORE_ENGINE` > default, with the default
   now `auto`: empty directories use log, existing file/slab/log directories

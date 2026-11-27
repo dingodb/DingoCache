@@ -371,6 +371,8 @@ jobs:
         RdmaPortState.ARailWhosePortGoesDownLeavesSelectionAndComesBack
         RdmaRailAdmission.ACooledRailIsProbedInTheBackground
         RdmaRailAdmission.ARailsLatencyExcludesConnectionSetup
+        RdmaRailSuspect.MdsNamedPeerFailureChoosesSibling
+        RdmaRailSuspect.StaticPeerFailureChoosesSibling
         RdmaRegisterMemory.AFailedRailUndoesTheOthersAndPublishesNothing
         RdmaServerPorts.ARailGoingDownEndsOnlyItsConnections
         RdmaServerPorts.NoDeviceNamedGetsTheFirstActiveRail

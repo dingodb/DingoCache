@@ -107,6 +107,8 @@ PUBLIC_FAMILIES = {
     "dfkv_rdma_rail_get_bytes_total",
     "dfkv_rdma_rail_put_bytes_total",
     "dfkv_rdma_rail_retry_exhausted_peers",
+    "dfkv_rdma_rail_suspect",
+    "dfkv_rdma_suspect_rail_refusals_total",
     "dfkv_rdma_recv_segment_bytes",
     "dfkv_rdma_recv_segment_max_bytes",
     "dfkv_rdma_recv_segment_chunks",

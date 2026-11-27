@@ -399,11 +399,14 @@ class RdmaServer {
   std::mutex rail_listener_mu_;
   RailStateListener rail_listener_;
   std::atomic<uint64_t> inactive_rail_refusals_{0};
+  std::atomic<uint64_t> suspect_rail_refusals_{0};
   std::atomic<uint64_t> rail_down_connections_ended_{0};
   std::atomic<uint64_t> rail_port_changes_{0};
   void PortWatchLoop();
   void CheckRailPorts();
-  // The rail a client that names no device gets: the first not known down.
+  // The rail a client that names no device gets: the first not known down or
+  // currently retry-peer suspect. Zero is returned when all are excluded; the
+  // ordinary resolved-device admission checks still fail closed on that rail.
   size_t DefaultRail() const;
   // Track per-connection Serve threads + their endpoints so Stop() can wake them
   // out of WaitComp and join them before the handler's owner is destroyed, and
@@ -517,9 +520,20 @@ class RdmaServer {
   std::vector<std::unique_ptr<RailStats>> rail_stats_;  // indexed with anchor_devs_
   // Per rail: peer IP addresses whose connection ended in RETRY_EXC or
   // RNR_RETRY_EXC in the last 30 s (dfkv_rdma_rail_retry_exhausted_peers).
-  // Observation only; a design question is whether many of them on one rail
-  // should take it out of placement.
+  // The existing window stays purely observational when the opt-in threshold
+  // is zero. A positive threshold adds only server admission/connection
+  // behavior, never physical-port or MDS health state.
   std::vector<std::unique_ptr<PeerWindow>> rail_retry_peers_;
+  uint64_t rail_suspect_peers_ = 0;  // DFKV_RDMA_RAIL_SUSPECT_PEERS
+  std::unique_ptr<std::atomic<bool>[]> rail_suspect_;
+  // Serializes opt-in window evaluation and both suspect transitions. An
+  // expired-window read cannot clear a generation that a retry just crossed.
+  mutable std::mutex rail_suspect_mu_;
+  uint64_t RetryObservationMs() const;
+  bool RailSuspect(size_t rail, uint64_t now_ms) const;
+  // Test-only: seeding is done through RdmaServerTestPeer; a real rewritten CQ
+  // failure, never this clock or the seed, must drive the state transition.
+  std::function<uint64_t()> retry_observation_ms_for_test_;
   // Narrow hardware-free startup seams, private and reachable only through the
   // test peer. Production always calls verbs discovery and materializes real
   // anchors.
