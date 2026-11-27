@@ -559,14 +559,14 @@ TEST_F(EngineTest, MixedNodeReportsSlabViewsForSlabDisksOnly) {
   SlabAllocator::RetentionStats slab_only;
   {
     DiskCacheGroup::Options o;
-    o.cache_dirs = Dirs(1);
-    o.cache_dirs[0] += "-slab-only";
+    // Prepare the actual legacy disk. Under auto, an empty directory is log,
+    // so a slab retained only for its statistics cannot prove mixed behavior.
+    o.cache_dirs = {dirs[0]};
     o.capacity_bytes = 1ull << 30;
     o.engine = "slab";
     DiskCacheGroup slab(o);
     ASSERT_TRUE(slab.Healthy()) << slab.StartupError();
     slab_only = slab.RetentionStats();
-    fs::remove_all(o.cache_dirs[0]);
   }
   ::setenv("DFKV_STORE_ENGINE", "auto", 1);
   {
