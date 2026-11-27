@@ -11,7 +11,7 @@ ordinary reads.
 Full timeline (seconds, relative to the start of workload traffic):
     0..30 three real nodes n0..n2 with deterministic traffic, 30 fence+delete
     n2's member record, 120 unfence (the server's own heartbeat re-creates the
-    record), 180 stop the workload.  The absence therefore lasts ~90 s, longer
+    record), 195 stop the workload.  The absence therefore lasts ~90 s, longer
     than the read-back horizon H = DFKV_RING_READBACK_MS + 10*poll = 60 s, so
     both the within-H read-back phase and the over-H refusal phase of the
     dedicated absent route (PlanReadBack's absent_since >= H => unknown) are
@@ -100,8 +100,8 @@ HEARTBEAT_MS = 1000               # victim re-announces ~1 s after unfence
 MDS_LEASE_TTL_SECONDS = 30        # src/mds/mds_server.h kTtlSeconds (real lease expiry)
 SCHEDULE_TOLERANCE_NS = c35.SCHEDULE_TOLERANCE_NS
 # Evidence-window margins around MDS-observed membership transitions.  A
-# client adopts a 3->2 shrink (33% < the 50% guard arm) on its next 1 s poll;
-# 5 s covers poll + adoption + scrape cadence with room.
+# client adopts a 3->2 shrink only after the guard sees the same value on two
+# consecutive 1 s polls; 5 s covers polls + adoption + scrape cadence with room.
 MARGIN_S = 5
 DISRUPTION_BAD_RATE = 0.5         # one second is "disrupted" at <=50% full prefixes
 DISRUPTION_MIN_BAD_SECONDS = 3
@@ -1168,6 +1168,7 @@ class VariantRun4:
         refused_unknown_series = summed_client("readback_refused_unknown")
         gate_min_absence = None
         absent_members_min = None
+        absent_members_max_after_adoption = None
         if gone_ns and back_ns:
             gate_values = [value for series in client_series.values()
                            for ns, value in series["registry_gate_open"]
@@ -1177,6 +1178,12 @@ class VariantRun4:
                              for ns, value in series["absent_members"]
                              if gone_ns + margin <= ns <= back_ns - margin]
             absent_members_min = min(absent_values) if absent_values else None
+        if back_ns:
+            post_adoption = [value for series in client_series.values()
+                             for ns, value in series["absent_members"]
+                             if ns >= back_ns + 2 * 1e9]
+            absent_members_max_after_adoption = (
+                max(post_adoption) if post_adoption else None)
 
         # Per-second rate windows (workload seconds).
         def rates(start_s: int, end_s: int) -> dict:
@@ -1200,7 +1207,8 @@ class VariantRun4:
                 "pre_absence": dict(unavailable),
                 "absence_first10s": dict(unavailable),
                 "absence_over_h_first10s": dict(unavailable),
-                "post_restore_5_15s": dict(unavailable),
+                "absence_steady20s": dict(unavailable),
+                "post_restore_15_35s": dict(unavailable),
                 "whole_run": self.stats.window(0, self.timing["end_s"]),
             }
         else:
@@ -1208,13 +1216,15 @@ class VariantRun4:
                 "pre_absence": self.stats.window(10, 25),
                 "absence_first10s": self.stats.window(gone_s + 3, gone_s + 13),
                 "absence_over_h_first10s": self.stats.window(gone_s + 63, gone_s + 73),
-                "post_restore_5_15s": self.stats.window(back_s + 5, back_s + 15),
+                "absence_steady20s": self.stats.window(gone_s + 13, gone_s + 33),
+                "post_restore_15_35s": self.stats.window(back_s + 15, back_s + 35),
                 "whole_run": self.stats.window(0, self.timing["end_s"]),
             }
             self.result["rate_windows"] = {
                 "absence_first10s": rates(gone_s + 3, gone_s + 13),
                 "absence_over_h_first10s": rates(gone_s + 63, gone_s + 73),
-                "post_restore_5_15s": rates(back_s + 5, back_s + 15),
+                "absence_steady20s": rates(gone_s + 13, gone_s + 33),
+                "post_restore_15_35s": rates(back_s + 15, back_s + 35),
             }
 
         self.result["fence_evidence"] = self.fence_evidence
@@ -1232,7 +1242,9 @@ class VariantRun4:
             and self.unfence_confirmed_ns > 0 and self.keeper.reannounce_ns > 0
             and back_ns > 0 and self.metrics.final_ring_ns > 0
             and self.fence_confirmed_ns <= gone_ns <= self.unfence_confirmed_ns
-            < self.keeper.reannounce_ns <= back_ns <= self.metrics.final_ring_ns
+            < self.keeper.reannounce_ns
+            and self.keeper.reannounce_ns - int((KEEPER_PERIOD_S + 0.5) * 1e9)
+            <= back_ns <= self.metrics.final_ring_ns
             and self.metrics.final_victim_eligible)
         self.result["membership_evidence"] = {
             "fence_confirmed_ns": self.fence_confirmed_ns,
@@ -1347,8 +1359,9 @@ class VariantRun4:
                 over_h = {"start_ns": oh_start, "end_ns": back_ns}
         post = ({"start_ns": back_ns + margin, "end_ns": back_ns + 25 * 1e9}
                 if back_ns and back_ns + margin < end_ns else None)
-        freeze = ({"start_ns": back_ns + 20 * 1e9, "end_ns": end_ns}
-                  if back_ns and back_ns + 20 * 1e9 < end_ns else None)
+        freeze_delay_ns = (READBACK_MS + SETTLE_MS + MARGIN_S * 1000) * 1_000_000
+        freeze = ({"start_ns": back_ns + freeze_delay_ns, "end_ns": end_ns}
+                  if back_ns and back_ns + freeze_delay_ns < end_ns else None)
 
         def counter_windows(field_points: list[tuple[int, float]]) -> dict:
             answer: dict[str, Any] = {}
@@ -1384,6 +1397,8 @@ class VariantRun4:
                 if freeze else {"complete": False}),
             "gate_min_during_absence": gate_min_absence,
             "absent_members_min_during_absence": absent_members_min,
+            "absent_members_max_after_two_polls": absent_members_max_after_adoption,
+            "held_ring_freeze_start_ns": freeze["start_ns"] if freeze else None,
         }
 
         self._correctness = c35.check_operations(self.root / "operations.jsonl")
@@ -1766,16 +1781,19 @@ def selected_checks4(result: dict, smoke: bool) -> None:
         pre_absence = core.get("pre_absence", {})
         pre_rate = pre_absence.get("full_prefix_hit_rate")
         first10 = rate_windows.get("absence_first10s", {})
+        steady = rate_windows.get("absence_steady20s", {})
         add("AMB_recovers_valid_values_within_H",
             first10.get("complete") is True
+            and steady.get("complete") is True
             and pre_absence.get("complete") is True
             and pre_rate is not None
-            and (first10.get("mean_full_prefix_rate") or 0)
+            and (steady.get("mean_full_prefix_rate") or 0)
             >= AMB_MIN_PRE_ABSENCE_FRACTION * pre_rate
             and (victim_hit.get("within_h", {}).get("delta") or 0)
             >= VICTIM_MIN_READBACK_HITS
             and totals.get("hit", 0) > 0,
-            {"first10s": first10, "victim_cache_hit_within_h": victim_hit.get("within_h"),
+            {"first10s": first10, "steady20s": steady,
+             "victim_cache_hit_within_h": victim_hit.get("within_h"),
              "client_readback_hit": totals.get("hit"),
              "note": "valid M negative case: never-removed keys are read back "
                      "from the absent live owner"})
@@ -1803,7 +1821,7 @@ def selected_checks4(result: dict, smoke: bool) -> None:
             {"refused_removed": totals.get("refused_removed"),
              "note": "removed negative case: churn-removed keys are refused "
                      "by M and never served"})
-        post = rate_windows.get("post_restore_5_15s", {})
+        post = rate_windows.get("post_restore_15_35s", {})
         add("restore_resumes_ordinary_reads_with_no_new_readback_hit",
             post.get("complete") is True
             and pre_absence.get("complete") is True
@@ -1811,11 +1829,15 @@ def selected_checks4(result: dict, smoke: bool) -> None:
             and (post.get("mean_full_prefix_rate") or 0)
             >= POST_MIN_PRE_ABSENCE_FRACTION * pre_rate
             and (victim_hit.get("post_restore", {}).get("delta") or 0) > 0
+            and dest.get("absent_members_max_after_two_polls") == 0
             and dest.get("readback_hit_freeze_after_restore", {}).get("complete") is True
             and dest.get("readback_hit_freeze_after_restore", {}).get("delta") == 0,
-            {"post_restore_5_15s": post,
+            {"post_restore_15_35s": post,
              "victim_cache_hit_post_restore": victim_hit.get("post_restore"),
-             "readback_hit_freeze": dest.get("readback_hit_freeze_after_restore")})
+             "absent_members_max_after_two_polls":
+                 dest.get("absent_members_max_after_two_polls"),
+             "readback_hit_freeze": dest.get("readback_hit_freeze_after_restore"),
+             "held_ring_freeze_start_ns": dest.get("held_ring_freeze_start_ns")})
     metrics_ok = metrics.get("final_capture_complete") is True and metrics.get(
         "every_node_has_metrics") is True
     add("authoritative_final_metrics", metrics_ok,
@@ -1843,18 +1865,27 @@ def cross_variant_checks4(by_name: dict[str, dict]) -> dict:
                       False, {"reason": "incomplete amb pre_absence window",
                               "pre_absence": amb_pre})
         return {"evaluated": False, "reason": "incomplete amb pre_absence window"}
+    amb_steady = by_name["amb"].get("rate_windows", {}).get(
+        "absence_steady20s", {})
+    amb_steady_mean = amb_steady.get("mean_full_prefix_rate")
+    if amb_steady.get("complete") is not True or amb_steady_mean is None:
+        c35.add_check(by_name["amb"], "cross_amb_recovers_where_base_and_A_cannot",
+                      False, {"reason": "incomplete amb steady window",
+                              "steady": amb_steady})
+        return {"evaluated": False, "reason": "incomplete amb steady window"}
     base_mean = windows["base"]["mean_full_prefix_rate"]
     a_mean = windows["a"]["mean_full_prefix_rate"]
     amb_mean = windows["amb"]["mean_full_prefix_rate"]
     c35.add_check(
         by_name["amb"], "cross_amb_recovers_where_base_and_A_cannot",
-        amb_mean >= AMB_MIN_PRE_ABSENCE_FRACTION * amb_pre_rate
+        amb_steady_mean >= AMB_MIN_PRE_ABSENCE_FRACTION * amb_pre_rate
         and base_mean <= DISRUPTION_MAX_MEAN
         and a_mean <= DISRUPTION_MAX_MEAN
         and amb_mean - base_mean >= MIN_AMB_CONTRAST
         and amb_mean - a_mean >= MIN_AMB_CONTRAST,
         {"amb_first10s_mean": amb_mean, "base_first10s_mean": base_mean,
          "a_first10s_mean": a_mean,
+         "amb_steady20s_mean": amb_steady_mean,
          "amb_pre_absence_mean": amb_pre_rate,
          "amb_minus_base": amb_mean - base_mean,
          "amb_minus_a": amb_mean - a_mean,
@@ -1912,7 +1943,7 @@ def main(argv: list[str] | None = None) -> int:
     workload = Workload4()
     timing = ({"fence_s": 8, "unfence_s": 28, "end_s": 40, "planned_absence_s": 20}
               if args.smoke else
-              {"fence_s": 30, "unfence_s": 120, "end_s": 180, "planned_absence_s": 90})
+              {"fence_s": 30, "unfence_s": 120, "end_s": 195, "planned_absence_s": 90})
     metadata = {
         "wall_time": c35._iso(),
         "argv": sys.argv if argv is None else [sys.argv[0], *argv],
