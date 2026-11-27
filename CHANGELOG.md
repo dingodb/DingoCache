@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Tests: cover per-node batched recent-REMOVE queries for both scalar TCP
+  and pipelined misses (CLI-38). Each batched read-back question costs at
+  most one M request per previous owner, instead of one request per missed
+  key, and the matching base/A controls and refusal behavior stay unchanged.
 - Server, RAM tier: a RAM-ACK PUT refused at the dirty watermark can wait
   for the flush instead (REQ-26, `DFKV_RAM_ACK_BACKPRESSURE_WAIT_MS`, 0 by
   default: refused at once, as before). Over the watermark (80% of the tier

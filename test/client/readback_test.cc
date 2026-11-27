@@ -369,6 +369,48 @@ TEST_P(ReadBack, AMissAfterAnOwnerChangeIsReadBackFromThePreviousOwner) {
   EXPECT_EQ(Asked("f"), 0) << "O, which answered not found, was asked";
 }
 
+// Batched misses share one recent-REMOVE query per previous owner per call.
+// This guards TCP's scalar transport path as well as the pipelined batch path:
+// the outer read may be scalar, but its M questions are still grouped by node.
+TEST_P(ReadBack, NonPipelinedBatchMissesShareOneMemoryQueryPerNode) {
+  RbEnv env;
+  auto c = OpenOn(&t, kOld);
+  c->SetMembers(View(kIds));
+  const auto keys = MovedToF(8, "batch-mem-");
+  const std::string v(8, 'v');
+  std::map<std::string, int> expected;
+  for (const auto& key : keys) ++expected[PrevOwner(key)];
+  for (const auto& key : keys) Store(PrevOwner(key), key, v);
+
+  std::vector<std::string> outs(keys.size(), std::string(v.size(), '\0'));
+  std::vector<KvGetItem> items;
+  for (size_t i = 0; i < keys.size(); ++i)
+    items.push_back({keys[i], &outs[i][0], v.size()});
+  for (bool hit : c->BatchGet(items)) ASSERT_TRUE(hit);
+  for (const auto& id : kIds) {
+    EXPECT_EQ(Asked(id), expected.count(id) ? 1 : 0)
+        << "BatchGet: one M request or no query";
+  }
+
+  std::vector<size_t> lens;
+  for (bool hit : c->BatchGetAuto(items, &lens)) ASSERT_TRUE(hit);
+  ASSERT_EQ(lens.size(), keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    ASSERT_EQ(lens[i], v.size());
+    EXPECT_EQ(outs[i], v);
+  }
+  for (const auto& id : kIds) {
+    EXPECT_EQ(Asked(id), expected.count(id) ? 2 : 0)
+        << "BatchGetAuto: one more M request per previous owner";
+  }
+
+  for (bool exist : c->BatchExist(keys)) ASSERT_TRUE(exist);
+  for (const auto& id : kIds) {
+    EXPECT_EQ(Asked(id), expected.count(id) ? 3 : 0)
+        << "BatchExist: one more M request per previous owner";
+  }
+}
+
 // No read-back where it is not a candidate: the owner did not change, the
 // owner had it, the window passed, B off.
 TEST_P(ReadBack, OnlyAnOwnersNotFoundInsideTheWindowIsACandidate) {
@@ -478,8 +520,8 @@ TEST_P(ReadBack, AbsentOwnerAfterHeldWindowServesEveryReadForm) {
   for (bool hit : c->BatchExist({keys[4], keys[5], keys[6]})) EXPECT_TRUE(hit);
 
   EXPECT_EQ(Reads("d"), 11);
-  EXPECT_EQ(AgesAsked("d"), GetParam() ? 7 : 11)
-      << "pipelining groups each operation; TCP plans each scalar key";
+  EXPECT_EQ(AgesAsked("d"), 7)
+      << "both transports group M questions by node, not by missed key";
   EXPECT_EQ(Asked("d"), 0) << "rewrite-enabled B must use op 26";
   EXPECT_EQ(Metric(*c, "dfkv_client_readback_reads_total{result=\"hit\"}"),
             "11");
@@ -743,7 +785,6 @@ TEST_P(ReadBack, AnyRemovedOrUnknownRefusesTheReadBack) {
 // one failed request makes every key asked there unknown, the keys of its
 // answered requests included. Keys not asked there are read back.
 TEST_P(ReadBack, AFailedRequestMakesEveryKeyAskedThereUnknown) {
-  if (!GetParam()) GTEST_SKIP() << "a non-pipelined batch reads key by key";
   RbEnv env;
   auto c = OpenOn(&t, kOld);
   c->SetMembers(View(kIds));
