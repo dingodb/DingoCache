@@ -86,7 +86,7 @@ def _identity(chains: dict[str, list[bytes]], values: dict[bytes, bytes]) -> str
 
 def _routes(chains: dict[str, list[bytes]], segment_size: int) -> list[bytes]:
     return [
-        keys[(index // segment_size) * segment_size]
+        chains[chain_id][(index // segment_size) * segment_size]
         for chain_id in CHAIN_IDS
         for index, keys in enumerate(chains[chain_id])
     ]
