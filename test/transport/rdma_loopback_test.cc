@@ -8488,7 +8488,17 @@ void ExerciseNoRailSuspect(const std::string& tag, const char* threshold,
   auto* idle = RdmaTransportTestPeer::AcquireControlOn(&guard, node.addr, 0);
   ASSERT_NE(idle, nullptr);
   RdmaTransportTestPeer::ReleaseControl(&guard, node.addr, idle);
-  ASSERT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0), 1u);
+  // ReleaseControl has returned idle to this client's pool, so this QP must
+  // stay live throughout the negative control. Readiness can reach that client
+  // before the server publishes live_eps_; wait for that registration rather
+  // than mistaking its async ordering for teardown. A real EOF is not a path
+  // to the expected count, and no operation closes guard before this check.
+  for (int i = 0;
+       i < 600 &&
+       RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0) != 1; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0), 1u)
+      << "the pooled idle QP never appeared in the server's live registry";
   armed.store(true, std::memory_order_release);
   RdmaTransport transport(kMaxMsg, rail);
   ASSERT_TRUE(DriveRewrittenServerFailures(node, transport, failures));
