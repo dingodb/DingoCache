@@ -5,10 +5,14 @@
 // changes: a PUT after a REMOVE is stored and served.
 #include "client/kv_client.h"
 #include "cache/kv_node_server.h"
+#include "utils/net_util.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <iomanip>
+#include <iostream>
 #include <cstdlib>
 #include <thread>
 #include <future>
@@ -76,6 +80,76 @@ class KvNodeServerTestPeer {
     s.pause_ages_for_test_.store(false, std::memory_order_relaxed);
     s.ages_test_state_++;
     s.ages_test_cv_.notify_all();
+  }
+  struct AgeCapture {
+    uint64_t raw_before_ms = 0;
+    uint64_t effective_now_ms = 0;
+    uint64_t raw_after_ms = 0;
+    uint64_t covered_ms = 0;
+    uint64_t remove_record_at_ms = 0;
+    uint64_t write_record_at_ms = 0;
+    uint32_t filtered_removed_age = kRemovedAgeUnknown;
+    uint32_t filtered_written_age = kRemovedAgeUnknown;
+    uint32_t retained_removed_age = kRemovedAgeUnknown;
+    uint32_t retained_written_age = kRemovedAgeUnknown;
+    bool remove_index_present = false;
+    bool write_index_present = false;
+  };
+  // Sample the same production joint query at an exact test-advanced RAW
+  // watermark. A second query at the returned coverage proves whether the
+  // indexed records are still retained when the narrower filter hides them.
+  static AgeCapture CaptureAge(KvNodeServer& s, const BlockKey& key,
+                               uint32_t age_ms, uint64_t exact_now_ms = 0) {
+    AgeCapture capture;
+    capture.raw_before_ms = RawMs();
+    capture.effective_now_ms = exact_now_ms == 0
+                                   ? capture.raw_before_ms + 1000
+                                   : exact_now_ms;
+    s.remove_memory_->AdvanceTo(capture.effective_now_ms);
+    s.write_memory_->Check(capture.effective_now_ms);
+    char digest[16];
+    net::PutU64(digest, key.digest_hi);
+    net::PutU64(digest + 8, key.digest_lo);
+    capture.covered_ms = s.write_memory_->AgesWithRemovals(
+        *s.remove_memory_, key.tenant_hash, digest, 1, age_ms,
+        capture.effective_now_ms, &capture.filtered_removed_age,
+        &capture.filtered_written_age);
+    const uint64_t retained_covered = s.write_memory_->AgesWithRemovals(
+        *s.remove_memory_, key.tenant_hash, digest, 1, capture.covered_ms,
+        capture.effective_now_ms, &capture.retained_removed_age,
+        &capture.retained_written_age);
+    capture.remove_index_present =
+        capture.retained_removed_age < kRemovedAgeUnknown;
+    capture.write_index_present =
+        capture.retained_written_age < kRemovedAgeUnknown;
+    if (capture.remove_index_present)
+      capture.remove_record_at_ms =
+          capture.effective_now_ms - capture.retained_removed_age;
+    if (capture.write_index_present)
+      capture.write_record_at_ms =
+          capture.effective_now_ms - capture.retained_written_age;
+    capture.raw_after_ms = RawMs();
+    EXPECT_EQ(retained_covered, capture.covered_ms);
+    return capture;
+  }
+  // Called while op 26 is paused immediately before its table locks and only
+  // after the synchronous TCP records have been checked separately. These
+  // controlled records deliberately become latest for the reproducible
+  // age-window fixture; they must never be the sole evidence that real
+  // handlers recorded M/W. The effective query time is max(server RAW, this
+  // watermark), so later scheduler delay cannot age these controlled records.
+  static uint64_t MakeOriginalAgesDeterministic(KvNodeServer& s,
+                                                const BlockKey& rewritten,
+                                                const BlockKey& old,
+                                                const BlockKey& gone) {
+    // Both historical records must remain newer than the real TCP records:
+    // RemoveMemory::NowLocked never lets a back-dated rewrite go backwards.
+    const uint64_t effective_now = RawMs() + 200;
+    s.remove_memory_->Record(rewritten, effective_now - 200);
+    s.write_memory_->Record(rewritten, effective_now - 198);
+    s.write_memory_->Record(old, effective_now);
+    s.remove_memory_->Record(gone, effective_now);
+    return effective_now;
   }
   // Re-stamp only the two records of a real TCP PUT→REMOVE pair at one legal
   // RAW tick. The pair and subsequent op-26 request stay end to end, while
@@ -183,20 +257,107 @@ TEST(RemoveMemoryTcp, OpTwentySixAnswersRemoveAndWriteAges) {
   KVClient c({{"n", node.addr}}, "rmem/ages");
   const std::string v(64, 'v');
   ASSERT_TRUE(c.Remove("rewritten"));
-  // This legal REMOVE→PUT rewrite must have a strictly older REMOVE. A tie
-  // deliberately has the conservative verdict exercised separately below.
   std::this_thread::sleep_for(std::chrono::milliseconds(2));
   ASSERT_TRUE(c.Put("rewritten", v.data(), v.size()));
   ASSERT_TRUE(c.Put("old", v.data(), v.size()));
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  const auto first_duplicate = KvNodeServerTestPeer::CaptureAge(
+      *node.srv, ToBlockKey("rmem/ages", "old"), 600000, RawMs());
+  ASSERT_TRUE(first_duplicate.write_index_present);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
   ASSERT_TRUE(c.Put("old", v.data(), v.size()));  // a duplicate: a PUT
+  const auto second_duplicate = KvNodeServerTestPeer::CaptureAge(
+      *node.srv, ToBlockKey("rmem/ages", "old"), 600000, RawMs());
+  ASSERT_TRUE(second_duplicate.write_index_present);
+  ASSERT_GT(second_duplicate.write_record_at_ms,
+            first_duplicate.write_record_at_ms)
+      << "the second real duplicate PUT must become the latest record";
   ASSERT_TRUE(c.Remove("gone"));
-  std::vector<KVClient::MemoryAnswer> a;
+
+  // Prove real handler provenance before controlled records replace latest.
+  // This covered wide-window query must not depend on a natural sleep landing
+  // before a 250 ms cutoff. The original 250 ms gate is tested separately
+  // below using an explicit, reproducible fixture.
+  std::vector<KVClient::MemoryAnswer> real;
+  const uint32_t real_lookback_ms = static_cast<uint32_t>(
+      std::min<uint64_t>(second_duplicate.covered_ms, 600000));
+  ASSERT_GT(real_lookback_ms, 0u);
   ASSERT_EQ(c.RemovedWithinAges(node.addr, {"rewritten", "old", "gone", "never"},
-                                250, &a),
+                                real_lookback_ms, &real),
             Status::kOk);
+  ASSERT_EQ(real.size(), 4u);
+  ASSERT_NE(real[0].removed_age, kRemovedAgeNone);
+  ASSERT_NE(real[0].removed_age, kRemovedAgeUnknown);
+  ASSERT_NE(real[0].written_age, kRemovedAgeNone);
+  ASSERT_NE(real[0].written_age, kRemovedAgeUnknown);
+  EXPECT_LT(real[0].written_age, real[0].removed_age)
+      << "the real REMOVE→PUT operations must determine this ordering";
+  EXPECT_EQ(KVClient::RewriteVerdict(node.addr, {{node.addr, real[0]}}),
+            KVClient::Rewrite::kAfterEvery);
+  EXPECT_LT(real[1].written_age, 100u);
+  EXPECT_EQ(real[1].removed_age, kRemovedAgeNone);
+  EXPECT_LT(real[2].removed_age, 100u);
+  EXPECT_EQ(real[2].written_age, kRemovedAgeNone);
+  EXPECT_EQ(real[3].removed_age, kRemovedAgeNone);
+  EXPECT_EQ(real[3].written_age, kRemovedAgeNone);
+  EXPECT_LE(real[0].sent_ms, real[0].answered_ms);
+  std::cout << "AGE_PROVENANCE real_removed_age=" << real[0].removed_age
+            << " real_written_age=" << real[0].written_age
+            << " first_duplicate_written_at_ms="
+            << first_duplicate.write_record_at_ms
+            << " second_duplicate_written_at_ms="
+            << second_duplicate.write_record_at_ms << '\n';
+
+  // Only now install the separate exact-age fixture.
+  std::vector<KVClient::MemoryAnswer> a;
+  KvNodeServerTestPeer::Pause(*node.srv);
+  auto original_query = std::async(std::launch::async, [&] {
+    return c.RemovedWithinAges(node.addr, {"rewritten", "old", "gone", "never"},
+                               250, &a);
+  });
+  KvNodeServerTestPeer::WaitQuery(*node.srv);
+  const uint64_t pinned_now = KvNodeServerTestPeer::MakeOriginalAgesDeterministic(
+      *node.srv, ToBlockKey("rmem/ages", "rewritten"),
+      ToBlockKey("rmem/ages", "old"), ToBlockKey("rmem/ages", "gone"));
+  KvNodeServerTestPeer::Release(*node.srv);
+  ASSERT_EQ(original_query.get(), Status::kOk);
   ASSERT_EQ(a.size(), 4u);
-  EXPECT_GE(a[0].removed_age, 200u);
+  const auto original_capture = KvNodeServerTestPeer::CaptureAge(
+      *node.srv, ToBlockKey("rmem/ages", "rewritten"), 250, pinned_now);
+  std::cout << std::boolalpha << std::setprecision(17)
+            << "AGE_CAPTURE phase=deterministic-response"
+            << " raw_before_ms=" << original_capture.raw_before_ms
+            << " effective_now_ms=" << original_capture.effective_now_ms
+            << " raw_after_ms=" << original_capture.raw_after_ms
+            << " covered_ms=" << original_capture.covered_ms
+            << " remove_index_present=" << original_capture.remove_index_present
+            << " remove_record_at_ms=" << original_capture.remove_record_at_ms
+            << " retained_removed_age=" << original_capture.retained_removed_age
+            << " write_index_present=" << original_capture.write_index_present
+            << " write_record_at_ms=" << original_capture.write_record_at_ms
+            << " retained_written_age=" << original_capture.retained_written_age
+            << " filtered_removed_age=" << original_capture.filtered_removed_age
+            << " filtered_written_age=" << original_capture.filtered_written_age
+            << " response_removed_age=" << a[0].removed_age
+            << " response_written_age=" << a[0].written_age
+            << " duplicate_written_age=" << a[1].written_age
+            << " duplicate_removed_age=" << a[1].removed_age
+            << " gone_removed_age=" << a[2].removed_age
+            << " gone_written_age=" << a[2].written_age
+            << " missing_removed_age=" << a[3].removed_age
+            << " missing_written_age=" << a[3].written_age
+            << " sent_ms=" << a[0].sent_ms
+            << " answered_ms=" << a[0].answered_ms
+            << " verdict=" << static_cast<int>(KVClient::RewriteVerdict(
+                                  node.addr, {{node.addr, a[0]}}))
+            << '\n';
+  EXPECT_TRUE(original_capture.remove_index_present);
+  EXPECT_TRUE(original_capture.write_index_present);
+  EXPECT_EQ(original_capture.filtered_removed_age, 200u);
+  EXPECT_EQ(original_capture.filtered_written_age, 198u);
+  EXPECT_EQ(original_capture.remove_record_at_ms, pinned_now - 200);
+  EXPECT_EQ(original_capture.write_record_at_ms, pinned_now - 198);
+  EXPECT_EQ(a[0].removed_age, 200u);
+  EXPECT_EQ(a[0].written_age, 198u);
   EXPECT_LT(a[0].removed_age, 250u);
   EXPECT_LT(a[0].written_age, a[0].removed_age)
       << "the PUT came strictly after the REMOVE";
@@ -204,9 +365,9 @@ TEST(RemoveMemoryTcp, OpTwentySixAnswersRemoveAndWriteAges) {
             KVClient::Rewrite::kAfterEvery);
   std::string served(v.size(), '\0');
   EXPECT_TRUE(c.Get("rewritten", &served[0], served.size()));
-  EXPECT_LT(a[1].written_age, 100u) << "the duplicate PUT is the latest";
+  EXPECT_EQ(a[1].written_age, 0u) << "the duplicate PUT is the latest";
   EXPECT_EQ(a[1].removed_age, kRemovedAgeNone);
-  EXPECT_LT(a[2].removed_age, 100u);
+  EXPECT_EQ(a[2].removed_age, 0u);
   EXPECT_EQ(a[2].written_age, kRemovedAgeNone);
   EXPECT_EQ(a[3].removed_age, kRemovedAgeNone);
   EXPECT_EQ(a[3].written_age, kRemovedAgeNone);
@@ -231,7 +392,7 @@ TEST(RemoveMemoryTcp, OpTwentySixAnswersRemoveAndWriteAges) {
 
   EXPECT_EQ(Counter(node.srv->MetricsText(),
                     "dfkv_removed_within_ages_requests_total"),
-            2u);
+            3u);
   EXPECT_NE(node.srv->MetricsText().find("dfkv_write_memory_entries"),
             std::string::npos);
   // Beyond what the node knows: unknown.
