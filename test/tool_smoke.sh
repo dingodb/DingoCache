@@ -12,14 +12,16 @@ for b in dfkv_server dfkv_mds dfkvctl dfkv_bench dfkv_smoke \
 done
 echo "version smoke OK"
 "$BUILD/dfkv_server" --help | grep -q \
-  'storage backend: slab | file (default slab)'
+  'slab | file | auto | log (default auto: empty=log, existing kept)'
 
 D=$(mktemp -d)
 mkdir "$D/cache"
 : > "$D/srv.out"   # pre-create so the awk below can't fail on a missing file under `set -e`
-# -u DFKV_LOG: the clean-shutdown check below reads INFO lines.
-env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_LOG "$BUILD/dfkv_server" \
-  --dir "$D/cache" --port 0 --cap 1073741824 >>"$D/srv.out" 2>&1 &
+# --store-engine "" is not absence: it must clear the inherited slab override
+# and resolve auto on this fresh root. -u DFKV_LOG keeps shutdown INFO lines.
+env -u DFKV_SLAB_WRITE -u DFKV_LOG DFKV_STORE_ENGINE=slab \
+  "$BUILD/dfkv_server" --dir "$D/cache" --port 0 --cap 1073741824 \
+  --store-engine "" >>"$D/srv.out" 2>&1 &
 PID=$!
 # The server of the moment is asked to stop, and killed if it has not within
 # two seconds: one that is blocked in an open does not act on SIGTERM.
@@ -37,13 +39,14 @@ P=""
 # `|| true`: a transient awk read must never trip `set -e` before the server prints PORT.
 for i in $(seq 1 100); do P=$(awk '/PORT/{print $2}' "$D/srv.out" 2>/dev/null || true); [ -n "$P" ] && break; sleep 0.05; done
 [ -n "$P" ] || { echo "server did not report PORT"; cat "$D/srv.out"; exit 1; }
-[ -f "$D/cache/slots.tbl" ] || {
-  echo "default server did not create slab metadata"
+[ -f "$D/cache/lse_super" ] && [ -f "$D/cache/lse_journal" ] || {
+  echo "--store-engine empty did not reset inherited slab and create LSE metadata"
   cat "$D/srv.out"
   exit 1
 }
-[ ! -d "$D/cache/blocks" ] || {
-  echo "default server silently selected the file engine"
+[ ! -e "$D/cache/slots.tbl" ] && [ ! -d "$D/cache/blocks" ] || {
+  echo "--store-engine empty retained an inherited non-auto engine"
+  cat "$D/srv.out"
   exit 1
 }
 "$BUILD/dfkv_smoke" --members "n=127.0.0.1:$P" --size 4096
@@ -102,9 +105,9 @@ for i in $(seq 1 100); do P=$(awk '/PORT/{print $2}' "$D/srv2.out" 2>/dev/null |
 [ -n "$P" ] || { echo "restarted server did not report PORT"; cat "$D/srv2.out"; exit 1; }
 got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" get k)
 [ "$got" = "v12345" ] || { echo "value lost across a clean restart: '$got'"; cat "$D/srv2.out"; exit 1; }
-"$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -Eq '^dfkv_slab_unclean_resets_total(\{[^}]*\})? 0$' || {
-  echo "restart after SIGTERM was not a clean start"
-  "$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep unclean || true
+"$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -Eq '^dfkv_lse_recovery_records_rejected(\{[^}]*\})? 0$' || {
+  echo "restart after SIGTERM rejected recovered LSE records"
+  "$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep lse_recovery || true
   cat "$D/srv2.out"
   exit 1
 }

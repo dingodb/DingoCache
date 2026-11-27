@@ -447,6 +447,40 @@ LogStore::LogStore(Options opt, bool* ok) : opt_(std::move(opt)) {
                       first_foreign +
                       "); inspect them, nothing was changed");
     if (super && !marker) return OpenStore();
+    if (super && marker) {
+      // InitStore truncates the marker, journal and superblock. Before any of
+      // those writes, reject a real development-format superblock from an
+      // interrupted initialization. Malformed final-format remnants retain
+      // the previous init/recovery behavior; an I/O failure never falls
+      // through to destructive reinitialization.
+      const std::string path = (root / kSuperName).string();
+      const int fd = io_->Open(path, O_RDONLY, 0);
+      if (fd < 0)
+        return SetErrno("cannot open lse_super before initialization", errno);
+      AlignedBuf buf(2 * kBlockBytes);
+      if (buf.p == nullptr) {
+        io_->Close(fd);
+        return SetError("out of memory");
+      }
+      if (!PreadAll(io_.get(), fd, buf.p, 2 * kBlockBytes, 0)) {
+        const int saved_errno = errno;
+        io_->Close(fd);
+        return SetErrno("cannot read lse_super before initialization",
+                        saved_errno);
+      }
+      bool development = false;
+      for (int copy = 0; copy < 2; ++copy) {
+        lse::Superblock ignored;
+        development |= lse::DecodeSuperblock(
+                           reinterpret_cast<const uint8_t*>(buf.p) +
+                               copy * kBlockBytes,
+                           /*allow_development=*/false, &ignored) ==
+                       lse::DecodeError::kDevelopmentFormat;
+      }
+      io_->Close(fd);
+      if (development)
+        return SetError("lse_super is not usable: development format");
+    }
     if (!marker && (fs::exists(root / kJournalName, ec) ||
                     fs::exists(root / kSegmentsDir, ec)))
       return SetError(

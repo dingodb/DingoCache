@@ -227,12 +227,16 @@ int main(int argc, char** argv) {
   // that does not parse must stop the start, not become the default.
   const unsigned long long max_msg = args.GetU64("--max-msg", 32ull << 20);
   (void)max_msg;  // the hard payload ceiling of the RDMA server
-  // The explicit flag wins over DFKV_STORE_ENGINE. With neither present,
-  // DiskCacheGroup resolves "auto": empty directories get log; existing ones
-  // retain the engine indicated by their format.
-  std::string store_engine = args.Get("--store-engine", "");
-  if (!store_engine.empty())
+  // A nonempty explicit flag wins over DFKV_STORE_ENGINE. An explicitly empty
+  // value resets that environment override too; an absent flag leaves the
+  // environment alone. Automatic resolution uses log for an empty directory
+  // and retains the engine indicated by an existing directory's format.
+  const std::string store_engine = args.Get("--store-engine", "");
+  if (!store_engine.empty()) {
     ::setenv("DFKV_STORE_ENGINE", store_engine.c_str(), 1);
+  } else if (args.Has("--store-engine")) {
+    ::unsetenv("DFKV_STORE_ENGINE");
+  }
   // Slab write mode: "direct" (default; page-cache-free) | "buffered" opt-out.
   std::string slab_write = args.Get("--slab-write", "");
   if (!slab_write.empty()) ::setenv("DFKV_SLAB_WRITE", slab_write.c_str(), 1);
