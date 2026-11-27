@@ -715,8 +715,17 @@ class ChurnRun:
             self.writer = self.open_client("writer", 1000)
         if self.scenario in ("poll-skew", "independent-cooling"):
             self.remover = self.open_client("remover", 1000)
+        # A faster client that discovers a 10 s poller grows S from 11 s to
+        # 110 s and deliberately keeps C/B closed until that history exists.
+        # The 40 s generic wait is valid only for uniform fast polling.
+        gate_timeout_s = max(40.0, 11 * poll_max_ms / 1000 + 20)
+        self.result["gate_wait_evidence"] = {
+            "configured_timeout_s": gate_timeout_s,
+            "configured_poll_max_ms": poll_max_ms,
+            "s_growing_wait_ms": 11 * poll_max_ms,
+        }
         for client in self.clients.values():
-            self.wait_gate(client, True)
+            self.wait_gate(client, True, timeout=gate_timeout_s)
         registry = self.registry()
         polls = [int(value) for value in re.findall(r"poll_ms=(\d+)", registry)]
         self.result["h_evidence"].update({
