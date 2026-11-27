@@ -1,7 +1,7 @@
-// StoreEngine wiring: DiskCacheGroup defaults to the production slab backend;
-// file-per-block KVStore remains an explicit diagnostic choice. Options.engine
-// overrides DFKV_STORE_ENGINE, which in turn overrides the slab default. Both
-// engines must round-trip and route across disks identically.
+// StoreEngine wiring: DiskCacheGroup defaults to auto; a new/empty directory
+// gets log and existing file/slab/log directories retain their engine.
+// Options.engine overrides DFKV_STORE_ENGINE, which overrides the auto default.
+// All backends must round-trip and route across disks identically.
 #include "cache/disk_cache_group.h"
 #include "cache/ram_tier.h"
 #include "cache/kv_node_server.h"
@@ -210,7 +210,6 @@ TEST_F(EngineTest, BackendRangeConformanceTable) {
 
   add_disk_backend("file", base_ / "file");
   add_disk_backend("slab", base_ / "slab");
-  ::setenv("DFKV_LSE_EXPERIMENTAL", "1", 1);
   add_disk_backend("log", base_ / "log");
 
   RamTier::Options ram_options;
@@ -240,16 +239,19 @@ TEST_F(EngineTest, BackendRangeConformanceTable) {
     ExpectSharedRangeContract(backend.first, backend.second);
 }
 
-TEST_F(EngineTest, NoOptionOrEnvironmentDefaultsToSlab) {
+TEST_F(EngineTest, NoOptionOrEnvironmentDefaultsToAutoAndLogOnEmpty) {
   DiskCacheGroup::Options o;
   o.cache_dirs = Dirs(1);
   o.capacity_bytes = 1ull << 30;
   DiskCacheGroup g(o);
   ASSERT_TRUE(g.Healthy()) << g.StartupError();
-  EXPECT_EQ(g.EngineName(), "slab");
-  std::string v(64, 's');
+  EXPECT_EQ(g.EngineName(), "log");
+  EXPECT_EQ(g.DiskEngineName(0), "log");
+  std::string v(64, 'l');
   ASSERT_EQ(g.Cache(BlockKey{7, 0}, v.data(), v.size()), Status::kOk);
-  EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "slots.tbl"));
+  EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "lse_super"));
+  EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "lse_journal"));
+  EXPECT_FALSE(fs::exists(fs::path(o.cache_dirs[0]) / "slots.tbl"));
   EXPECT_FALSE(fs::exists(fs::path(o.cache_dirs[0]) / "blocks"));
 }
 
@@ -299,18 +301,19 @@ TEST_F(EngineTest, InvalidEngineAndSlabConfigurationFailClosed) {
             std::string::npos);
 }
 
-TEST_F(EngineTest, InvalidDefaultSlabCapacityRefusesStartup) {
+TEST_F(EngineTest, InvalidExplicitSlabCapacityRefusesStartup) {
   const auto dirs = Dirs(1);
   DiskCacheGroup::Options options;
   options.cache_dirs = dirs;
   options.capacity_bytes = (1ull << 30) + 1;
+  options.engine = "slab";
   DiskCacheGroup group(options);
   EXPECT_EQ(group.EngineName(), "slab");
   EXPECT_FALSE(group.Healthy());
   EXPECT_NE(group.StartupError().find("multiple"), std::string::npos);
   EXPECT_FALSE(fs::exists(fs::path(dirs[0]) / "blocks"));
 
-  KvNodeServer server(dirs[0], options.capacity_bytes);
+  KvNodeServer server(options);
   EXPECT_EQ(server.engine_name(), "slab");
   EXPECT_FALSE(server.Healthy());
   EXPECT_EQ(server.Start(0), Status::kIOError);
@@ -382,29 +385,30 @@ TEST_F(EngineTest, RequestedRamTierFailureRefusesDiskOnlyStartup) {
 }
 
 // ---- engine selection per directory (log-structured engine design §10) ------
-// "auto" and "log" are experimental: without DFKV_LSE_EXPERIMENTAL=1 they are
-// refused, so no existing configuration can pick them up by accident.
-TEST_F(EngineTest, AutoAndLogNeedTheExperimentalFlag) {
-  for (const char* engine : {"auto", "log"}) {
-    SCOPED_TRACE(engine);
-    DiskCacheGroup::Options o;
-    o.cache_dirs = Dirs(1);
-    o.capacity_bytes = 1ull << 30;
-    o.engine = engine;
-    DiskCacheGroup g(o);
-    EXPECT_FALSE(g.Healthy());
-    EXPECT_NE(g.StartupError().find("DFKV_LSE_EXPERIMENTAL"),
-              std::string::npos)
-        << g.StartupError();
-    EXPECT_TRUE(fs::is_empty(o.cache_dirs[0])) << "nothing was created";
+// Stage 10 retired the selector experiment gate: the old variable is inert,
+// including values that used to reject auto and log.
+TEST_F(EngineTest, ExperimentalEnvironmentHasNoEffectOnAutoOrLog) {
+  for (const char* flag : {"0", "", "true", "yes", "1 ", " 1", "01", "2"}) {
+    ::setenv("DFKV_LSE_EXPERIMENTAL", flag, 1);
+    for (const char* engine : {"auto", "log"}) {
+      SCOPED_TRACE(std::string(engine) + " experimental=[" + flag + "]");
+      DiskCacheGroup::Options o;
+      o.cache_dirs = Dirs(1);
+      o.capacity_bytes = 1ull << 30;
+      o.engine = engine;
+      DiskCacheGroup g(o);
+      ASSERT_TRUE(g.Healthy()) << g.StartupError();
+      EXPECT_EQ(g.EngineName(), "log");
+      EXPECT_EQ(g.DiskEngineName(0), "log");
+      EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "lse_super"));
+    }
   }
 }
 
-// "auto" chooses per directory: an empty one gets the default (slab until
-// the log engine is accepted), a slab or file directory keeps its engine, and
-// a node may mix them. Per-disk views follow each disk's own engine.
+// "auto" chooses per directory: an empty one gets log, a slab or file
+// directory keeps its engine, and a node may mix them. Per-disk views follow
+// each disk's own engine.
 TEST_F(EngineTest, AutoChoosesEachDirectorysEngine) {
-  ::setenv("DFKV_LSE_EXPERIMENTAL", "1", 1);
   const auto dirs = Dirs(3);
   std::string value(64, 'a');
   {
@@ -430,35 +434,35 @@ TEST_F(EngineTest, AutoChoosesEachDirectorysEngine) {
   EXPECT_EQ(g.EngineName(), "mixed");
   EXPECT_TRUE(g.HasSlabDisks());
   ASSERT_EQ(g.DiskCount(), 3u);
-  EXPECT_EQ(g.DiskEngineName(0), "slab") << "empty: the default engine";
+  EXPECT_EQ(g.DiskEngineName(0), "log") << "empty: the stage-10 default";
   EXPECT_EQ(g.DiskEngineName(1), "file");
   EXPECT_EQ(g.DiskEngineName(2), "slab");
   // Slab-only per-disk views are indexed by disk, not by slab disk.
-  EXPECT_NE(g.DiskWatermarkObservation(0).capacity_bytes, 0u);
+  EXPECT_EQ(g.DiskWatermarkObservation(0).capacity_bytes, 0u)
+      << "the log disk has no slab observation";
   EXPECT_EQ(g.DiskWatermarkObservation(1).capacity_bytes, 0u)
       << "the file disk has no slab observation";
   EXPECT_NE(g.DiskWatermarkObservation(2).capacity_bytes, 0u);
 }
 
 TEST_F(EngineTest, AutoOnAllSlabDirectoriesIsSlab) {
-  ::setenv("DFKV_LSE_EXPERIMENTAL", "1", 1);
   DiskCacheGroup::Options o;
   o.cache_dirs = Dirs(2);
   o.capacity_bytes = 2ull << 30;
-  o.engine = "auto";
+  o.engine = "slab";
   {
-    DiskCacheGroup first(o);  // both empty: slab
+    DiskCacheGroup first(o);
     ASSERT_TRUE(first.Healthy()) << first.StartupError();
     EXPECT_EQ(first.EngineName(), "slab");
   }
-  DiskCacheGroup again(o);  // both slab now
+  o.engine = "auto";
+  DiskCacheGroup again(o);
   ASSERT_TRUE(again.Healthy()) << again.StartupError();
   EXPECT_EQ(again.EngineName(), "slab");
 }
 
 // What "auto" and "log" refuse, without changing anything in the directory.
 TEST_F(EngineTest, AutoAndLogRefuseWhatTheyDoNotOwn) {
-  ::setenv("DFKV_LSE_EXPERIMENTAL", "1", 1);
   struct Case {
     const char* engine;
     std::vector<const char*> files;
@@ -501,16 +505,16 @@ TEST_F(EngineTest, AutoAndLogRefuseWhatTheyDoNotOwn) {
 // whose lost+found holds files opens as before (and creating one in a
 // directory holding anything stays refused by slab itself).
 TEST_F(EngineTest, AutoKeepsSlabsBehaviourForLostAndFound) {
-  ::setenv("DFKV_LSE_EXPERIMENTAL", "1", 1);
   DiskCacheGroup::Options o;
   o.cache_dirs = Dirs(1);
   o.capacity_bytes = 1ull << 30;
-  o.engine = "auto";
+  o.engine = "slab";
   {
     DiskCacheGroup created(o);
     ASSERT_TRUE(created.Healthy()) << created.StartupError();
     EXPECT_EQ(created.EngineName(), "slab");
   }
+  o.engine = "auto";
   fs::create_directories(fs::path(o.cache_dirs[0]) / "lost+found");
   std::ofstream(fs::path(o.cache_dirs[0]) / "lost+found" / "#4711") << "x";
   DiskCacheGroup again(o);
@@ -519,37 +523,25 @@ TEST_F(EngineTest, AutoKeepsSlabsBehaviourForLostAndFound) {
   EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "lost+found" / "#4711"));
 }
 
-// The environment selects "auto" as the option does, and only the exact
-// value 1 lets it through.
-TEST_F(EngineTest, AutoFromTheEnvironmentNeedsExactlyOne) {
+// The environment selects auto as the option does, independent of the
+// retired experimental variable.
+TEST_F(EngineTest, AutoFromTheEnvironmentUsesLogOnEmpty) {
   ::setenv("DFKV_STORE_ENGINE", "auto", 1);
-  for (const char* flag : {"0", "", "true", "yes", "1 ", " 1", "01", "2"}) {
-    SCOPED_TRACE(std::string("[") + flag + "]");
-    ::setenv("DFKV_LSE_EXPERIMENTAL", flag, 1);
-    DiskCacheGroup::Options o;
-    o.cache_dirs = Dirs(1);
-    o.capacity_bytes = 1ull << 30;
-    DiskCacheGroup g(o);
-    EXPECT_FALSE(g.Healthy());
-    EXPECT_NE(g.StartupError().find("DFKV_LSE_EXPERIMENTAL=1"),
-              std::string::npos)
-        << g.StartupError();
-    EXPECT_TRUE(fs::is_empty(o.cache_dirs[0])) << "nothing was created";
-  }
-  ::setenv("DFKV_LSE_EXPERIMENTAL", "1", 1);
+  ::setenv("DFKV_LSE_EXPERIMENTAL", "0", 1);
   DiskCacheGroup::Options o;
   o.cache_dirs = Dirs(1);
   o.capacity_bytes = 1ull << 30;
   DiskCacheGroup g(o);
   ASSERT_TRUE(g.Healthy()) << g.StartupError();
-  EXPECT_EQ(g.EngineName(), "slab") << "auto on an empty directory";
+  EXPECT_EQ(g.EngineName(), "log");
+  EXPECT_EQ(g.DiskEngineName(0), "log");
+  EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "lse_super"));
 }
 
 // A node whose disks run different engines: the per-disk slab samples list
 // the slab disks only, and retention is the slab disks' (the file engine
 // keeps none, and would read as disabled with no TTL).
 TEST_F(EngineTest, MixedNodeReportsSlabViewsForSlabDisksOnly) {
-  ::setenv("DFKV_LSE_EXPERIMENTAL", "1", 1);
   const auto dirs = Dirs(2);
   {
     DiskCacheGroup::Options o;
@@ -607,7 +599,6 @@ TEST_F(EngineTest, MixedNodeReportsSlabViewsForSlabDisksOnly) {
 // The log engine behind the group: the same round trips as the others, a
 // restart keeps what was stored, and "auto" finds the log directory again.
 TEST_F(EngineTest, LogEngineRoundTripsAcrossDisksAndRestarts) {
-  ::setenv("DFKV_LSE_EXPERIMENTAL", "1", 1);
   DiskCacheGroup::Options o;
   o.cache_dirs = Dirs(3);
   o.capacity_bytes = 3ull << 30;

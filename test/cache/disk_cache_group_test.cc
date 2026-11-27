@@ -6,6 +6,7 @@
 #include "cache/log_store.h"
 #include "cache/lse_io.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <unistd.h>
 
@@ -100,6 +101,25 @@ class ScopedEnv {
 
  private:
   std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
+
+class ScopedUnsetEnv {
+ public:
+  explicit ScopedUnsetEnv(const char* name) : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      had_old_ = true;
+      old_ = old;
+    }
+    ::unsetenv(name);
+  }
+  ~ScopedUnsetEnv() {
+    if (had_old_) ::setenv(name_, old_.c_str(), 1);
+  }
+
+ private:
+  const char* name_;
   std::string old_;
   bool had_old_ = false;
 };
@@ -1749,4 +1769,393 @@ TEST_F(DiskGroupTest, SlabBalanceSettingIsZeroOrOne) {
     EXPECT_NE(group.StartupError().find("DFKV_SLAB_BALANCE"), std::string::npos)
         << group.StartupError();
   }
+}
+
+namespace {
+
+// Stage-10 selection tests use real stores, including valid superblocks and
+// payload-bearing slab/file directories, rather than stand-in marker names.
+bool CreateActualStore(const fs::path& dir, const char* engine) {
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {dir.string()};
+  options.capacity_bytes = 1ull << 30;
+  options.engine = engine;
+  DiskCacheGroup group(options);
+  const std::string value = std::string("created-by-") + engine;
+  return group.Healthy() &&
+         group.Cache(BlockKey{0x7100, 0x7200}, value.data(), value.size()) ==
+             Status::kOk;
+}
+
+bool ReadAt(int fd, void* data, size_t size, off_t offset) {
+  return ::pread(fd, data, size, offset) == static_cast<ssize_t>(size);
+}
+
+bool WriteAt(int fd, const void* data, size_t size, off_t offset) {
+  return ::pwrite(fd, data, size, offset) == static_cast<ssize_t>(size);
+}
+
+// Adds only the development feature bit, recomputing the real DFKVLSE1 block
+// CRCs. This is fixture setup, distinct from the intended open refusal.
+bool MarkDevelopmentSuperblocks(const fs::path& dir, bool both_copies) {
+  const auto path = dir / "lse_super";
+  const int fd = ::open(path.c_str(), O_RDWR);
+  if (fd < 0) return false;
+  bool ok = true;
+  const int copies = both_copies ? 2 : 1;
+  for (int copy = 0; copy < copies; ++copy) {
+    lse::Block block{};
+    lse::Superblock super;
+    ok = ReadAt(fd, block.data(), block.size(), copy * lse::kBlockBytes) &&
+         lse::DecodeSuperblock(block.data(), true, &super) ==
+             lse::DecodeError::kOk;
+    if (!ok) break;
+    super.incompat_features |= lse::kIncompatDevelopmentFormat;
+    block = lse::EncodeSuperblock(super);
+    ok = WriteAt(fd, block.data(), block.size(), copy * lse::kBlockBytes);
+    if (!ok) break;
+  }
+  if (ok && ::fsync(fd) != 0) ok = false;
+  ::close(fd);
+  return ok;
+}
+
+bool FinalSuperblocks(const fs::path& dir) {
+  const int fd = ::open((dir / "lse_super").c_str(), O_RDONLY);
+  if (fd < 0) return false;
+  for (int copy = 0; copy < 2; ++copy) {
+    lse::Block block{};
+    lse::Superblock super;
+    const bool ok =
+        ReadAt(fd, block.data(), block.size(), copy * lse::kBlockBytes) &&
+        lse::DecodeSuperblock(block.data(), false, &super) ==
+            lse::DecodeError::kOk &&
+        (super.incompat_features & lse::kIncompatDevelopmentFormat) == 0;
+    if (!ok) {
+      ::close(fd);
+      return false;
+    }
+  }
+  ::close(fd);
+  return true;
+}
+
+std::map<std::string, std::string> TreeSnapshot(const fs::path& dir) {
+  std::map<std::string, std::string> out;
+  for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+    if (!entry.is_regular_file()) continue;
+    const uint64_t size = entry.file_size();
+    std::ifstream in(entry.path(), std::ios::binary);
+    // Metadata is compared in full. Large preallocated slab/segment files are
+    // compared by shape and their first/last pages, without reading GiBs into
+    // a unit-test process merely to prove a failed open left them untouched.
+    std::string state = std::to_string(size) + ":";
+    if (size <= 131072) {
+      state.append(std::istreambuf_iterator<char>(in),
+                   std::istreambuf_iterator<char>());
+    } else {
+      char first[4096];
+      char last[4096];
+      in.read(first, sizeof(first));
+      state.append(first, in.gcount());
+      in.seekg(-static_cast<std::streamoff>(sizeof(last)), std::ios::end);
+      in.read(last, sizeof(last));
+      state.append(last, in.gcount());
+    }
+    out[fs::relative(entry.path(), dir).string()] = std::move(state);
+  }
+  return out;
+}
+
+enum class ActualDirKind { kEmpty, kSlab, kLog, kFile, kConflict, kForeign,
+                           kDevelopmentLog };
+
+const char* ActualDirKindName(ActualDirKind kind) {
+  switch (kind) {
+    case ActualDirKind::kEmpty: return "empty";
+    case ActualDirKind::kSlab: return "slab";
+    case ActualDirKind::kLog: return "log";
+    case ActualDirKind::kFile: return "file";
+    case ActualDirKind::kConflict: return "conflict";
+    case ActualDirKind::kForeign: return "foreign";
+    case ActualDirKind::kDevelopmentLog: return "development-log";
+  }
+  return "unknown";
+}
+
+bool MakeActualDir(const fs::path& dir, ActualDirKind kind) {
+  fs::create_directories(dir);
+  switch (kind) {
+    case ActualDirKind::kEmpty:
+      return true;
+    case ActualDirKind::kSlab:
+      if (!CreateActualStore(dir, "slab")) return false;
+      // Harmless legacy sidecar content must not change slab ownership.
+      std::ofstream(dir / "operator-note.txt") << "keep this note";
+      return true;
+    case ActualDirKind::kLog:
+      return CreateActualStore(dir, "log");
+    case ActualDirKind::kFile:
+      return CreateActualStore(dir, "file");
+    case ActualDirKind::kDevelopmentLog:
+      return CreateActualStore(dir, "log") &&
+             MarkDevelopmentSuperblocks(dir, true);
+    case ActualDirKind::kConflict: {
+      if (!CreateActualStore(dir, "slab")) return false;
+      const fs::path other = dir.parent_path() /
+                             (dir.filename().string() + "-actual-log");
+      if (!CreateActualStore(other, "log")) return false;
+      // Both metadata-bearing formats are now physically present. The
+      // startup contract must reject this root, never try either engine.
+      return fs::copy_file(other / "lse_super", dir / "lse_super") &&
+             fs::copy_file(other / "lse_journal", dir / "lse_journal");
+    }
+    case ActualDirKind::kForeign:
+      std::ofstream(dir / "notes.txt") << "not a cache store";
+      return true;
+  }
+  return false;
+}
+
+bool SelectedByAuto(ActualDirKind kind, std::string* resolved) {
+  switch (kind) {
+    case ActualDirKind::kEmpty:
+    case ActualDirKind::kLog: *resolved = "log"; return true;
+    case ActualDirKind::kSlab: *resolved = "slab"; return true;
+    case ActualDirKind::kFile: *resolved = "file"; return true;
+    default: return false;
+  }
+}
+
+void ExpectWholeValue(DiskCacheGroup& group, const BlockKey& key,
+                      const std::string& value) {
+  ASSERT_TRUE(group.IsCached(key));
+  ValueMetadata metadata;
+  ASSERT_EQ(group.Lookup(key, &metadata), Status::kOk);
+  EXPECT_EQ(metadata.value_len, value.size());
+  std::string out;
+  size_t value_len = 0;
+  ASSERT_EQ(group.Range(key, 0, 0, &out, &value_len), Status::kOk);
+  EXPECT_EQ(out, value);
+  EXPECT_EQ(value_len, value.size());
+  std::vector<char> into(value.size() + 64);
+  size_t out_len = 0;
+  value_len = 0;
+  ASSERT_EQ(group.RangeInto(key, 0, 0, into.data(), into.size(), &out_len,
+                            &value_len),
+            Status::kOk);
+  EXPECT_EQ(std::string(into.data(), out_len), value);
+  EXPECT_EQ(value_len, value.size());
+  alignas(4096) char direct[32768];
+  ASSERT_LE(value.size(), sizeof(direct));
+  const char* direct_data = nullptr;
+  out_len = 0;
+  value_len = 0;
+  ASSERT_EQ(group.RangeDirect(key, 0, 0, direct, sizeof(direct),
+                              &direct_data, &out_len, &value_len),
+            Status::kOk);
+  EXPECT_EQ(std::string(direct_data, out_len), value);
+  EXPECT_EQ(value_len, value.size());
+}
+
+}  // namespace
+
+TEST_F(DiskGroupTest, StageTenSelectionMatrixUsesActualStoreFormats) {
+  const ActualDirKind kinds[] = {
+      ActualDirKind::kEmpty, ActualDirKind::kSlab, ActualDirKind::kLog,
+      ActualDirKind::kFile, ActualDirKind::kConflict,
+      ActualDirKind::kForeign, ActualDirKind::kDevelopmentLog};
+  const char* engines[] = {"auto", "slab", "log", "file"};
+  for (const auto kind : kinds) {
+    for (const char* engine : engines) {
+      SCOPED_TRACE(std::string(ActualDirKindName(kind)) + "/" + engine);
+      const fs::path dir = base_ / "selection-matrix" /
+                           ActualDirKindName(kind) / engine;
+      ASSERT_TRUE(MakeActualDir(dir, kind)) << "fixture setup failed";
+      const auto before = TreeSnapshot(dir);
+      DiskCacheGroup::Options options;
+      options.cache_dirs = {dir.string()};
+      options.capacity_bytes = 1ull << 30;
+      options.engine = engine;
+      DiskCacheGroup group(options);
+
+      std::string auto_engine;
+      const bool auto_accepts = SelectedByAuto(kind, &auto_engine);
+      const bool explicit_accepts =
+          (kind == ActualDirKind::kEmpty) ||
+          (kind == ActualDirKind::kSlab && std::strcmp(engine, "slab") == 0) ||
+          (kind == ActualDirKind::kLog && std::strcmp(engine, "log") == 0) ||
+          (kind == ActualDirKind::kFile && std::strcmp(engine, "file") == 0);
+      const bool accepted =
+          std::strcmp(engine, "auto") == 0 ? auto_accepts : explicit_accepts;
+      if (!accepted) {
+        EXPECT_FALSE(group.Healthy());
+        EXPECT_FALSE(group.StartupError().empty());
+        if (kind == ActualDirKind::kDevelopmentLog &&
+            (std::strcmp(engine, "auto") == 0 ||
+             std::strcmp(engine, "log") == 0)) {
+          EXPECT_NE(group.StartupError().find("development format"),
+                    std::string::npos)
+              << group.StartupError();
+        }
+        EXPECT_EQ(TreeSnapshot(dir), before)
+            << "failed startup changed the existing directory";
+        continue;
+      }
+      ASSERT_TRUE(group.Healthy()) << group.StartupError();
+      const std::string expected =
+          std::strcmp(engine, "auto") == 0 ? auto_engine : engine;
+      EXPECT_EQ(group.EngineName(), expected);
+      EXPECT_EQ(group.DiskEngineName(0), expected);
+      if (kind == ActualDirKind::kSlab) {
+        EXPECT_TRUE(fs::exists(dir / "operator-note.txt"));
+      }
+    }
+  }
+}
+
+TEST_F(DiskGroupTest, AutoConstructsMixedSlabLogAndFileDisks) {
+  const auto dirs = Dirs(3);
+  ASSERT_TRUE(CreateActualStore(dirs[0], "slab"));
+  ASSERT_TRUE(CreateActualStore(dirs[1], "log"));
+  ASSERT_TRUE(CreateActualStore(dirs[2], "file"));
+  DiskCacheGroup::Options options;
+  options.cache_dirs = dirs;
+  options.capacity_bytes = 3ull << 30;
+  options.engine = "auto";
+  DiskCacheGroup group(options);
+  ASSERT_TRUE(group.Healthy()) << group.StartupError();
+  EXPECT_EQ(group.EngineName(), "mixed");
+  EXPECT_EQ(group.DiskEngineName(0), "slab");
+  EXPECT_EQ(group.DiskEngineName(1), "log");
+  EXPECT_EQ(group.DiskEngineName(2), "file");
+  EXPECT_EQ(group.DiskObjects(0), 1u);
+  EXPECT_EQ(group.DiskObjects(1), 1u);
+  EXPECT_EQ(group.DiskObjects(2), 1u);
+}
+
+TEST_F(DiskGroupTest, ClassificationRaceCannotHideSlabLogConflict) {
+  const auto dirs = Dirs(2);
+  ASSERT_TRUE(CreateActualStore(dirs[0], "slab"));
+  ASSERT_TRUE(CreateActualStore(dirs[1], "log"));
+  const auto before = TreeSnapshot(dirs[0]);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {dirs[0]};
+  options.capacity_bytes = 1ull << 30;
+  options.engine = "auto";
+  options.after_classify_for_test = [&](const std::string& dir) {
+    // Deterministic handoff: classification saw slab, then an actual valid
+    // LSE superblock appears before the selected engine opens the root.
+    ASSERT_EQ(dir, dirs[0]);
+    ASSERT_TRUE(fs::copy_file(dirs[1] + "/lse_super",
+                              fs::path(dir) / "lse_super"));
+  };
+  DiskCacheGroup group(options);
+  EXPECT_FALSE(group.Healthy());
+  EXPECT_NE(group.StartupError().find("slab and log"), std::string::npos)
+      << group.StartupError();
+  const auto after = TreeSnapshot(dirs[0]);
+  for (const auto& original : before) {
+    auto found = after.find(original.first);
+    ASSERT_NE(found, after.end()) << original.first;
+    EXPECT_EQ(found->second, original.second) << original.first;
+  }
+  EXPECT_TRUE(fs::exists(dirs[0] + "/lse_super"))
+      << "the new format was not hidden or removed";
+}
+
+TEST_F(DiskGroupTest, DefaultAutoPersistsEveryDirectWriteAndRemove) {
+  // This deliberately clears the unit-test-wide file default and sets the
+  // retired experiment variable to a formerly disabling value.
+  ScopedUnsetEnv engine("DFKV_STORE_ENGINE");
+  ScopedEnv old_gate("DFKV_LSE_EXPERIMENTAL", "0");
+  const auto dirs = Dirs(1);
+  const BlockKey ordinary_key{0x8101, 0x9101};
+  const BlockKey direct_key{0x8102, 0x9102};
+  const BlockKey batch_key1{0x8103, 0x9103};
+  const BlockKey batch_key2{0x8104, 0x9104};
+  const std::string ordinary_value(6000, 'o');
+  const std::array<std::string, 3> direct_values = {
+      std::string(5000, 'd'), std::string(7000, 'b'), std::string(9000, 'c')};
+  alignas(4096) char direct_buffer[32768] = {};
+  alignas(4096) char batch_buffer1[32768] = {};
+  alignas(4096) char batch_buffer2[32768] = {};
+
+  auto write_all = [&](DiskCacheGroup& group) {
+    ASSERT_EQ(group.EngineName(), "log");
+    ASSERT_EQ(group.Cache(ordinary_key, ordinary_value.data(),
+                          ordinary_value.size()),
+              Status::kOk);
+    std::memcpy(direct_buffer, direct_values[0].data(),
+                direct_values[0].size());
+    ASSERT_EQ(group.CacheDirect(direct_key, direct_buffer,
+                                direct_values[0].size(), sizeof(direct_buffer)),
+              Status::kOk);
+    std::memcpy(batch_buffer1, direct_values[1].data(),
+                direct_values[1].size());
+    std::memcpy(batch_buffer2, direct_values[2].data(),
+                direct_values[2].size());
+    const std::vector<StoreEngine::CacheBatchItem> items = {
+        {batch_key1, batch_buffer1, direct_values[1].size(),
+         sizeof(batch_buffer1)},
+        {batch_key2, batch_buffer2, direct_values[2].size(),
+         sizeof(batch_buffer2)}};
+    const auto statuses = group.CacheDirectBatch(items);
+    ASSERT_EQ(statuses.size(), 2u);
+    EXPECT_EQ(statuses[0], Status::kOk);
+    EXPECT_EQ(statuses[1], Status::kOk);
+    ASSERT_NO_FATAL_FAILURE(ExpectWholeValue(group, ordinary_key,
+                                             ordinary_value));
+    ASSERT_NO_FATAL_FAILURE(ExpectWholeValue(group, direct_key,
+                                             direct_values[0]));
+    ASSERT_NO_FATAL_FAILURE(ExpectWholeValue(group, batch_key1,
+                                             direct_values[1]));
+    ASSERT_NO_FATAL_FAILURE(ExpectWholeValue(group, batch_key2,
+                                             direct_values[2]));
+  };
+
+  {
+    DiskCacheGroup::Options options;
+    options.cache_dirs = dirs;
+    options.capacity_bytes = 1ull << 30;
+    DiskCacheGroup group(options);
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    // Not just resolve a string: create and exercise the real LSE selected by
+    // the unset option/environment path.
+    write_all(group);
+    EXPECT_TRUE(FinalSuperblocks(dirs[0]));
+  }
+
+  DiskCacheGroup::Options reopen_options;
+  reopen_options.cache_dirs = dirs;
+  reopen_options.capacity_bytes = 1ull << 30;
+  {
+    DiskCacheGroup reopened(reopen_options);
+    ASSERT_TRUE(reopened.Healthy()) << reopened.StartupError();
+    ASSERT_EQ(reopened.EngineName(), "log");
+    ASSERT_NO_FATAL_FAILURE(ExpectWholeValue(reopened, ordinary_key,
+                                             ordinary_value));
+    ASSERT_NO_FATAL_FAILURE(ExpectWholeValue(reopened, direct_key,
+                                             direct_values[0]));
+    ASSERT_NO_FATAL_FAILURE(ExpectWholeValue(reopened, batch_key1,
+                                             direct_values[1]));
+    ASSERT_NO_FATAL_FAILURE(ExpectWholeValue(reopened, batch_key2,
+                                             direct_values[2]));
+    ASSERT_EQ(reopened.Remove(direct_key), Status::kOk);
+  }
+
+  DiskCacheGroup after_remove(reopen_options);
+  ASSERT_TRUE(after_remove.Healthy()) << after_remove.StartupError();
+  EXPECT_EQ(after_remove.EngineName(), "log");
+  EXPECT_FALSE(after_remove.IsCached(direct_key));
+  ValueMetadata missing;
+  EXPECT_EQ(after_remove.Lookup(direct_key, &missing), Status::kNotFound);
+  std::string out;
+  EXPECT_EQ(after_remove.Range(direct_key, 0, 0, &out), Status::kNotFound);
+  ASSERT_NO_FATAL_FAILURE(ExpectWholeValue(after_remove, ordinary_key,
+                                           ordinary_value));
+  ASSERT_NO_FATAL_FAILURE(ExpectWholeValue(after_remove, batch_key1,
+                                           direct_values[1]));
+  ASSERT_NO_FATAL_FAILURE(ExpectWholeValue(after_remove, batch_key2,
+                                           direct_values[2]));
 }

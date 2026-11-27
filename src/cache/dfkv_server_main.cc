@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
       "  --weight <n>         consistent-hash weight (default 1)\n"
       "  --metrics-port <p>   enable Prometheus /metrics (omit = off); --metrics-bind <addr>\n"
       "  --mds-registration-timeout-ms <n>  first MDS registration deadline (default 60000; env DFKV_MDS_REGISTRATION_TIMEOUT_MS)\n"
-      "  --store-engine <e>   storage backend: slab | file (default slab)\n"
+      "  --store-engine <e>   slab | file | auto | log (default auto: empty=log, existing kept)\n"
       "  --slab-write <m>     slab I/O mode: direct | buffered (default direct)\n"
       "  --ram-tier <on|off>  RAM hot tier + RDMA zero-copy GET (default off)\n"
       "  --ram-tier-bytes <n> RAM arena size in bytes (default 16 GiB; pre-faulted and locked in\n"
@@ -228,7 +228,8 @@ int main(int argc, char** argv) {
   const unsigned long long max_msg = args.GetU64("--max-msg", 32ull << 20);
   (void)max_msg;  // the hard payload ceiling of the RDMA server
   // The explicit flag wins over DFKV_STORE_ENGINE. With neither present,
-  // DiskCacheGroup resolves the single production default, "slab".
+  // DiskCacheGroup resolves "auto": empty directories get log; existing ones
+  // retain the engine indicated by their format.
   std::string store_engine = args.Get("--store-engine", "");
   if (!store_engine.empty())
     ::setenv("DFKV_STORE_ENGINE", store_engine.c_str(), 1);
