@@ -300,7 +300,9 @@ echo "mds etcd-probe smoke OK"
 # pre-fault itself is given up is proven by a unit test).
 kill $PID 2>/dev/null || true
 wait $PID 2>/dev/null || true
-SRV_ENV=(env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_SLAB_WARM_RESTART -u DFKV_LOG)
+# These crash/cancel cases assert slab-specific markers and metrics. Keep the
+# backend explicit now that an unset selector defaults to auto on a fresh root.
+SRV_ENV=(env -u DFKV_SLAB_WRITE -u DFKV_SLAB_WARM_RESTART -u DFKV_LOG DFKV_STORE_ENGINE=slab)
 mkdir "$D/c1"
 : > "$D/c1.out"
 "${SRV_ENV[@]}" "$BUILD/dfkv_server" --dir "$D/c1" --port 0 --cap 1073741824 >>"$D/c1.out" 2>&1 &
