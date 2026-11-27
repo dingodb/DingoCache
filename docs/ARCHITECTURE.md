@@ -460,6 +460,16 @@ eviction, removal, and restart rebuild. A limited tenant bypasses the
 asynchronous RAM write-back admission path so the PUT result reflects durable
 quota admission immediately.
 
+The quota key is a deterministic tenant hash, not a secret: the client supplies
+that identity in each request, without a principal-to-tenant authorization
+check. Per-node durable-payload accounting, including the unlimited default
+for unlisted tenants, therefore enforces disk admission, not hostile-client
+isolation. It does not cap GET-driven installation or promotion into the RAM
+tier, which performs no tenant-quota check. Dynamic or static membership
+changes discovery only and does not add data-plane authentication; the
+network-level trust boundary is defined in
+[DEPLOY.md §0](DEPLOY.md#0-网络模型关键).
+
 ---
 
 ## 6. RAM hot tier (opt-in)

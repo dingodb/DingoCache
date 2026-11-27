@@ -20,7 +20,14 @@ dfkv 把**控制面**与**数据面**解耦：
 - **设备发现与拓扑**：留空时自动发现保持 `ACTIVE`-only（两端各选本地首个 port 1 `ACTIVE` HCA）；显式逗号白名单定义固定 topology，按首次出现顺序去重，server 会接纳**存在但启动时 DOWN** 的设备完成 anchor/MR 初始化并持续监控。运行期至少一条 initialized rail 健康即可承载 placement；最后一条健康 rail 丢失立即退环，0→非 0 恢复仍通过连续采样门。
 - **失败策略**：未设 `DFKV_RDMA` 时选择 TCP；一旦选择 RDMA，显式设备缺失、open/port/GID query 失败，或任一 configured rail 的 anchor、启动时的试注册（初始 receive chunk 注册一次随即释放，`LimitMEMLOCK` 不够时在这里失败）、RAM/user MR 初始化失败，均拒绝启动而不缩小 topology。client 配置 `DFKV_RDMA_RAIL_TIERS` 后还要求 MDS 返回完整 HLT1 peer topology；缺失/不完整或无兼容健康轨以 client-local `kNoCompatibleRail` fail closed，不切 TCP、不惩罚 peer。
 
-- **信任模型（RDMA 数据面）**：server 不鉴别 client，能连到 bootstrap 端口的进程都能建连；隔离的目标是一个出错的 client 不能破坏别的连接，不是防恶意 client。每条连接只拿到覆盖**自己 receive slots** 的 rkey（按连接单独注册，不再是整块 chunk 的 rkey），写别的连接的 slot 会以远端访问错误失败；slot 交给新连接前清零，读不回上一个连接留下的字节；leased PUT 与 GET 用按操作注册、只覆盖本次范围的 MR，用完即撤销。仍未覆盖的：同一设备上所有 MR 共用一个 PD，猜中别的连接 rkey 的恶意 client 可以读或写那块范围，包括仍在有效期内的按操作 READ 授权（GET 的 staging、钉住的 RAM 值），即不仅能破坏、也能读到别人的值；多窗口 PUT 的窗口位置无法验证，覆盖不全时可能存下自己 lease 里已有的字节（staging 不逐次清零）。要防恶意租户需要按 QP 绑定的 memory window，目前未做。
+- **信任模型（RDMA 数据面）**：server 不鉴别 client，能连到 bootstrap 端口的进程都能建连；隔离的目标是一个出错的 client 不能破坏别的连接，不是防恶意 client。每条连接只拿到覆盖**自己 receive slots** 的 rkey（按连接单独注册，不再是整块 chunk 的 rkey），写别的连接的 slot 会以远端访问错误失败；slot 交给新连接前清零，读不回上一个连接留下的字节；leased PUT 与 GET 用按操作注册、只覆盖本次范围的 MR，用完即撤销。仍未覆盖的：同一设备上所有 MR 共用一个 PD，猜中别的连接 rkey 的恶意 client 可以读或写那块范围，包括仍在有效期内的按操作 READ 授权（GET 的 staging、钉住的 RAM 值），即不仅能破坏、也能读到别人的值；多窗口 PUT 的窗口位置无法验证，覆盖不全时可能存下自己 lease 里已有的字节（staging 不逐次清零）。RAM GET 的按 QP 绑定 memory window 已实现为 `DFKV_RDMA_SERVER_MW`（默认 0=关，见配置表与
+  [server-memory-windows](design/server-memory-windows.md)）；它减少已授权范围被其他 QP 猜中后的越权访问，
+  不提供 client 身份或 tenant 授权，也不覆盖上述 PUT/staging 和多窗口边界。
+
+MDS 的注册/心跳/注销、clients 列表、成员 fence/unfence，以及 TCP/RDMA 数据请求均不验证请求者身份。
+tenant 哈希是路由/容量记账标签，不是秘密或授权凭证；tenant quota、memory window、静态成员表都不能单独
+形成恶意租户隔离边界。静态成员表只改变发现路径，不改变数据面的信任模型。生产使用因此仍以受信内网和
+网络层隔离为前提；如需抵御其他可达租户，必须另行定义 MDS、客户端与数据面的认证和混版本迁移契约。
 
 发现：默认走 **MDS 动态发现**（etcd + dfkv_mds，见 §2b）；静态成员表仍作为遗留/单节点备用路径（见 §4-legacy）。无副本（一致性哈希单属主，节点挂 = 该分片 miss → 重算）。
 
