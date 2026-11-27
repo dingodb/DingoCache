@@ -34,18 +34,24 @@ class DiskCacheGroup {
   struct Options {
     std::vector<std::string> cache_dirs;   // one per NVMe SSD
     uint64_t capacity_bytes = (1ull << 30);  // TOTAL, split evenly across disks
-    // Empty reads DFKV_STORE_ENGINE, then selects the production slab backend.
-    // "file" remains available only when explicitly requested for diagnostics.
-    // "auto" (choose per directory by what it holds) and "log" (the
-    // log-structured engine) need DFKV_LSE_EXPERIMENTAL=1 while that engine
-    // is under construction; see docs/design/log-structured-engine.md §10.
+    // Empty reads DFKV_STORE_ENGINE, then selects "auto". "auto" chooses each
+    // directory by what it holds: an empty directory gets log, while existing
+    // file/slab/log stores keep their engine. Explicit file/slab/log stays
+    // explicit; a conflicting or foreign directory refuses to start. See
+    // docs/design/log-structured-engine.md §10.
     std::string engine{};
     // Dependency injection for focused concurrency tests. Production leaves
-    // this empty and constructs the selected file/slab engine normally. Called
-    // once per directory, from one thread per directory at the same time. An
-    // exception it throws is reported as that directory's startup failure.
+    // this empty and constructs the selected file/slab/log engine normally.
+    // A factory deliberately takes over engine construction and directory
+    // classification. Called once per directory, from one thread per directory
+    // at the same time. An exception it throws is reported as that directory's
+    // startup failure.
     std::function<std::unique_ptr<StoreEngine>(const std::string&, uint64_t)>
         engine_factory{};
+    // Test seam for the classification/open handoff, used only on the normal
+    // construction path after ClassifyStoreDir succeeds and before an engine
+    // is selected or opened. The engine revalidates ownership under its lock.
+    std::function<void(const std::string&)> after_classify_for_test{};
     // Leave the disks opened but not activated; the owner calls Activate()
     // when the node is about to serve. See Activate().
     bool defer_activation = false;
@@ -163,9 +169,9 @@ class DiskCacheGroup {
   size_t DiskCount() const { return disks_.size(); }
   uint64_t Evictions() const;     // summed across disks
   uint64_t EvictedBytes() const;  // summed across disks
-  // The storage backend actually constructed ("file" | "slab") -- the RESOLVED
-  // choice (Options.engine / DFKV_STORE_ENGINE / default), not the flag intent.
-  // "mixed" when "auto" chose different engines for different disks.
+  // The storage backend actually constructed ("file" | "slab" | "log") --
+  // the RESOLVED choice (Options.engine / DFKV_STORE_ENGINE / default auto),
+  // not the flag intent. "mixed" when auto chose different engines by disk.
   const std::string& EngineName() const { return engine_; }
   // Whether slab metrics apply: the slab engine was selected, or "auto" chose
   // it for at least one disk.

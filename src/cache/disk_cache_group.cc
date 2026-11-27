@@ -14,6 +14,7 @@
 #include <set>
 #include <sstream>
 #include <cerrno>
+#include <stdexcept>
 #include <system_error>
 #include <thread>
 
@@ -171,28 +172,18 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   std::string engine = opt.engine;
   if (engine.empty()) {
     const char* value = std::getenv("DFKV_STORE_ENGINE");
-    engine = (value && *value) ? value : "slab";
+    engine = (value && *value) ? value : "auto";
   }
   if (engine != "file" && engine != "slab" && engine != "auto" &&
       engine != "log") {
-    fail("DFKV_STORE_ENGINE must be 'file' or 'slab'");
+    fail("DFKV_STORE_ENGINE must be 'file', 'slab', 'auto' or 'log'");
     return;
   }
-  if (engine == "auto" || engine == "log") {
-    const char* experimental = std::getenv("DFKV_LSE_EXPERIMENTAL");
-    if (experimental == nullptr || std::strcmp(experimental, "1") != 0) {
-      fail("DFKV_STORE_ENGINE=" + engine +
-           " is experimental (the log-structured engine is under "
-           "construction); it needs DFKV_LSE_EXPERIMENTAL=1");
-      return;
-    }
-  }
-  // The engine of each disk. "auto" and "log" decide it per directory from
-  // what the directory holds (docs/design/log-structured-engine.md §10.1);
-  // "slab" and "file" use one engine for every disk and leave the checks to
-  // the engine, as they always did.
+  // The engine of each disk, decided per directory before any engine opens
+  // it (docs/design/log-structured-engine.md §10.1). A custom factory
+  // deliberately owns construction and classification, as it did before.
   std::vector<std::string> disk_engine(opt.cache_dirs.size(), engine);
-  if ((engine == "auto" || engine == "log") && !opt.engine_factory) {
+  if (!opt.engine_factory) {
     for (size_t i = 0; i < opt.cache_dirs.size(); ++i) {
       const std::string& dir = opt.cache_dirs[i];
       StoreDirClassification found;
@@ -201,34 +192,47 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
         fail(error);
         return;
       }
+      if (opt.after_classify_for_test) opt.after_classify_for_test(dir);
       std::string names;
       for (const auto& name : found.deciding)
         names += (names.empty() ? "" : ", ") + name;
       const std::string why =
           dir + " holds " + StoreDirClassName(found.cls) + " data (" +
           names + ")";
+      const auto explicit_mismatch = [&] {
+        fail("DFKV_STORE_ENGINE=" + engine + ", but " + why +
+             "; empty the directory or use another one");
+      };
       switch (found.cls) {
         case StoreDirClass::kEmpty:
-          // Until the log engine is accepted, an empty directory under
-          // "auto" gets the slab engine, the default.
-          disk_engine[i] = engine == "log" ? "log" : "slab";
+          // Stage 10: auto selects log for a new/empty directory. Explicit
+          // file/slab/log retain their meaning.
+          if (engine == "auto") disk_engine[i] = "log";
           break;
         case StoreDirClass::kSlab:
-        case StoreDirClass::kFile:
-          if (engine == "log") {
-            fail("DFKV_STORE_ENGINE=log, but " + why +
-                 "; empty the directory or use another one");
+          if (engine == "log" || engine == "file") {
+            explicit_mismatch();
             return;
           }
-          disk_engine[i] =
-              found.cls == StoreDirClass::kSlab ? "slab" : "file";
+          disk_engine[i] = "slab";
           break;
         case StoreDirClass::kLog:
+          if (engine == "slab" || engine == "file") {
+            explicit_mismatch();
+            return;
+          }
           disk_engine[i] = "log";
+          break;
+        case StoreDirClass::kFile:
+          if (engine == "log" || engine == "slab") {
+            explicit_mismatch();
+            return;
+          }
+          disk_engine[i] = "file";
           break;
         case StoreDirClass::kConflict:
         case StoreDirClass::kForeign:
-          fail("cannot choose a storage engine: " + why +
+          fail("DFKV_STORE_ENGINE=" + engine + " cannot open " + why +
                "; inspect the files, nothing was changed");
           return;
       }
@@ -428,8 +432,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       if (opt.engine_factory) {
         opened[i].store = opt.engine_factory(dir, disk_capacity);
       } else if (disk_engine[i] == "log") {
-        // Experimental (DFKV_LSE_EXPERIMENTAL=1, checked above). Writes are
-        // direct or buffered as DFKV_SLAB_WRITE says, as for slab.
+        // Writes are direct or buffered as DFKV_SLAB_WRITE says, as for slab.
         LogStore::Options lo;
         lo.dir = dir;
         lo.capacity_bytes = disk_capacity;
@@ -456,6 +459,26 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       } else {
         opened[i].store =
             std::make_unique<KVStore>(KVStore::Options{dir, disk_capacity});
+      }
+      // Slab and log now hold their directory locks; file has rechecked its
+      // complete root layout. Recheck mixed ownership so a directory changed
+      // after the advisory classification cannot be accepted as both slab and
+      // log. Other format mismatches are rejected by the selected engine.
+      if (!opt.engine_factory && opened[i].store &&
+          opened[i].store->Healthy()) {
+        StoreDirClassification current;
+        std::string error;
+        if (!ClassifyStoreDir(dir, &current, &error)) {
+          throw std::runtime_error(error);
+        }
+        if (current.cls == StoreDirClass::kConflict) {
+          std::string names;
+          for (const auto& name : current.deciding)
+            names += (names.empty() ? "" : ", ") + name;
+          throw std::runtime_error(
+              dir + " holds slab and log data (" + names +
+              ") at engine open; inspect the files, nothing was activated");
+        }
       }
     } catch (const std::exception& error) {
       opened[i].threw = true;

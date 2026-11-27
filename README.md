@@ -13,7 +13,7 @@ DingoCache's **dfkv** is a standalone distributed KV cache for LLM inference. Ca
 ## Why dfkv?
 
 - **Reuse cached KV across instances.** Clients use a canonical namespace and binary object key, then route to the owning node using weighted Ketama hashing. A miss is reported as a miss so the inference engine can recompute; dfkv does not claim to be a durable database.
-- **Bring your own storage and transport.** The default restart-aware slab store uses bounded disk capacity and extent files instead of a file per object. TCP works without RDMA; native RDMA and an in-memory hot tier are opt-in, hardware-dependent paths.
+- **Bring your own storage and transport.** The default `auto` selector chooses the log-structured store for an empty directory and preserves the existing engine on file/slab/log directories. Explicit slab and file-per-object engines remain available. TCP works without RDMA; native RDMA and an in-memory hot tier are opt-in, hardware-dependent paths.
 - **Fit different inference stacks.** SGLang uses a dynamic HiCache plugin, LMCache uses its remote connector (or MP-server L2 adapter), and vLLM uses a direct `KVConnectorBase_V1` connector. All three share the `libdfkv.so` client and its raw-value contract.
 - **Operate a changing ring.** Stateless `dfkv_mds` instances use etcd leases for membership; clients discover the ring and rebuild their route on placement changes. Per-node and client metrics, readiness endpoints, and `dfkvctl` help inspect it.
 
@@ -29,7 +29,7 @@ flowchart TB
     C --> D
     D -->|"TCP or optional RDMA data path"| E["dfkv_server: owning cache node"]
     E --> R["Optional RAM hot tier"]
-    R --> F["DiskCacheGroup: slab store on local disks"]
+    R --> F["DiskCacheGroup: auto-selected stores on local disks"]
     E --> F
     D -. "membership discovery" .-> M["dfkv_mds replicas"]
     E -. "registration and heartbeat" .-> M
@@ -75,7 +75,7 @@ The connectors supply model/layout-aware namespaces and object keys; dfkv stores
 
 ## Capabilities and boundaries
 
-- **Storage:** slab is the default; the file-per-object backend is an explicit diagnostic fallback, not an automatic recovery path. The optional RAM tier and read coalescing have separate configuration and acknowledgment semantics; see [storage and RAM design](docs/ARCHITECTURE.md).
+- **Storage:** `auto` is the default (new/empty directories use log; existing file/slab/log directories retain their engine). Explicit slab and file backends remain available; incompatible or mixed metadata never falls back silently. The optional RAM tier and read coalescing have separate configuration and acknowledgment semantics; see [storage and RAM design](docs/ARCHITECTURE.md).
 - **Transport:** TCP is the default. RDMA requires a build with verbs support, an enabled server RDMA listener, and client `DFKV_RDMA=1`. Once RDMA is requested, incompatible or unhealthy rails fail closed rather than silently switching to TCP. [Transport and deployment details](docs/DEPLOY.md) · [client options](docs/CONNECTORS.md).
 - **Consistency and failures:** no replication or backing-store fallback. Ring changes or eviction may require recomputation. A PUT whose request may already have been submitted is **not** blindly replayed across RDMA rails: its remote outcome can be ambiguous. See the [failure contract](docs/DEPLOY.md).
 - **Known v2.30.0 limitation:** an intermittent server RDMA CQ *retry-exceeded* completion (status 12), observed before this release, remains unattributed. This release adds QP correlation diagnostics; it does **not** fix or suppress that error. See the [release notes](https://github.com/dingodb/DingoCache/releases/tag/v2.30.0).

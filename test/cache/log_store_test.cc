@@ -97,6 +97,52 @@ std::map<std::string, std::string> Snapshot(const fs::path& dir) {
   return out;
 }
 
+bool FinalSuperblocks(const fs::path& dir) {
+  const int fd = ::open((dir / "lse_super").c_str(), O_RDONLY);
+  if (fd < 0) return false;
+  for (int copy = 0; copy < 2; ++copy) {
+    lse::Block block{};
+    lse::Superblock super;
+    const bool ok =
+        ::pread(fd, block.data(), block.size(), copy * lse::kBlockBytes) ==
+            static_cast<ssize_t>(block.size()) &&
+        lse::DecodeSuperblock(block.data(), false, &super) ==
+            lse::DecodeError::kOk &&
+        (super.incompat_features & lse::kIncompatDevelopmentFormat) == 0;
+    if (!ok) {
+      ::close(fd);
+      return false;
+    }
+  }
+  ::close(fd);
+  return true;
+}
+
+// Mutates fixture copies only, preserving DFKVLSE1 geometry and recomputing
+// each superblock's real CRC. both=false leaves copy 1 final-format.
+bool MarkDevelopmentSuperblocks(const fs::path& dir, bool both) {
+  const int fd = ::open((dir / "lse_super").c_str(), O_RDWR);
+  if (fd < 0) return false;
+  bool ok = true;
+  for (int copy = 0; copy < (both ? 2 : 1); ++copy) {
+    lse::Block block{};
+    lse::Superblock super;
+    ok = ::pread(fd, block.data(), block.size(), copy * lse::kBlockBytes) ==
+             static_cast<ssize_t>(block.size()) &&
+         lse::DecodeSuperblock(block.data(), true, &super) ==
+             lse::DecodeError::kOk;
+    if (!ok) break;
+    super.incompat_features |= lse::kIncompatDevelopmentFormat;
+    block = lse::EncodeSuperblock(super);
+    ok = ::pwrite(fd, block.data(), block.size(), copy * lse::kBlockBytes) ==
+         static_cast<ssize_t>(block.size());
+    if (!ok) break;
+  }
+  if (ok && ::fsync(fd) != 0) ok = false;
+  ::close(fd);
+  return ok;
+}
+
 }  // namespace
 
 // ---- the StoreEngine contract ------------------------------------------------
@@ -415,6 +461,39 @@ TEST(LogStore, CrashPointsDuringInitPutAndRemove) {
 }
 
 // ---- what is on disk -----------------------------------------------------------
+TEST(LogStore, NewStoresAreFinalAndDevelopmentIsRefusedWithoutConversion) {
+  for (const bool both_copies : {false, true}) {
+    SCOPED_TRACE(both_copies ? "both copies development"
+                             : "one final-looking copy");
+    const fs::path dir =
+        TestDir(both_copies ? "dev-format-both" : "dev-format-one");
+    {
+      bool ok = false;
+      LogStore s(Opts(dir), &ok);
+      ASSERT_TRUE(ok) << s.StartupError();
+      const std::string value = Value(1, 0);
+      ASSERT_EQ(s.Cache(Key(1), value.data(), value.size()), Status::kOk);
+      ASSERT_TRUE(s.Close());
+    }
+    ASSERT_TRUE(FinalSuperblocks(dir)) << "new store carried development";
+    // Deliberately make a valid development fixture, including a mixed-copy
+    // case. Failure to make this fixture is not the intended rejection.
+    ASSERT_TRUE(MarkDevelopmentSuperblocks(dir, both_copies))
+        << "development fixture setup failed";
+    const auto before = Snapshot(dir);
+    auto options = Opts(dir);
+    options.defer_activation = true;
+    bool ok = true;
+    LogStore old(options, &ok);
+    EXPECT_FALSE(ok);
+    EXPECT_NE(old.StartupError().find("development format"), std::string::npos)
+        << old.StartupError();
+    EXPECT_EQ(Snapshot(dir), before)
+        << "development format was converted or mutated";
+    fs::remove_all(dir);
+  }
+}
+
 TEST(LogStore, AnOpenedStoreThatIsNotActivatedChangesNothing) {
   const fs::path dir = TestDir("asfound");
   {

@@ -395,7 +395,7 @@ before. A later release will not accept this value.` 以后的版本会收紧这
 
 | flag / env | 侧 | 作用 |
 |------------|----|------|
-| `--store-engine=file\|slab` / `DFKV_STORE_ENGINE` | **server** | 该节点的盘上存储引擎；均未设置时默认 `slab`，`file` 仅为显式诊断回退 |
+| `--store-engine=file\|slab\|auto\|log` / `DFKV_STORE_ENGINE` | **server** | 该节点的盘上存储引擎；均未设置时默认 `auto`：空目录用 `log`，已有目录保留实际引擎；冲突或未知格式拒绝启动 |
 | `DFKV_RAM_TIER` / `DFKV_RAM_TIER_BYTES` | **server** | 写穿 RAM 热层 |
 | `DFKV_SERVER_URING` | **server** | io_uring 异步 GET serve 路径 |
 | `DFKV_SLAB_WRITE` | **server** | slab I/O 模式（默认 direct；`buffered` 为退出开关） |
@@ -404,7 +404,7 @@ before. A later release will not accept this value.` 以后的版本会收紧这
 | `DFKV_TCP_FIRST_REQ_MS` / `DFKV_MDS_FIRST_REQ_MS` / `DFKV_METRICS_FIRST_REQ_MS` | **server / mds** | 各 listener 首请求 deadline（默认 30000ms，`0`=关）：deadline 内不发首个请求的连接被踢，防空连接堆积 |
 | `DFKV_METRICS_MAX_CONNS` / `DFKV_MDS_MAX_CONNS` | **mds / metrics** | listener 并发连接上限（metrics 64、MDS 4096），防连接洪泛 |
 
-显式配置的混合车队（部分节点 slab、部分诊断节点 file；部分带 RAM 层）对所有客户端**完全等价**。不配置 flag/env 的节点一律选择 slab；slab 配置无效时拒绝启动，不会自行加入为 file 节点。
+显式配置的混合车队（不同节点或同一节点不同盘使用 slab/log/file；部分带 RAM 层）对所有客户端**完全等价**。不配置 flag/env 的节点选择 auto：空目录用 log，已有目录保留真实引擎；格式冲突时拒绝启动，不会自行改成其他引擎。
 
 受限 tenant 的超额 PUT 返回 `kQuotaExceeded`（上层看到普通 PUT failure，peer
 不进入 I/O cooldown）；这与写入门/全盘压力的 `kCacheFull` 可由 server metrics

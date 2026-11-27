@@ -8,8 +8,9 @@
  * segment; sealing with summaries and trailers, summary-based recovery and
  * the clean close (stage 5); the cleaner with second-chance relocation,
  * inline reclaim, shadows, journal compaction and capacity changes (stage 6);
- * RETAIN with a footprint budget (stage 7). It is selectable only with
- * DFKV_LSE_EXPERIMENTAL=1 and writes the development-format bit. */
+ * RETAIN with a footprint budget (stage 7). The format is frozen at stage 10:
+ * new stores carry no development-format bit, and development stores are
+ * refused rather than converted. */
 #ifndef DFKV_LOG_STORE_H_
 #define DFKV_LOG_STORE_H_
 

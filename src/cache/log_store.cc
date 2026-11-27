@@ -579,7 +579,7 @@ bool LogStore::InitStore(const Geometry& g) {
     return SetErrno("cannot create " + segdir, errno);
 
   sb_ = lse::Superblock{};
-  sb_.incompat_features = lse::kIncompatDevelopmentFormat;
+  // Format frozen at stage 10: new stores carry no development bit.
   sb_.store_uuid = RandomUuid();
   sb_.segment_bytes = g.segment_bytes;
   sb_.segment_count = g.segment_count;
@@ -620,12 +620,14 @@ bool LogStore::ReadSuperblock() {
   if (!PreadAll(io_.get(), super_fd_, buf.p, 2 * kBlockBytes, 0))
     return SetErrno("cannot read lse_super", errno);
   bool have = false;
+  bool development = false;
   lse::DecodeError why = lse::DecodeError::kBadMagic;
   for (int copy = 0; copy < 2; ++copy) {
     lse::Superblock sb;
     const auto e = lse::DecodeSuperblock(
         reinterpret_cast<const uint8_t*>(buf.p) + copy * kBlockBytes,
-        /*allow_development=*/true, &sb);
+        /*allow_development=*/false, &sb);
+    if (e == lse::DecodeError::kDevelopmentFormat) development = true;
     if (e != lse::DecodeError::kOk) {
       if (why == lse::DecodeError::kBadMagic) why = e;
       continue;
@@ -633,6 +635,10 @@ bool LogStore::ReadSuperblock() {
     if (!have || sb.sequence > sb_.sequence) sb_ = sb;
     have = true;
   }
+  // A store is development format if either durable copy still says so; one
+  // externally edited final-looking copy must not bypass the stage-10 gate.
+  if (development)
+    return SetError("lse_super is not usable: development format");
   if (!have)
     return SetError(std::string("lse_super is not usable: ") +
                     lse::DecodeErrorName(why));

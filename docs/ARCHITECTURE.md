@@ -245,17 +245,19 @@ arithmetic and [DEPLOY.md](DEPLOY.md) §3 for rollout settings.
 `DiskCacheGroup` routes each block to one NVMe disk (Ketama over the full
 `BlockKey.Filename()`) and owns one `StoreEngine` per disk. With no option and
 no `DFKV_STORE_ENGINE`, every `DiskCacheGroup` user (including `dfkv_server`)
-selects `slab`. `--store-engine=file` / `DFKV_STORE_ENGINE=file` selects the
-explicit diagnostic fallback; invalid slab capacity or persistent geometry
-fails startup and never retries with `file`:
+selects `auto`: an empty directory gets `log`, while actual file/slab/log
+metadata retains its engine. Explicit `--store-engine=file|slab|log` selects
+that engine, and conflicting or foreign metadata refuses startup without
+conversion, deletion or fallback:
 
 ```
 StoreEngine: Cache / CacheDirect[Batch] / Range[*] / Lookup / Remove + stats
-   ├── slab  →  DiskSlabStore  (production: extent pool + sparse slots.tbl)
-   └── file  →  KVStore        (diagnostic fallback: one file per block)
+   ├── slab  →  DiskSlabStore  (extent pool + sparse slots.tbl)
+   ├── log   →  LogStore       (log-structured records + journal)
+   └── file  →  KVStore        (explicit diagnostic: one file per block)
 ```
 
-### 5a. `slab` engine — production default
+### 5a. `slab` engine
 
 Each configured disk is a fixed pool of pre-allocated **extent files**. A
 media-agnostic `SlabAllocator` binds extents to a deterministic startup-built
@@ -633,13 +635,14 @@ object/backlog gauges, and explicit total/arena/dedicated budget/usage gauges
 
 ## 7. Configuration matrix (feature defaults)
 
-The production disk path is slab by default; RAM and RDMA remain explicit.
+The production disk path defaults to auto (new directories use log, existing
+stores retain their engine); RAM and RDMA remain explicit.
 RDMA requires `DFKV_RDMA=1`; selected peers must negotiate the v2 one-sided
 data plane or the connection fails.
 
 | Feature | Enable with | Default | Notes |
 |---------|-------------|---------|-------|
-| disk storage engine | `--store-engine=slab|file` / `DFKV_STORE_ENGINE` | `slab` (all server/store construction paths) | option > env > default; v3 slab needs a clean cache directory; invalid capacity, format, or geometry fails closed without a file fallback |
+| disk storage engine | `--store-engine=slab|file|auto|log` / `DFKV_STORE_ENGINE` | `auto` (all server/store construction paths) | option > env > default; empty = log, existing format = same engine; invalid capacity, format, geometry, or mixed ownership fails closed without fallback |
 | RAM hot tier | `DFKV_RAM_TIER=1` (+ `DFKV_RAM_TIER_BYTES`) | off | write-back/write-around + direct cold-read promotion + RDMA zero-copy GET; requested allocation failure rejects startup |
 | RAM PUT policy | `--ram-write-mode=writeback|writearound` / `DFKV_RAM_WRITE_MODE` | `writeback` | write-back absorbs PUT bursts; write-around avoids the PUT arena copy and relies on direct GET promotion |
 | RAM read promotion | `DFKV_RAM_PROMOTE=first|second` (+ `DFKV_RAM_PROMOTE_WINDOW_MS`) | `first` | `second` promotes a whole cold read only on the key's repeat read within the window (30 s), so one-time scans do not evict re-read values; a first read reserves nothing |

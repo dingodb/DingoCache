@@ -300,7 +300,7 @@ Environment=DFKV_TENANT_DEFAULT_QUOTA_BYTES=0
 # --port = TCP(bootstrap+TCP数据) 端口; --rdma-port = RDMA bootstrap 端口; --rdma-dev = 数据面 RDMA 设备
 # --metrics-port = 可选 Prometheus /metrics（缺省=不开端口；--id/--group 成为指标标签）;
 #   --metrics-bind <addr> 绑定监听地址（缺省 0.0.0.0）
-# 此生产示例故意不设置 --store-engine/DFKV_STORE_ENGINE：resolved 默认即 slab。
+# 此示例不设置 --store-engine/DFKV_STORE_ENGINE：resolved 默认 auto；空目录用 log，已有目录保留原引擎。
 # 两个 <size> 按本机填十进制字节数：
 #   --ram-tier-bytes：能长期锁给 dfkv 的内存（启动时整块预触页并锁住），扣掉系统、
 #     推理进程和其他服务需要的部分，并与下面的 MemoryMax、TimeoutStartSec 一起调；
@@ -376,8 +376,8 @@ WantedBy=multi-user.target
 > pool 外 MR 已在成功 completion 后解除，失败路径先销毁 QP 再解除。
 
 
-> **存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）。解析顺序为 flag > 环境变量 > `slab`；运行时真值经 `dfkvctl ring` INFO 列（`engine=`/`wr=`/`ram=`）和 `dfkv_build_info{engine,write_mode}` 审计。**
-> - `--store-engine slab|file`：不设置 flag/env 时所有 store/server 路径默认 `slab`。slab = extent 池 + sparse `slots.tbl` + dirty/clean epoch。**早期格式→v3 tenant-scoped slab 必须使用空缓存目录**；容量、格式或几何不符会拒绝启动而不会改写原数据，也绝不会静默改用 file。`file` 的 48 字符 tenant+object 文件名同样不读取旧 cache，仅作显式诊断/回滚。
+> **存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）。解析顺序为 flag > 环境变量 > `auto`；运行时真值经 `dfkvctl ring` INFO 列（`engine=`/`wr=`/`ram=`）和 `dfkv_build_info{engine,write_mode}` 审计。**
+> - `--store-engine slab|file|auto|log`：不设置 flag/env 时所有 store/server 路径默认 `auto`，空目录创建 `log`，已有 file/slab/log 目录按真实元数据继续原引擎。显式选择与目录格式冲突、slab/log 混合或未知内容都拒绝启动，不转换、不删除、不静默 fallback；选项与环境变量仍按 flag 优先。旧 `DFKV_LSE_EXPERIMENTAL` 不再控制可用性。新建 log 目录不写 development bit；已有 development-format superblock 以不支持格式拒绝，借助真实 magic/CRC/version/feature 检查，绝不就地转换。slab = extent 池 + sparse `slots.tbl` + dirty/clean epoch。**早期格式→v3 tenant-scoped slab 必须使用空缓存目录**；容量、格式或几何不符同样拒绝。`file` 的 48 字符 tenant+object 文件名仅作显式诊断/回滚。
 > - **slab 首次初始化中断**：新版从空目录建仓前落盘 `slab_initializing`。
 >   仅当该标记与请求几何一致、`slab_state` 尚不存在、`slots.tbl` 全零且
 >   每个已存在的 extent 形状正确时，重启才补建缺失文件；原文件不截断。
@@ -438,7 +438,7 @@ WantedBy=multi-user.target
 > - 停止顺序（收到 SIGTERM 之后）：先给正在等刷盘的 PUT（见 `DFKV_RAM_PUT_WAIT_MS`）回 `kCacheFull`，停请求不再等它们的刷盘 → 停 RDMA 和 TCP 请求 → RAM 层积压刷盘（时限 `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S`，默认 30 秒，超时丢弃剩余）→ 各盘同时同步并写 clean → 进程直接退出（内存交给内核回收，不再逐个对象释放）。每一步在日志里有一行 `shutdown: ...` 和耗时（INFO 级别）；最后一行是 `dfkv_server shut down cleanly in N s; exiting`，这一行之后进程即使被 `TimeoutStopSec` 杀掉，下次启动也是干净启动，缓存保留。2.36 及更早版本 clean 标记写在释放内存之后，那段时间被杀会清空全部缓存。
 > - 启动时每块 slab 盘打一行 `slab <目录>: opened in N ms, K objects restored (extents A ms, allocation skipped for S of E; table scan B ms; restore C ms)`（INFO 级别）：`extents` 是打开全部 extent 文件的时间，`table scan` 是读并校验 `slots.tbl` 的时间，`restore` 是把恢复出的对象装入内存索引的时间。`allocation skipped for S of E` 只在 direct 模式下出现（buffered 模式启动时不对 extent 调用 `fallocate`）：上次干净停止且 extent 文件已经分配满时不再对它调用 `fallocate`，`S` 是跳过的 extent 数；非干净退出后的启动、新建的或有空洞的 extent 照旧调用，这时 `S` 小于 `E`（非干净退出后为 0）。启动变慢时先看这一行是哪一段变长。关闭一块盘时如果还有数据写入没有结束，这块盘不写 clean 标记，打一条 WARN，下次启动按非干净退出处理；正常停止顺序（见上一条）先停请求和 RAM 层刷盘，不会走到这里。
 > - arena 默认申请透明大页。4K 页下内核每秒只能给出约 4 GiB，加线程没有用，退出时归还也慢；2 MiB 页下 192 GiB 的 arena 实测 3.3 秒常驻、约 1 秒归还（4K 页是 39–47 秒和 13–21 秒），从 RAM 层读 1 MiB 对象的吞吐高 30–40%。启动日志 `ram tier arena pre-faulted: ... huge pages=N MiB` 和指标 `dfkv_ram_arena_hugepage_bytes` 给出实际由大页承载的量：系统设置是 `never` 时为 0；空闲内存碎片化时会小于 arena，而且内核在分配时做内存规整，预触页可能比 4K 页还慢（没有实测过这种主机）。遇到这种情况可以设 `DFKV_RAM_TIER_HUGEPAGES=off`：不再申请，页大小回到由系统设置决定（`madvise` 下是 4K 页；`always` 下 arena 本来就在大页上，页大小关不掉，但不申请之后内核在缺页时不再同步做内存规整，指标因为没有测量而读 0）。
-> GPU 节点推荐：保留默认 slab/direct，按节点突发画像启用 RAM tier 并设置总预算。
+> GPU 节点推荐：保留默认 auto/direct，按节点突发画像启用 RAM tier 并设置总预算；已有 slab 目录不会被转换。
 ```bash
 systemctl daemon-reload && systemctl enable --now dfkv
 journalctl -u dfkv -n 10 --no-pager
@@ -813,7 +813,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `--metrics-port` | omit=off | Prometheus /metrics、healthz、readyz |
 | `--metrics-bind` | `0.0.0.0` | metrics/health 绑 IP（内网收敛） |
 | `--mds-registration-timeout-ms` / `DFKV_MDS_REGISTRATION_TIMEOUT_MS` | `60000` | 首次 MDS 注册截止（1000–600000） |
-| `--store-engine` / `DFKV_STORE_ENGINE` | `slab` | `slab` 为默认；`file` 为显式诊断 fallback |
+| `--store-engine` / `DFKV_STORE_ENGINE` | `auto` | 支持 `slab` / `file` / `auto` / `log`；空目录默认 `log`，已有目录保留原引擎，格式冲突拒绝启动 |
 | `--slab-write` / `DFKV_SLAB_WRITE` | `direct` | slab 数据面 O_DIRECT / buffered；文件系统不支持 DIO 时整店回退 buffered 并以 `wr=` 上报 |
 | `DFKV_SLAB_PAYLOAD_CRC` | `1` | slab 值校验：PUT 把值的 CRC32C 记进 slot record，整值读取（GET、RDMA 读）时校验，不符则删除该 key、按未命中回答并计入 `dfkv_slab_payload_crc_failures_total`。只读一段的请求不校验。校验发生在读取时：落盘前被 kill、warm restart 后保留下来的 record，在第一次整值读取之前 EXISTS 仍报存在。代价（单写者、1 MiB 值、NVMe 单元级实测）：PUT 中位延迟多约 60–70 µs（约 +17%，单写者吞吐约 −12%），GET 多约 15–40 µs；多个写者时瓶颈在盘，影响更小。设 `0`：PUT 不再记录校验值（record 与旧版本写的相同），任何读取都不校验，包括开着时写下的 record；关闭期间写下的 record 重新打开后也一直不校验，直到被重写。只接受 `0`/`1`，其他值拒绝启动 |
 | `--ram-tier` / `DFKV_RAM_TIER` | `off` | RAM 热层（写穿+RDMA zero-copy GET） |

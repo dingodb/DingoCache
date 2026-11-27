@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Server, storage engine: complete stage-10 activation. The selector
+  precedence remains option > `DFKV_STORE_ENGINE` > default, with the default
+  now `auto`: empty directories use log, existing file/slab/log directories
+  retain their engine, and conflicting/foreign metadata fails closed without
+  conversion or deletion. Explicit `file`, `slab` and `log` remain supported.
+  The former `DFKV_LSE_EXPERIMENTAL` selector gate is inert. New log stores
+  carry the frozen final format (no development bit); development-format
+  superblocks are refused without conversion or mutation, including when only
+  one durable copy still carries the bit. Recheck mixed slab/log ownership at
+  engine open so a classification/open change cannot hide a conflict.
+
 - Client, direct vLLM connector: optional segment-affine routing behind
   `segment_affinity_pages` (STO-17, default 0 = off). A segment's actual
   first-object key is only a node placement anchor for owner, drain,
