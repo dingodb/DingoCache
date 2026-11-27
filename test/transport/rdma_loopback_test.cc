@@ -8883,14 +8883,10 @@ TEST(RdmaRailSuspect, RegistrationAfterSuspectWakeCannotStayLive) {
     gate_released = true;
   }
   gate_cv.notify_all();
-  const BlockKey late_key = ToBlockKey(SelfHdr(), "late-registration-key");
-  EncodeReqVersion(late_peer.ep.sbuf(0), kNativeProtoRdmaV2,
-                   WireOp::kExist, late_key, 0, 0, 0);
-  Status late_status = Status::kIOError;
-  uint64_t late_bytes = 0;
-  EXPECT_FALSE(late_peer.Exchange(kReqPrefix, &late_status, &late_bytes))
-      << "the late registration must not continue with a live data QP";
-  late_peer.Close();  // client-side FD/QP teardown is complete as well
+  // Do not post an operation or close late_peer yet. A Wake racing a newly
+  // arrived CQE may legally complete that CQE before the next WaitComp. With
+  // no operation posted, only the suspect recheck can end the paused QP; a
+  // client disconnect cannot make this assertion pass instead.
   for (int i = 0;
        i < 600 &&
        RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0) != 0; ++i)
@@ -8903,6 +8899,7 @@ TEST(RdmaRailSuspect, RegistrationAfterSuspectWakeCannotStayLive) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   EXPECT_EQ(node.rsrv->ActiveConns(), 1u)
       << "only the unrelated rail's live connection remains";
+  late_peer.Close();  // client-side FD/QP teardown is complete as well
   EXPECT_EQ(node.rsrv->PendingHandshakes(), 0u);
   std::string out(value.size(), '\0');
   ASSERT_TRUE(sibling.Get("late-registration-sibling", out.data(), out.size()));
