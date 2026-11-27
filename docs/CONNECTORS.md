@@ -945,6 +945,12 @@ vllm serve <model> \
   }'
 ```
 
+**可选分段亲和路由：** `kv_connector_extra_config.segment_affinity_pages` 默认 `0`。
+需要减少 owner 切换对同段前缀的破坏时才显式开启，并保持所有读写端 S 一致；启用会改变放置，
+旧对象不迁移、预期 cold miss，旧 `libdfkv.so` 在 enabled 时必须拒绝启动。它只改变 node 路由，
+不改变对象 key/namespace、存储格式或 LSE 淘汰。配置、过滤/partial-hit/加载窗口对齐规则和迁移边界见
+[`integration/vllm/README.md`](../integration/vllm/README.md#kv_connector_extra_config-keys)。
+
 `model_name` 取 vLLM 的精确 `model_config.model`（即上面的 `<model>`），不是
 extra-config 键。namespace 始终绑定该 model identity 与 `vllm-multiwr-v5`；没有可配置
 的 namespace alias。

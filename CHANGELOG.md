@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Client, direct vLLM connector: optional segment-affine routing behind
+  `segment_affinity_pages` (STO-17, default 0 = off). A segment's actual
+  first-object key is only a node placement anchor for owner, drain,
+  substitute and held-ring/read-back planning. Actual object keys still
+  govern payloads, BlockKey/dedup identity, M/W queries, REMOVE and cleanup.
+  Absolute page/history-derived anchors are propagated through save masks,
+  partial/state tails, lookups, retention, load windows and stale removal;
+  they are not cluster-wide chain identities, same-disk placement or LSE
+  eviction metadata. Additive `_anchored` C ABI forms carry binary route
+  vectors after object keys; empty/NULL vectors and S=0 retain legacy routes.
+  Enabled affinity requires the complete new symbols and fails before opening
+  against an older library. Enabling it, or changing S between sharing
+  clients, intentionally changes placement and can cold-miss existing
+  objects; off has no route-vector allocation or default behavior change.
+
 - Tests: cover per-node batched recent-REMOVE queries for both scalar TCP
   and pipelined misses (CLI-38). Each batched read-back question costs at
   most one M request per previous owner, instead of one request per missed
