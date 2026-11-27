@@ -54,6 +54,18 @@ namespace dfkv {
 // killed only after the writes and their persistent index metadata are synced.
 class LogStoreTestPeer {
  public:
+  static bool QuiesceCleanerForReadback(LogStore* store) {
+    {
+      LogStore::Lock lock(store->mu_);
+      if (!store->opt_.cleaner || !store->cleaner_.joinable()) return false;
+      store->stop_threads_ = true;
+      store->state_cv_.notify_all();
+    }
+    // Never join while holding mu_: the cleaner takes it throughout its loop.
+    store->cleaner_.join();
+    return true;
+  }
+
   static bool SyncDirtySegments(LogStore* store) {
     LogStore::Lock lock(store->mu_);
     for (auto& segment : store->segments_) {
@@ -771,6 +783,7 @@ struct RunRecord {
   bool healthy_start = false;
   bool healthy_before_close = false;
   bool close_ok = false;
+  bool log_cleaner_quiesced_before_readback = false;
   bool slab_settled = true;
   double write_seconds = 0;
   double settle_seconds = 0;
@@ -1170,9 +1183,17 @@ RunRecord RunOne(EngineKind kind, uint32_t pair, uint32_t order,
         Violate(&run, "slab watermark did not settle within 30 seconds");
     }
     run.settle_seconds = Seconds(Clock::now() - settle_start);
-    const auto read_start = Clock::now();
-    EnumerateAndReadBack(store.get(), &run);
-    run.readback_seconds = Seconds(Clock::now() - read_start);
+    if (kind == EngineKind::kLog) {
+      run.log_cleaner_quiesced_before_readback =
+          dfkv::LogStoreTestPeer::QuiesceCleanerForReadback(log);
+      if (!run.log_cleaner_quiesced_before_readback)
+        Violate(&run, "could not join the enabled LSE cleaner before readback");
+    }
+    if (kind == EngineKind::kSlab || run.log_cleaner_quiesced_before_readback) {
+      const auto read_start = Clock::now();
+      EnumerateAndReadBack(store.get(), &run);
+      run.readback_seconds = Seconds(Clock::now() - read_start);
+    }
   }
 
   run.healthy_before_close = store->Healthy();
@@ -1245,6 +1266,8 @@ RunRecord RunOne(EngineKind kind, uint32_t pair, uint32_t order,
       Violate(&run, "slab CRC/metadata/balance invariants failed");
     }
   } else {
+    if (!run.log_cleaner_quiesced_before_readback)
+      Violate(&run, "LSE resident readback lacked the cleaner quiescence barrier");
     if (run.log_read_crc_failures != 0)
       Violate(&run, "log reports payload CRC failures");
     if (run.log_direct_open_successes == 0 ||
@@ -1341,6 +1364,8 @@ std::string RunJson(const RunRecord& run, const Config& config) {
       << ",\"log_open_segments_from_zero\":true"
       << ",\"log_relocate_pct\":25,\"log_sync_ms\":1000"
       << ",\"log_cleaner\":true,\"log_preopen\":true"
+      << ",\"log_cleaner_quiesced_before_readback\":"
+      << run.log_cleaner_quiesced_before_readback
       << ",\"log_retain_enabled\":false"
       << ",\"log_stat_cache_full\":" << run.log_stat_cache_full
       << ",\"log_records_relocated\":" << run.log_records_relocated
