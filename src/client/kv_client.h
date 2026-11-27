@@ -37,6 +37,8 @@
 
 namespace dfkv {
 
+class ReplayTrace;
+
 // Fan-out width of TCP batches and of RDMA writes. RDMA reads do not use it:
 // they run on the process-wide ReadScheduler (DFKV_RDMA_READ_WORKERS).
 // When batch_concurrency is unset (0 = auto), use at least 8 workers so a
@@ -319,6 +321,28 @@ class KVClient {
   void StopProbe();
 
  private:
+  // Public batch entry points only wrap these existing bodies with optional
+  // replay observation; routing, retries and result production stay here.
+  std::vector<bool> BatchPutImpl(const std::vector<KvPutItem>& items,
+                                 std::vector<ItemStatus>* status);
+  std::vector<bool> BatchGetImpl(const std::vector<KvGetItem>& items,
+                                 std::vector<ItemStatus>* status);
+  std::vector<bool> BatchGetAutoImpl(const std::vector<KvGetItem>& items,
+                                     std::vector<size_t>* out_lens,
+                                     std::vector<ItemStatus>* status);
+  std::vector<bool> BatchExistImpl(const std::vector<std::string>& keys,
+                                   const KvRouteKeys* route_keys);
+  void BatchRetainImpl(const std::vector<std::string>& keys,
+                       const RetainRequest& req, uint8_t* out,
+                       const KvRouteKeys* route_keys);
+  std::vector<bool> BatchRemoveImpl(const std::vector<std::string>& keys,
+                                    const KvRouteKeys* route_keys);
+  std::vector<bool> BatchPutSgImpl(const std::vector<KvPutItemSg>& items,
+                                   std::vector<ItemStatus>* status);
+  std::vector<bool> BatchGetAutoSgImpl(const std::vector<KvGetItemSg>& items,
+                                       std::vector<size_t>* out_lens,
+                                       std::vector<ItemStatus>* status);
+
   std::string Route(const std::string& key,
                     std::string_view route_key = {}) const;
   // Route for an operation: Route, except that with cooldown reroute on and
@@ -693,6 +717,9 @@ class KVClient {
   std::condition_variable ring_cv_;  // notified when AdoptRing sets a non-empty ring
   std::string key_namespace_;
   BlockKeyHasher block_key_;  // ToBlockKey(key_namespace_, key)
+  // Null unless explicitly configured in the constructor. Every public batch
+  // checks this pointer before taking timestamps or deriving item metadata.
+  std::unique_ptr<ReplayTrace> replay_trace_;
   uint64_t namespace_hash_ = 0;
   std::unique_ptr<Transport> owned_;
   // Null until the constructor selects a transport; AdoptRing runs earlier

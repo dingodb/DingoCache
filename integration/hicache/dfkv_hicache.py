@@ -46,6 +46,7 @@ from dfkv_common import cabi as dfkv_cabi
 from dfkv_common.client_metrics import read_native_snapshot
 from dfkv_common.block_size import get_max_block_bytes, validate_object_sizes
 from dfkv_common.config_check import validate_extra_config
+from dfkv_common.replay_trace import ReplayTraceWriter as _ReplayTraceWriter
 
 from dfkv_access_log import (access_log, configure as _configure_access_log,
                             apply_hot as _access_log_apply_hot,
@@ -841,6 +842,7 @@ def _with_retain_scope(method):
 class DfkvHiCache(HiCacheStorage):
     # Defaults for instances built without __init__ (tests, subclasses).
     _has_retain = False
+    _replay_trace = None  # tests constructed without __init__ also stay disabled
     _retain_tls = threading.local()
     _pending_retain = None
 
@@ -1213,6 +1215,20 @@ class DfkvHiCache(HiCacheStorage):
             poll_s if poll_s > 0 else 10.0))
         self._peer_lat_poller = _push_metrics.start_peer_latency_poller(
             lambda: _read_snapshot(self._lib, self._h), peer_poll_s)
+        # Optional prefix evidence is configured once, after all real physical
+        # coordinates and the binary namespace are known. No request reads env.
+        self._replay_trace = _ReplayTraceWriter.from_env(
+            role="connector-prefix", key_namespace=self._key_namespace,
+            coordinates={
+                "dp_size": max(1, int(cfg.get("dp_size", 1))),
+                "dp_rank": getattr(storage_config, "dp_rank", None),
+                "tp_size": self.tp_size, "tp_rank": self.tp_rank,
+                "pcp_size": self.pcp_size, "pcp_rank": self.pcp_rank,
+                "storage_pcp_rank": self._storage_pcp_rank,
+                "dcp_size": self.dcp_size, "dcp_rank": self.dcp_rank,
+                "pp_size": self.pp_size, "pp_rank": self.pp_rank,
+                "physical_rank": self.physical_rank,
+            })
 
     def __del__(self):
         try:
@@ -1229,6 +1245,12 @@ class DfkvHiCache(HiCacheStorage):
             if getattr(self, "_peer_lat_poller", None):
                 self._peer_lat_poller.stop()
                 self._peer_lat_poller = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_replay_trace", None):
+                self._replay_trace.close()
+                self._replay_trace = None
         except Exception:
             pass
         try:
@@ -2915,8 +2937,54 @@ class DfkvHiCache(HiCacheStorage):
             # Fleet op metrics now come from the C++ KVClient snapshot (above).
             return res
 
+    def _trace_native_pages(self, keys, sks, per_page, components, chunks,
+                            device):
+        """Tag the exact native list just probed; never rebuild its identity."""
+        pages = []
+        at = 0
+        width = self._sg_width() if device else None
+        for _key in keys:
+            descriptors = []
+            for local, sk in enumerate(sks[at:at + per_page]):
+                component_index = (local // chunks) % len(components)
+                descriptors.append({
+                    "key": sk,
+                    "storage_kind": "sg_group" if device else "pool",
+                    "component": components[component_index],
+                    "component_index": component_index,
+                    "sg_group": local % chunks if device else None,
+                    "sg_width": width,
+                })
+            pages.append(descriptors)
+            at += per_page
+        if at != len(sks):
+            raise ValueError("prefix trace has unaligned native keys")
+        return pages
+
+    def _record_prefix_trace(self, trace, mark, operation, keys, native_pages,
+                             flat_results, probe_operation, refresh=None,
+                             result=None):
+        if trace is None:
+            return
+        native_results = []
+        at = 0
+        for descriptors in native_pages:
+            end = at + len(descriptors)
+            native_results.append(list(flat_results[at:end]))
+            at = end
+        if at != len(flat_results):
+            trace.observation_failed()
+            return
+        trace.record_prefix(
+            mark, operation=operation, probe_operation=probe_operation,
+            pages={"logical_keys": list(keys), "native_pages": native_pages,
+                   "native_results": native_results},
+            refresh=refresh, result=result)
+
     def batch_exists(self, keys, extra_info=None) -> int:
         total = len(keys)
+        trace = self._replay_trace
+        trace_mark = trace.mark() if trace is not None else None
         t0 = time.perf_counter()
         with _tracing.span("batch_exists", total) as _sp, \
                 access_log("batch_exists", lambda: f"{self._alog_tag} {total} keys") as r:
@@ -2926,9 +2994,11 @@ class DfkvHiCache(HiCacheStorage):
             # presence anchor in batch_get_v1 and retention. The bare object
             # key cannot match a chunked store; a different negotiated width
             # is a cold miss rather than a corrupt read.
+            trace_device = self._device_direct_active() if trace is not None else False
             sks = [sk for k in keys for sk in self._stored_keys("kv", k)]
             per_page = len(sks) // total if total else 0
-            page_ok = self._fold(self._batch_exist_flat(sks), total, per_page)
+            flat_found = self._batch_exist_flat(sks)
+            page_ok = self._fold(flat_found, total, per_page)
             n = 0
             for ok in page_ok:
                 if not ok:
@@ -2942,6 +3012,24 @@ class DfkvHiCache(HiCacheStorage):
             )
             r.result = f"prefix={n}/{total}"
             self._log_exist_probe(sks, n, total)
+            if trace is not None:
+                try:
+                    components = self._kv_components()
+                    chunks = per_page // len(components) if total else 1
+                    native_pages = self._trace_native_pages(
+                        keys, sks, per_page, components, chunks, trace_device)
+                    self._record_prefix_trace(
+                        trace, trace_mark, "batch_exists", keys, native_pages,
+                        flat_found,
+                        "retain_refresh" if self._has_retain else "exist",
+                        refresh={"mode": "refresh", "ttl_s": 0,
+                                 "attempted": bool(sks),
+                                 "native_item_results":
+                                     "not_available_at_connector_boundary"}
+                        if self._has_retain else None,
+                        result={"contiguous_prefix": n, "page_results": page_ok})
+                except Exception:
+                    trace.observation_failed()
             if _sp:
                 _sp.hits = n
             return n
@@ -3525,6 +3613,8 @@ class DfkvHiCache(HiCacheStorage):
 
     def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
         total = len(keys)
+        trace = self._replay_trace
+        trace_mark = trace.mark() if trace is not None else None
         with access_log("batch_exists_v2",
                         lambda: f"{self._alog_tag} {total} keys, "
                                 f"{_fmt_pools(pool_transfers)}") as r:
@@ -3543,6 +3633,8 @@ class DfkvHiCache(HiCacheStorage):
             # the keys are all known once the KV prefix is.
             probes = []
             sks = []
+            trace_native = [] if trace is not None else None
+            trace_boundaries = {} if trace is not None else None
             for tr in (pool_transfers or []) if kv_pages else ():
                 name = str(tr.name)
                 sub = self._pool_sub(name)
@@ -3555,6 +3647,15 @@ class DfkvHiCache(HiCacheStorage):
                            for k in keys[:kv_pages]
                            for sk in self._pool_keys(name, k, dev_side))
                 probes.append((tr, name, sub, start, len(sks)))
+                if trace is not None:
+                    try:
+                        components = self._pool_components(name)
+                        trace_native.append((start, len(sks),
+                            self._trace_native_pages(
+                                keys[:kv_pages], sks[start:], sub, components, 1,
+                                dev_side)))
+                    except Exception:
+                        trace.observation_failed()
             # Probed without renewing: as in SGLang's reference, the pools
             # after the one that leaves no usable prefix get no verdict, and
             # their objects must not be renewed for a prefix nobody can load.
@@ -3584,6 +3685,8 @@ class DfkvHiCache(HiCacheStorage):
                     serves = set(range(1, boundary + 1))
                 if boundary:
                     hit[name] = boundary
+                if trace is not None:
+                    trace_boundaries[(start, end)] = boundary
                 restorable &= serves
             if self._has_retain and judged:
                 # The renewal the probe would have made, for the judged pools.
@@ -3601,6 +3704,33 @@ class DfkvHiCache(HiCacheStorage):
             if total:
                 self._metrics.on_exists_v2(probe_pages=total,
                                            hit_pages=result.kv_hit_pages)
+            if trace is not None:
+                try:
+                    for start, end, native_pages in trace_native:
+                        tr, name, _sub, _start, _end = next(
+                            probe for probe in probes
+                            if probe[3] == start and probe[4] == end)
+                        refreshed = self._has_retain and (start, end) in judged
+                        self._record_prefix_trace(
+                            trace, trace_mark, "batch_exists_v2_pool",
+                            keys[:kv_pages], native_pages, found[start:end],
+                            "exist",
+                            refresh={"mode": "refresh", "ttl_s": 0,
+                                     "attempted": end > start,
+                                     "native_item_results":
+                                         "not_available_at_connector_boundary"}
+                            if refreshed else None,
+                            result={
+                                "pool": name,
+                                "hit_policy": getattr(tr.hit_policy, "name",
+                                                      str(tr.hit_policy)),
+                                "judged": (start, end) in judged,
+                                "pool_prefix_boundary": trace_boundaries.get(
+                                    (start, end)),
+                                "final_usable_prefix": final,
+                            })
+                except Exception:
+                    trace.observation_failed()
             return result
 
     # --- required abstract methods (non zero-copy / introspection) ---
