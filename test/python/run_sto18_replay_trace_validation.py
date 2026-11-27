@@ -71,7 +71,7 @@ def main() -> int:
         env["DFKV_REPLAY_TRACE_NATIVE_FIXTURE"] = str(artifacts / "batches")
         env["DFKV_REPLAY_TRACE_NATIVE_EMPTY_FIXTURE"] = str(artifacts / "rotation")
         validated = subprocess.run(
-            [sys.executable, "-m", "unittest", "-v", "test.python.test_sto18_replay_trace"],
+            [sys.executable, str(ROOT / "test/python/test_sto18_replay_trace.py"), "-v"],
             cwd=ROOT, env=env, check=False)
         if validated.returncode != 0:
             preserve(f"native-to-Python replay validation failed: {validated.returncode}")
