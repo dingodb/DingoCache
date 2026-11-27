@@ -230,7 +230,7 @@ def test_load_rotation_windows_and_stale_remove_preserve_anchor_alignment(
     )
     receiver._handle_request(request)
     assert store.gets == [
-        ([keys[1], keys[2]], [keys[0], keys[0]]),
+        ([keys[1], keys[2]], [keys[0], keys[2]]),
         ([keys[3], keys[0]], [keys[2], keys[0]]),
     ]
 
