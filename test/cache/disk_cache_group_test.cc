@@ -4,7 +4,9 @@
 #include "cache/disk_cache_group.h"
 #include "cache/disk_slab_store.h"
 #include "cache/log_store.h"
+#include "cache/lse_format.h"
 #include "cache/lse_io.h"
+#include "cache/store_dir_class.h"
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -21,6 +23,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -103,6 +106,26 @@ class ScopedEnv {
   std::string old_;
   bool had_old_ = false;
 };
+
+std::string ReadFileBytes(const fs::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+}
+
+// Metadata is at the root; extent and segment payload files need not be read
+// to prove that an ownership refusal changed no root file or directory entry.
+std::map<std::string, std::string> RootByteSnapshot(const fs::path& dir) {
+  std::map<std::string, std::string> out;
+  for (const auto& entry : fs::directory_iterator(dir)) {
+    const std::string name = entry.path().filename().string();
+    if (entry.is_regular_file())
+      out[name] = ReadFileBytes(entry.path());
+    else
+      out[name] = entry.is_directory() ? "<directory>" : "<other>";
+  }
+  return out;
+}
 
 class ProbeEngine final : public StoreEngine {
  public:
@@ -731,6 +754,96 @@ TEST_F(DiskGroupTest, RealSlabDisksOpenedTogetherKeepTheirData) {
         << i;
     EXPECT_EQ(out, value);
   }
+}
+
+TEST_F(DiskGroupTest, ExplicitSlabRejectsMixedSlabAndLseWithoutMutation) {
+  const fs::path dir = Dirs(1)[0];
+  constexpr uint64_t kCapacity = 1ull << 30;
+  const BlockKey key{73001, 0};
+  const std::string value(4096, 'm');
+  {
+    DiskCacheGroup slab({{dir.string()}, kCapacity, "slab"});
+    ASSERT_TRUE(slab.Healthy()) << slab.StartupError();
+    ASSERT_EQ(slab.Cache(key, value.data(), value.size()), Status::kOk);
+  }
+
+  // The marker is a byte-valid copy of a superblock written by a real LSE,
+  // not a filename-only stand-in.
+  const fs::path lse_source = base_ / "lse-source";
+  {
+    LogStore::Options options;
+    options.dir = lse_source.string();
+    options.capacity_bytes = 32ull << 20;
+    options.cleaner = false;
+    bool ok = false;
+    LogStore log(options, &ok);
+    ASSERT_TRUE(ok) << log.StartupError();
+    ASSERT_EQ(log.Cache(key, value.data(), value.size()), Status::kOk);
+  }
+  const fs::path source_super = lse_source / "lse_super";
+  const std::string superblock = ReadFileBytes(source_super);
+  ASSERT_GE(superblock.size(), lse::kBlockBytes);
+  lse::Superblock decoded;
+  ASSERT_EQ(lse::DecodeSuperblock(
+                reinterpret_cast<const uint8_t*>(superblock.data()),
+                /*allow_development=*/true, &decoded),
+            lse::DecodeError::kOk);
+  const fs::path mixed_super = dir / "lse_super";
+  ASSERT_TRUE(fs::copy_file(source_super, mixed_super));
+  ASSERT_EQ(ReadFileBytes(mixed_super), superblock);
+
+  StoreDirClassification found;
+  std::string error;
+  ASSERT_TRUE(ClassifyStoreDir(dir.string(), &found, &error)) << error;
+  ASSERT_EQ(found.cls, StoreDirClass::kConflict);
+  EXPECT_NE(std::find(found.deciding.begin(), found.deciding.end(),
+                      "slab_meta"),
+            found.deciding.end());
+  EXPECT_NE(std::find(found.deciding.begin(), found.deciding.end(),
+                      "lse_super"),
+            found.deciding.end());
+  const auto before = RootByteSnapshot(dir);
+  ASSERT_EQ(before.count("slab_meta"), 1u);
+  ASSERT_EQ(before.count("slots.tbl"), 1u);
+  ASSERT_EQ(before.at("lse_super"), superblock);
+
+  {
+    DiskCacheGroup mixed({{dir.string()}, kCapacity, "slab"});
+    EXPECT_FALSE(mixed.Healthy())
+        << "explicit slab accepted a directory also owned by LSE";
+  }
+  EXPECT_EQ(RootByteSnapshot(dir), before)
+      << "the mixed-ownership refusal changed slab or LSE root metadata";
+}
+
+TEST_F(DiskGroupTest, ExplicitSlabReopensOrdinarySlabWithCachedData) {
+  const fs::path dir = Dirs(1)[0];
+  constexpr uint64_t kCapacity = 1ull << 30;
+  const BlockKey key{73002, 0};
+  const std::string value(4096, 'o');
+  {
+    DiskCacheGroup slab({{dir.string()}, kCapacity, "slab"});
+    ASSERT_TRUE(slab.Healthy()) << slab.StartupError();
+    ASSERT_EQ(slab.Cache(key, value.data(), value.size()), Status::kOk);
+  }
+  StoreDirClassification found;
+  std::string error;
+  ASSERT_TRUE(ClassifyStoreDir(dir.string(), &found, &error)) << error;
+  ASSERT_EQ(found.cls, StoreDirClass::kSlab);
+  ASSERT_EQ(found.deciding.end(),
+            std::find(found.deciding.begin(), found.deciding.end(),
+                      "lse_super"));
+
+  DiskCacheGroup reopened({{dir.string()}, kCapacity, "slab"});
+  ASSERT_TRUE(reopened.Healthy()) << reopened.StartupError();
+  EXPECT_EQ(reopened.EngineName(), "slab");
+  EXPECT_EQ(reopened.Count(), 1u);
+  std::string out;
+  size_t value_len = 0;
+  ASSERT_EQ(reopened.Range(key, 0, value.size(), &out, &value_len),
+            Status::kOk);
+  EXPECT_EQ(out, value);
+  EXPECT_EQ(value_len, value.size());
 }
 
 // ---- Disks are opened first and activated together -------------------------

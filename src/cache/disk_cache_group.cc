@@ -188,11 +188,12 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     }
   }
   // The engine of each disk. "auto" and "log" decide it per directory from
-  // what the directory holds (docs/design/log-structured-engine.md §10.1);
-  // "slab" and "file" use one engine for every disk and leave the checks to
-  // the engine, as they always did.
+  // what the directory holds (docs/design/log-structured-engine.md §10.1).
+  // Explicit slab also refuses mixed slab/log ownership before its engine
+  // opens anything; its other layouts retain the engine's existing checks.
   std::vector<std::string> disk_engine(opt.cache_dirs.size(), engine);
-  if ((engine == "auto" || engine == "log") && !opt.engine_factory) {
+  if ((engine == "auto" || engine == "log" || engine == "slab") &&
+      !opt.engine_factory) {
     for (size_t i = 0; i < opt.cache_dirs.size(); ++i) {
       const std::string& dir = opt.cache_dirs[i];
       StoreDirClassification found;
@@ -207,6 +208,12 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       const std::string why =
           dir + " holds " + StoreDirClassName(found.cls) + " data (" +
           names + ")";
+      if (engine == "slab") {
+        if (found.cls != StoreDirClass::kConflict) continue;
+        fail("DFKV_STORE_ENGINE=slab, but " + why +
+             "; inspect the files, nothing was changed");
+        return;
+      }
       switch (found.cls) {
         case StoreDirClass::kEmpty:
           // Until the log engine is accepted, an empty directory under
