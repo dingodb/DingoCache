@@ -8774,6 +8774,284 @@ TEST(RdmaRailSuspect, MdsNamedPeerFailureChoosesSibling) {
   ExerciseSuspectSibling(/*named=*/true);
 }
 
+TEST(RdmaRailSuspect, RegistrationAfterSuspectWakeCannotStayLive) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "500");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv suspect_threshold("DFKV_RDMA_RAIL_SUSPECT_PEERS", "2");
+  ScopedEnv numa("DFKV_RDMA_NUMA", "0");
+  std::atomic<uint64_t> now_ms{100000};
+  std::atomic<bool> rewrite{false};
+  std::atomic<int> rewritten{0};
+  RdmaNode node("suspect-late-registration", kMaxMsg, false, false, {},
+                [&](ibv_wc* batch, int* count, size_t) {
+                  if (*count <= 0 || !rewrite.load() ||
+                      rewritten.load() != 0)
+                    return;
+                  rewritten.store(1);
+                  batch[0].status = IBV_WC_RETRY_EXC_ERR;
+                });
+  RdmaServerTestPeer::SetRetryObservationClock(
+      *node.rsrv, [&] { return now_ms.load(std::memory_order_relaxed); });
+  RdmaServerTestPeer::SeedRetryPeer(*node.rsrv, 0, "198.51.100.44",
+                                    now_ms.load());
+
+  // Establish the QP that will provide the real failed completion before
+  // arming the registration barrier or CQ rewrite.
+  RdmaTransport trigger(kMaxMsg, rails[0]);
+  {
+    auto* warm =
+        RdmaTransportTestPeer::AcquireControlOn(&trigger, node.addr, 0);
+    ASSERT_NE(warm, nullptr);
+    RdmaTransportTestPeer::ReleaseControl(&trigger, node.addr, warm);
+  }
+
+  std::mutex gate_mu;
+  std::condition_variable gate_cv;
+  bool gate_armed = false;
+  bool gate_entered = false;
+  bool gate_released = false;
+  RdmaServerTestPeer::SetBeforeLiveRegistration(node.rsrv.get(), [&] {
+    std::unique_lock<std::mutex> lock(gate_mu);
+    if (!gate_armed) return;
+    gate_armed = false;
+    gate_entered = true;
+    gate_cv.notify_all();
+    gate_cv.wait(lock, [&] { return gate_released; });
+  });
+  struct ReleaseRegistration {
+    RdmaServer* server;
+    std::mutex* mu;
+    std::condition_variable* cv;
+    bool* released;
+    ~ReleaseRegistration() {
+      {
+        std::lock_guard<std::mutex> lock(*mu);
+        *released = true;
+      }
+      cv->notify_all();
+      // Stop joins any Serve thread still returning from the callback. Only
+      // then is it safe to replace the std::function or destroy gate state.
+      server->Stop();
+      RdmaServerTestPeer::SetBeforeLiveRegistration(server, {});
+    }
+  } release_registration{node.rsrv.get(), &gate_mu, &gate_cv, &gate_released};
+  {
+    std::lock_guard<std::mutex> lock(gate_mu);
+    gate_armed = true;
+  }
+
+  // Finish the raw control bootstrap, but post no operation. The client keeps
+  // its real QP open throughout the barrier, so a client timeout cannot
+  // masquerade as the server's suspect-registration recheck.
+  PinnedPullPeer late_peer;
+  ASSERT_TRUE(late_peer.Open(node));
+  {
+    std::unique_lock<std::mutex> lock(gate_mu);
+    ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(3),
+                                 [&] { return gate_entered; }))
+        << "bootstrap did not reach before_live_registration";
+  }
+
+  // The paused connection already passed its resolved-device suspect check.
+  // A different, actual QP now supplies the threshold-crossing retry CQE and
+  // the 0->1 wake. The paused connection was not in live_eps_ for that wake.
+  rewrite.store(true, std::memory_order_release);
+  ASSERT_TRUE(DriveRewrittenServerFailures(node, trigger, 1));
+  ASSERT_TRUE(WaitForServerRailMetric(node, "dfkv_rdma_rail_suspect",
+                                      rails[0], 1));
+  EXPECT_EQ(DeviceCounterVal(node.rsrv->MetricsText(),
+                             "dfkv_rdma_rail_suspect", rails[1]),
+            0);
+
+  // No fixed delay: release only after observing the actual suspect state.
+  // The unrelated rail can complete a real operation while rail zero's
+  // registration is still paused.
+  RdmaTransport sibling_transport(kMaxMsg, rails[1]);
+  KVClient sibling({{"n", node.addr}}, SelfHdr(), &sibling_transport);
+  const std::string value = "sibling-still-serves";
+  ASSERT_TRUE(sibling.Put("late-registration-sibling", value.data(),
+                          value.size()));
+  {
+    std::lock_guard<std::mutex> lock(gate_mu);
+    gate_released = true;
+  }
+  gate_cv.notify_all();
+  const BlockKey late_key = ToBlockKey(SelfHdr(), "late-registration-key");
+  EncodeReqVersion(late_peer.ep.sbuf(0), kNativeProtoRdmaV2,
+                   WireOp::kExist, late_key, 0, 0, 0);
+  Status late_status = Status::kIOError;
+  uint64_t late_bytes = 0;
+  EXPECT_FALSE(late_peer.Exchange(kReqPrefix, &late_status, &late_bytes))
+      << "the late registration must not continue with a live data QP";
+  late_peer.Close();  // client-side FD/QP teardown is complete as well
+  for (int i = 0;
+       i < 600 &&
+       RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0) != 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0), 0u)
+      << "the registration recheck must wake the QP missed by the 0->1 wake";
+  // live_eps_ erasure precedes endpoint/ActiveConnection RAII. Waiting for the
+  // gauge proves both the failed QP and its later owners have been destroyed.
+  for (int i = 0; i < 600 && node.rsrv->ActiveConns() != 1; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(node.rsrv->ActiveConns(), 1u)
+      << "only the unrelated rail's live connection remains";
+  EXPECT_EQ(node.rsrv->PendingHandshakes(), 0u);
+  std::string out(value.size(), '\0');
+  ASSERT_TRUE(sibling.Get("late-registration-sibling", out.data(), out.size()));
+  EXPECT_EQ(out, value);
+}
+
+// Real unnamed control-plane bootstrap. local_rail selects the client's QP;
+// the DevFrame deliberately contains no device so the server's DefaultRail
+// chooses the remote endpoint. Full success includes QP-info exchange,
+// INIT->RTR->RTS, and the dynamic-only readiness response.
+bool OpenUnnamedControlPeer(RdmaNode& node, const std::string& local_rail) {
+  rdma::RcEndpoint ep;
+  ep.set_remote_access(false);  // a client QP is never an RDMA target
+  if (!ep.Open(local_rail.c_str(), rdma::kV2ControlCap, 1)) return false;
+  const int fd = net::Dial(node.addr, 2000, 2000);
+  if (fd < 0) return false;
+  char frame[rdma::kDevNameBytes], mine[rdma::kQpInfoBytes],
+      remote[rdma::kQpInfoBytes], ready[rdma::kV2RetirementReadinessBytes];
+  rdma::EncodeDevFrame(
+      "", rdma::kV2ControlCap | rdma::kDevFrameRequestDynamicOnly |
+              rdma::kDevFrameRequestPullRead |
+              rdma::kDevFrameRequestDynamicPull,
+      frame, rdma::kDevProtoV2);
+  rdma::QpInfo info = ep.Local();
+  info.depth = 1;
+  info.protocol_version = rdma::kDevProtoV2;
+  rdma::SerializeQpInfo(info, mine);
+  rdma::RecvSegmentInfo resident;
+  const bool ok =
+      net::WriteAll(fd, frame, sizeof(frame)) &&
+      net::WriteAll(fd, mine, sizeof(mine)) &&
+      net::ReadAll(fd, remote, sizeof(remote)) &&
+      ep.ConnectRtr(rdma::ParseQpInfo(remote)) &&
+      net::ReadAll(fd, ready, rdma::kV2DynamicOnlyReadinessBytes) &&
+      rdma::DecodeV2DynamicOnlyReadiness(
+          ready, rdma::kV2DynamicOnlyReadinessBytes, &resident) &&
+      ep.ConnectRts();
+  ::close(fd);
+  return ok;
+}
+
+TEST(RdmaRailSuspect, UnnamedBootstrapFailsClosedUntilOneRailExpires) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "500");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv suspect_threshold("DFKV_RDMA_RAIL_SUSPECT_PEERS", "2");
+  ScopedEnv numa("DFKV_RDMA_NUMA", "0");
+  std::atomic<uint64_t> now_ms{100000};
+  std::atomic<int> rewritten{0};
+  RdmaNode node("suspect-unnamed-all", kMaxMsg, false, false, {},
+                [&](ibv_wc* batch, int* count, size_t) {
+                  if (*count <= 0 || rewritten.load() >= 2) return;
+                  rewritten.fetch_add(1);
+                  batch[0].status = IBV_WC_RETRY_EXC_ERR;
+                });
+  RdmaServerTestPeer::SetRetryObservationClock(
+      *node.rsrv, [&] { return now_ms.load(std::memory_order_relaxed); });
+
+  // Each actual retry is ten virtual seconds apart. That lets one precise
+  // later timestamp expire only rail zero without any real sleeps.
+  RdmaServerTestPeer::SeedRetryPeer(*node.rsrv, 0, "198.51.100.50",
+                                    now_ms.load());
+  {
+    RdmaTransport transport(kMaxMsg, rails[0]);
+    ASSERT_TRUE(DriveRewrittenServerFailures(node, transport, 1));
+    ASSERT_TRUE(WaitForServerRailMetric(node, "dfkv_rdma_rail_suspect",
+                                        rails[0], 1));
+  }
+  now_ms.store(110000, std::memory_order_relaxed);
+  RdmaServerTestPeer::SeedRetryPeer(*node.rsrv, 1, "198.51.100.51",
+                                    now_ms.load());
+  {
+    RdmaTransport transport(kMaxMsg, rails[1]);
+    ASSERT_TRUE(DriveRewrittenServerFailures(node, transport, 2));
+    ASSERT_TRUE(WaitForServerRailMetric(node, "dfkv_rdma_rail_suspect",
+                                        rails[1], 1));
+  }
+  for (int i = 0;
+       i < 600 &&
+       (RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0) != 0 ||
+        RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 1) != 0); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0), 0u);
+  ASSERT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 1), 0u);
+  for (int i = 0; i < 600 && node.rsrv->ActiveConns() != 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_EQ(node.rsrv->ActiveConns(), 0u);
+  const uint64_t accepted_before = node.rsrv->V2Conns();
+  const long refusals_before = CounterVal(
+      node.rsrv->MetricsText(), "dfkv_rdma_suspect_rail_refusals_total");
+  const auto pending_cleared = [&] {
+    for (int i = 0; i < 600 && node.rsrv->PendingHandshakes() != 0; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return node.rsrv->PendingHandshakes() == 0;
+  };
+  const BlockKey key = ToBlockKey(SelfHdr(), "unnamed-not-a-tcp-fallback");
+  const std::string value = "must-not-write";
+  EXPECT_FALSE(OpenUnnamedControlPeer(node, rails[0]))
+      << "every resolved remote rail is suspect; the unnamed wire bootstrap "
+         "must close instead of inventing a usable default";
+  EXPECT_GT(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_suspect_rail_refusals_total"),
+            refusals_before)
+      << "local Open/dial/write failure cannot satisfy this refusal control";
+  ASSERT_TRUE(pending_cleared());
+  EXPECT_EQ(node.rsrv->V2Conns(), accepted_before);
+  EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
+  EXPECT_EQ(node.rsrv->PendingHandshakes(), 0u);
+  EXPECT_EQ(node.CacheDirectCalls(key), 0u);
+  EXPECT_EQ(DeviceCounterVal(node.rsrv->MetricsText(),
+                             "dfkv_rdma_rail_suspect", rails[0]),
+            1);
+  EXPECT_EQ(DeviceCounterVal(node.rsrv->MetricsText(),
+                             "dfkv_rdma_rail_suspect", rails[1]),
+            1);
+
+  now_ms.store(130001, std::memory_order_relaxed);  // rail 0: 30001; rail 1: 10001
+  ASSERT_TRUE(OpenUnnamedControlPeer(node, rails[0]))
+      << "the empty device frame must now really bootstrap on recovered rail 0";
+  EXPECT_EQ(node.rsrv->V2Conns(), accepted_before + 1);
+  EXPECT_EQ(DeviceCounterVal(node.rsrv->MetricsText(),
+                             "dfkv_rdma_rail_suspect", rails[0]),
+            0);
+  EXPECT_EQ(DeviceCounterVal(node.rsrv->MetricsText(),
+                             "dfkv_rdma_rail_suspect", rails[1]),
+            1);
+  const long before_last_refusal = CounterVal(
+      node.rsrv->MetricsText(), "dfkv_rdma_suspect_rail_refusals_total");
+  RdmaTransport still_refused(kMaxMsg, rails[1]);
+  EXPECT_EQ(still_refused.Cache(node.addr, key, value.data(), value.size()),
+            Status::kIOError)
+      << "only rail zero expired; rail one must remain fail-closed";
+  EXPECT_GT(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_suspect_rail_refusals_total"),
+            before_last_refusal)
+      << "the failed operation must really reach the suspect rail's refusal";
+  EXPECT_EQ(node.CacheDirectCalls(key), 0u);
+  ASSERT_TRUE(pending_cleared());
+  EXPECT_EQ(node.rsrv->PendingHandshakes(), 0u);
+  ASSERT_TRUE(OpenUnnamedControlPeer(node, rails[0]))
+      << "recovered rail remains available to a subsequent real bootstrap";
+}
+
 }  // namespace
 
 TEST(RdmaLoopback, ServerFailedCompletionNamesPeerDeviceAndStatusSync) {
