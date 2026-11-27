@@ -2,18 +2,22 @@
 import ctypes
 import hashlib
 import os
+import struct
 import sys
 import threading
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 import torch
+from vllm.distributed.kv_events import BlockStored
 from vllm.v1.core.kv_cache_utils import BlockHash
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from _cache_api import cache_group, full_attention_spec  # noqa: E402
 from _coordinator_fake import fake_coordinator  # noqa: E402
 from dfkv_common import cabi as dfkv_cabi  # noqa: E402
+from dfkv_common.replay_trace import block_key_filename  # noqa: E402
 from dfkv_vllm import dfkv_client as client_module  # noqa: E402
 from dfkv_vllm import worker as worker_module  # noqa: E402
 from dfkv_vllm.coordinator import DfkvStoreCoordinator  # noqa: E402
@@ -61,6 +65,75 @@ def _db():
 
 def _key(db, h):
     return PoolKey(db.metadata, h.hex()).to_bytes()
+
+
+class _CaptureStore:
+    """Capture the exact logical object and routing bytes crossing SAVE."""
+
+    def __init__(self):
+        self.objects = set()
+        self.probes = []
+        self.puts = []
+
+    def batch_exist(self, keys, *, route_keys=None):
+        keys = list(keys)
+        routes = None if route_keys is None else list(route_keys)
+        self.probes.append((keys, routes))
+        return [int(key in self.objects) for key in keys]
+
+    def batch_put_sg(self, keys, _ptrs, _sizes, *, route_keys=None):
+        keys = list(keys)
+        routes = None if route_keys is None else list(route_keys)
+        self.puts.append((keys, routes))
+        self.objects.update(keys)
+        return [0] * len(keys)
+
+
+def _decode_pool_key(wire):
+    """Strictly decode all self-delimiting fields in an actual PoolKey."""
+    magic = b"DFKVPOOL\x02"
+    assert wire.startswith(magic)
+    offset = len(magic)
+
+    def field():
+        nonlocal offset
+        size, = struct.unpack_from("<I", wire, offset)
+        offset += 4
+        value = wire[offset:offset + size]
+        assert len(value) == size
+        offset += size
+        return value
+
+    pool = field()
+    page_hash = field()
+    # Exactly five (size, rank) pairs precede group_id/component.
+    axes = struct.unpack_from("<IiIiIiIiIi", wire, offset)
+    offset += 5 * 8
+    group_id, = struct.unpack_from("<I", wire, offset)
+    offset += 4
+    component = field()
+    assert offset == len(wire)
+    return {
+        "pool": pool,
+        "page_hash": page_hash,
+        "axes": axes,
+        "group_id": group_id,
+        "component": component,
+    }
+
+
+def _native_block_key(object_key):
+    """Decode the native (tenant, digest_hi, digest_lo) eviction identity."""
+    encoded = block_key_filename(b"affinity-test-namespace", object_key)
+    assert len(encoded) == 48
+    return tuple(int(encoded[i:i + 16], 16) for i in (0, 16, 32))
+
+
+def _decode_events(events):
+    return [
+        msgspec.msgpack.decode(msgspec.msgpack.encode(event), type=BlockStored)
+        for event in events
+    ]
 
 
 def test_config_validation_defaults_to_zero_and_rejects_non_integers():
@@ -111,6 +184,206 @@ def test_anchor_fails_closed_when_absolute_first_page_hash_is_unavailable():
     )
     with pytest.raises(ValueError, match="absolute segment-first hash"):
         _segment_anchor_key(db, 5 * BLOCK, key, hashes, PAGES)
+
+
+def test_shared_prefix_dedup_routes_and_native_identity_have_no_request_lineage():
+    hashes = _hashes(2)
+
+    def page_hash(label):
+        return BlockHash(hashlib.sha256(label.encode()).digest())
+
+    requests = []
+    for req_id, first_block, token_base in (
+        ("request-a", 1, 200),
+        ("request-b", 11, 300),
+    ):
+        divergent = [page_hash(f"{req_id}-{i}") for i in range(2)]
+        requests.append(ReqMeta(
+            req_id=req_id, token_len_chunk=4 * BLOCK,
+            block_ids=(list(range(first_block, first_block + 4)),),
+            block_hashes=hashes + divergent, can_save=True,
+            token_ids=list(range(100, 100 + 2 * BLOCK)) + list(
+                range(token_base, token_base + 2 * BLOCK)
+            ),
+        ))
+
+    store = _CaptureStore()
+    db = _db()
+    sender = KVCacheStoreSendingThread(
+        store,
+        fake_coordinator(
+            BLOCK, store_mask=lambda n: [[True] * (n // BLOCK)]
+        ),
+        [db], BLOCK, 0, 0, 1, "kv_producer", threading.Event(),
+        enable_kv_event=True, segment_affinity_pages=PAGES,
+    )
+
+    def save(request):
+        sender.add_stored_request(request)
+        sender._handle_request(request)
+        return _decode_events(sender.get_kv_events())
+
+    # Reverse construction order so content position, not construction/batch
+    # position, determines the common anchors. The second request dedups its
+    # two common objects and only PUTs/publishes its divergent suffix.
+    second_events = save(requests[1])
+    first_events = save(requests[0])
+    second_probe, second_routes = store.probes[0]
+    first_probe, first_routes = store.probes[1]
+    assert store.probes[0][0][:2] == first_probe[:2]
+    assert second_routes[:2] == first_routes[:2] == [
+        second_probe[0], second_probe[0]
+    ]
+    assert second_probe[2:] != first_probe[2:]
+    assert store.puts[0][0] == second_probe
+    assert store.puts[1][0] == first_probe[2:]
+
+    # Every captured key strictly decodes to pool/hash/rank/group/component;
+    # metadata stops at the end of those fields. Native storage/eviction then
+    # sees only the corresponding tenant+digest triples. Equal common keys are
+    # shared content identity, never a unique request chain identifier.
+    for key in (*second_probe, *first_probe):
+        decoded = _decode_pool_key(key)
+        assert decoded["page_hash"]
+        assert decoded["axes"] == (1, -1, 1, 0, 1, 0, 1, 0, 1, 0)
+        assert decoded["group_id"] == 0
+    assert [_native_block_key(key) for key in second_probe[:2]] == [
+        _native_block_key(key) for key in first_probe[:2]
+    ]
+    assert [_native_block_key(key) for key in second_probe[2:]] != [
+        _native_block_key(key) for key in first_probe[2:]
+    ]
+
+    converted = worker_module.maybe_convert_block_hash
+    second_hashes = requests[1].block_hashes
+    first_hashes = requests[0].block_hashes
+    assert [event.block_hashes for event in second_events] == [
+        [converted(h)] for h in second_hashes
+    ]
+    assert [event.parent_block_hash for event in second_events] == [
+        None, converted(second_hashes[0]), converted(second_hashes[1]),
+        converted(second_hashes[2]),
+    ]
+    assert [event.block_hashes for event in first_events] == [
+        [converted(h)] for h in first_hashes[2:]
+    ]
+    assert [event.parent_block_hash for event in first_events] == [
+        converted(first_hashes[1]), converted(first_hashes[2])
+    ]
+
+    # Route hints are parallel call data only: with affinity disabled the same
+    # real SAVE presents byte-identical primary object keys to dfkv.
+    plain_store = _CaptureStore()
+    plain_sender = KVCacheStoreSendingThread(
+        plain_store,
+        fake_coordinator(
+            BLOCK, store_mask=lambda n: [[True] * (n // BLOCK)]
+        ),
+        [_db()], BLOCK, 0, 0, 1, "kv_producer", threading.Event(),
+        segment_affinity_pages=0,
+    )
+    plain_sender.add_stored_request(requests[1])
+    plain_sender._handle_request(requests[1])
+    assert plain_store.probes == [(second_probe, None)]
+    assert plain_store.puts == [(second_probe, None)]
+
+
+def test_full_block_events_skip_prefix_but_exclude_partial_boundary_tail():
+    # Half-block hashes let the prompt checkpoint at token 10 address the
+    # whole block [8, 12), while full positional objects combine two hashes.
+    db = ChunkedTokenDatabase(
+        _metadata(), BLOCK, hash_block_size=BLOCK // 2
+    )
+    db.set_seg_layout([(0x1000, 8, 8)])
+    hashes = _hashes(6)
+    store = _CaptureStore()
+    sender = KVCacheStoreSendingThread(
+        store,
+        fake_coordinator(
+            BLOCK, hash_block_size=BLOCK // 2,
+            enable_partial_hash_hits=True,
+            store_mask=lambda n: [[True] * (n // BLOCK)],
+            load_mask=lambda _h, boundary: [[True] * (
+                (boundary + BLOCK - 1) // BLOCK
+            )],
+            partial_tail_boundary=lambda _n: 10,
+        ),
+        [db], BLOCK, 0, 0, 1, "kv_producer", threading.Event(),
+        enable_kv_event=True, segment_affinity_pages=PAGES,
+    )
+
+    def save(token_len, num_prompt_tokens=None):
+        request = ReqMeta(
+            req_id="partial-tail", token_len_chunk=token_len,
+            block_ids=([1, 2, 3],), block_hashes=hashes, can_save=True,
+            token_ids=list(range(3 * BLOCK)),
+            num_prompt_tokens=num_prompt_tokens,
+        )
+        sender.add_stored_request(request)
+        sender._handle_request(request)
+        return _decode_events(sender.get_kv_events())
+
+    events = save(2 * BLOCK, num_prompt_tokens=11)
+    assert len(events) == 2
+    assert [event.parent_block_hash for event in events] == [
+        None, events[0].block_hashes[0]
+    ]
+    assert [event.token_ids for event in events] == [
+        list(range(BLOCK)), list(range(BLOCK, 2 * BLOCK))
+    ]
+
+    # The actual third probe/PUT is the partial checkpoint H(tokens[:10]).
+    # It has neither a root nor any other BlockStored event: off-grid objects
+    # deliberately carry no parent lineage, including None-parent events.
+    keys, routes = store.probes[0]
+    assert len(keys) == 3
+    tail_key = keys[-1]
+    assert _decode_pool_key(tail_key)["page_hash"] == hashes[4].hex().encode()
+    assert routes[-1] == tail_key
+    converted_tail = worker_module.maybe_convert_block_hash(hashes[4])
+    assert all(converted_tail not in event.block_hashes for event in events)
+
+    # The next SAVE skips the two confirmed full objects, but its event still
+    # parents to the preceding *full* block, not the tail at the same start.
+    preceding_full_hash = events[1].block_hashes[0]
+    events = save(3 * BLOCK)
+    assert len(events) == 1
+    full_third_key, full_third_routes = store.probes[1]
+    assert len(full_third_key) == 1
+    assert full_third_key[0] != tail_key
+    assert full_third_routes == full_third_key
+    assert events[0].parent_block_hash == preceding_full_hash
+    assert events[0].token_ids == list(range(2 * BLOCK, 3 * BLOCK))
+
+
+def test_offloaded_state_has_an_anchor_but_no_placeholder_parent_event():
+    hashes = _hashes(2)
+    store = _CaptureStore()
+    db = _db()
+    sender = KVCacheStoreSendingThread(
+        store,
+        fake_coordinator(
+            BLOCK, enable_partial_hash_hits=True,
+            store_mask=lambda n: [[True] * (n // BLOCK)],
+        ),
+        [db], BLOCK, 0, 0, 1, "kv_producer", threading.Event(),
+        enable_kv_event=True, segment_affinity_pages=PAGES,
+        tp_sharded_groups=frozenset({0}),
+    )
+    request = ReqMeta(
+        req_id="state-only", token_len_chunk=0,
+        block_ids=([1, 2],), block_hashes=hashes, can_save=True,
+        token_ids=list(range(2 * BLOCK)),
+        state_blocks={0: {2 * BLOCK: 9}},
+    )
+    sender.add_stored_request(request)
+    sender._handle_request(request)
+
+    (keys, routes), = store.probes
+    assert keys == [_key(db, hashes[1])]
+    assert routes == [_key(db, hashes[0])]
+    assert _decode_pool_key(keys[0])["page_hash"] == hashes[1].hex().encode()
+    assert sender.get_kv_events() == []
 
 
 def test_window_get_slices_routes_exactly_with_keys_and_descriptors():
