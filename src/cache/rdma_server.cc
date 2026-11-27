@@ -130,6 +130,18 @@ uint64_t MaxPendingHandshakes(uint64_t fallback) {
   return out;
 }
 
+uint64_t RailSuspectPeerThreshold() {
+  envparse::U64Spec spec;
+  spec.fallback = 0;  // opt-in only; zero preserves observation-only behavior
+  spec.max = 64;      // PeerWindow's fixed per-rail host capacity
+  spec.overflow_is_default = true;
+  const uint64_t out =
+      envparse::EnvU64("DFKV_RDMA_RAIL_SUSPECT_PEERS", spec);
+  config_dump::RecordResolved("DFKV_RDMA_RAIL_SUSPECT_PEERS",
+                              std::to_string(out));
+  return out;
+}
+
 uint64_t RecvChunkIdleMs() {
   envparse::U64Spec spec;
   spec.overflow_is_default = true;
@@ -224,6 +236,7 @@ RdmaServer::RdmaServer(Handler handler, size_t max_msg,
   }
   auto_device_ = dev_name_.empty();
   max_pending_handshakes_ = MaxPendingHandshakes(kDefaultMaxPendingHandshakes);
+  rail_suspect_peers_ = RailSuspectPeerThreshold();
   config_dump::RecordResolved("DFKV_RDMA_DEV",
                               dev_name_.empty() ? "(auto)" : dev_name_);
   // --rdma-dev accepts a comma list; every selected device gets a lifetime
@@ -469,6 +482,9 @@ Status RdmaServer::Start(int port) {
   rail_retry_peers_.clear();
   for (size_t i = 0; i < anchor_devs_.size(); ++i)
     rail_retry_peers_.push_back(std::make_unique<PeerWindow>());
+  rail_suspect_ =
+      std::make_unique<std::atomic<bool>[]>(anchor_devs_.size());
+  for (size_t i = 0; i < anchor_devs_.size(); ++i) rail_suspect_[i] = false;
   recv_segment_registered_rails_ = anchors_.size();
   LogTopologySummary(requested_devices.size(), anchors_.size(),
                      discovery.devices);
@@ -627,10 +643,44 @@ Status RdmaServer::Start(int port) {
   return Status::kOk;
 }
 
+uint64_t RdmaServer::RetryObservationMs() const {
+  return retry_observation_ms_for_test_
+             ? retry_observation_ms_for_test_()
+             : SteadyUs() / 1000;
+}
+
+bool RdmaServer::RailSuspect(size_t rail, uint64_t now_ms) const {
+  // The default-off path takes neither the window lock nor a new data-plane
+  // branch beyond this integer test.
+  if (rail_suspect_peers_ == 0 || rail >= rail_retry_peers_.size())
+    return false;
+  bool expired = false;
+  bool suspect;
+  {
+    // The same mutex covers retry Note/Count/crossing below. An expiry that
+    // raced a new threshold-crossing failure can therefore neither erase the
+    // new state nor make that failure skip its one-time wake.
+    std::lock_guard<std::mutex> lock(rail_suspect_mu_);
+    suspect = rail_retry_peers_[rail]->Count(now_ms) >= rail_suspect_peers_;
+    if (!suspect)
+      expired = rail_suspect_[rail].exchange(false, std::memory_order_acq_rel);
+  }
+  if (expired)
+    DFKV_LOG_WARN("rdma: rail " + anchor_devs_[rail] +
+                  " is no longer retry-peer suspect after the 30 s "
+                  "observation window; the next admission may use it");
+  return suspect;
+}
+
 size_t RdmaServer::DefaultRail() const {
-  for (size_t i = 0; rail_port_state_ && i < anchor_devs_.size(); ++i)
-    if (rail_port_state_[i].load(std::memory_order_acquire) != 0) return i;
-  return 0;
+  const uint64_t now_ms =
+      rail_suspect_peers_ == 0 ? 0 : RetryObservationMs();
+  for (size_t i = 0; rail_port_state_ && i < anchor_devs_.size(); ++i) {
+    if (rail_port_state_[i].load(std::memory_order_acquire) == 0) continue;
+    if (rail_suspect_peers_ != 0 && RailSuspect(i, now_ms)) continue;
+    return i;
+  }
+  return 0;  // the handshake below fails closed if every rail is unavailable
 }
 
 void RdmaServer::CheckRailPorts() {
@@ -1361,6 +1411,18 @@ void RdmaServer::Serve(
     close_boot();
     return;
   }
+  if (rail_suspect_peers_ != 0 &&
+      RailSuspect(rail_index, RetryObservationMs())) {
+    const uint64_t n =
+        suspect_rail_refusals_.fetch_add(1, std::memory_order_relaxed);
+    if (n == 0 || (n & 0x3FFu) == 0)
+      DFKV_LOG_WARN("rdma: refusing new bootstrap on retry-peer suspect "
+                    "rail dev=" + dev + " threshold_peers=" +
+                    std::to_string(rail_suspect_peers_) +
+                    " window_ms=30000 refusals=" + std::to_string(n + 1));
+    close_boot();
+    return;
+  }
   RailStats& rail_stats = *rail_stats_[rail_index];
   const int rail_numa = anchors_[rail_index]->numa_node();
   // Resolved once per real connection, while the bootstrap socket is still
@@ -1771,6 +1833,12 @@ void RdmaServer::Serve(
       ep.Wake();
       rail_down_connections_ended_.fetch_add(1, std::memory_order_relaxed);
     }
+    // Likewise, a retry failure can make this rail suspect between its
+    // bootstrap check and this registration. Never leave the new QP behind
+    // the transition's wake.
+    if (rail_suspect_peers_ != 0 &&
+        rail_suspect_[rail_index].load(std::memory_order_acquire))
+      ep.Wake();
   }
   // From now on a close of the client's end wakes this thread, which ends
   // the connection (WaitComp returns -1, as for Stop).
@@ -2643,8 +2711,42 @@ void RdmaServer::Serve(
     // per-rail count of distinct addresses (many on one rail point at the
     // rail's path, one at that peer; pods of one host count separately).
     if (wc.status == IBV_WC_RETRY_EXC_ERR ||
-        wc.status == IBV_WC_RNR_RETRY_EXC_ERR)
-      rail_retry_peers_[rail_index]->Note(PeerHost(peer_addr), SteadyUs() / 1000);
+        wc.status == IBV_WC_RNR_RETRY_EXC_ERR) {
+      const uint64_t now_ms = RetryObservationMs();
+      const std::string host = PeerHost(peer_addr);
+      if (rail_suspect_peers_ == 0) {
+        rail_retry_peers_[rail_index]->Note(host, now_ms);
+      } else {
+        size_t peers = 0;
+        bool crossed = false;
+        {
+          std::lock_guard<std::mutex> lock(rail_suspect_mu_);
+          rail_retry_peers_[rail_index]->Note(host, now_ms);
+          peers = rail_retry_peers_[rail_index]->Count(now_ms);
+          if (peers >= rail_suspect_peers_ &&
+              !rail_suspect_[rail_index].load(std::memory_order_acquire)) {
+            rail_suspect_[rail_index].store(true, std::memory_order_release);
+            crossed = true;
+          }
+        }
+        if (crossed) {
+          // This is a bounded correlation, never a physical-port or MDS
+          // health claim. Retire only QPs on the observed rail; the client's
+          // existing posted-PUT ambiguity and replay rules stay untouched.
+          DFKV_LOG_WARN("rdma: rail " + dev +
+                        " is retry-peer suspect: distinct_peers=" +
+                        std::to_string(peers) + " threshold_peers=" +
+                        std::to_string(rail_suspect_peers_) +
+                        " window_ms=30000 status=" +
+                        rdma::WcStatusName(wc.status) +
+                        "; waking only this rail's existing connections");
+          std::lock_guard<std::mutex> lock(conn_mu_);
+          for (const auto& [endpoint, live] : live_eps_) {
+            if (live.rail == rail_index) endpoint->Wake();
+          }
+        }
+      }
+    }
     DFKV_LOG_WARN(
         "rdma server CQ failure loop=" + std::string(loop) +
         " status=" + std::to_string(wc.status) +
@@ -3329,6 +3431,10 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_inactive_rail_refusals_total", "counter",
     "Bootstrap connections refused because their rail's port was not ACTIVE",
     inactive_rail_refusals_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_suspect_rail_refusals_total", "counter",
+    "Bootstrap connections refused on an opt-in retry-peer suspect rail "
+    "(DFKV_RDMA_RAIL_SUSPECT_PEERS)",
+    suspect_rail_refusals_.load(std::memory_order_relaxed));
   m(s, "dfkv_rdma_rail_down_connections_ended_total", "counter",
     "Connections ended because their rail's port stopped being ACTIVE",
     rail_down_connections_ended_.load(std::memory_order_relaxed));
@@ -3425,7 +3531,7 @@ std::string RdmaServer::MetricsText() const {
                 return r.completion_errors.load(std::memory_order_relaxed);
               });
   {
-    const uint64_t now_ms = SteadyUs() / 1000;
+    const uint64_t now_ms = RetryObservationMs();
     s += "# HELP dfkv_rdma_rail_retry_exhausted_peers Distinct peer addresses whose "
          "connection on this device ended with RETRY_EXC or RNR_RETRY_EXC in "
          "the last 30 s\n";
@@ -3434,6 +3540,14 @@ std::string RdmaServer::MetricsText() const {
       s += "dfkv_rdma_rail_retry_exhausted_peers{dev=\"" +
            PromLabelEscape(anchor_devs_[i]) + "\"} " +
            std::to_string(rail_retry_peers_[i]->Count(now_ms)) + "\n";
+    s += "# HELP dfkv_rdma_rail_suspect Opt-in retry-peer correlation "
+         "currently excluding this rail from new server admission; this is "
+         "not a physical-port or hardware health verdict\n";
+    s += "# TYPE dfkv_rdma_rail_suspect gauge\n";
+    for (size_t i = 0; i < rail_retry_peers_.size(); ++i)
+      s += "dfkv_rdma_rail_suspect{dev=\"" +
+           PromLabelEscape(anchor_devs_[i]) + "\"} " +
+           (RailSuspect(i, now_ms) ? "1\n" : "0\n");
   }
   // Lazily populated: a series appears with its first failure, so the label
   // set stays at (devices x statuses that actually occurred).

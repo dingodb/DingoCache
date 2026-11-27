@@ -575,6 +575,26 @@ journalctl -u dfkv -n 10 --no-pager
 >
 > **server 端口状态**：server 用同一个 `DFKV_RDMA_PORT_CHECK_MS` 在单独的线程里查各 rail 的端口（server 上默认 0，即关闭，行为与以前相同；建议设 1000，下面说的都是打开后的变化）（不占握手或服务线程，查询时不持这些线程要的锁）。端口不是 ACTIVE 的 rail：新连接在握手时直接关掉、不回答（`dfkv_rdma_inactive_rail_refusals_total`），client 当作对端忙暂停约 20 ms 再试一次，第二次仍被关就冷却 server 的这条 rail、改走别的 rail，不再在建好却走不通的 QP 上等 RC 重试耗尽；只有这一条 rail 的 client 立刻得到失败。端口连续两次查询都不是 ACTIVE 时（只有一次时只拒绝新连接，链路在一个查询周期内重新训练好的话已有连接不受影响），这条 rail 上已有的连接立即结束（只动这条 rail，`dfkv_rdma_rail_down_connections_ended_total`），释放它们的 pin 和接收槽；开了 `DFKV_RDMA_SESSION_FD` 的 client 复用前就能发现，否则下次使用时照旧等一次 RC 超时。状态变化（每条 rail 每秒至多一次；一秒内被压下的变化，在一秒过后的第一次查询时若仍成立再补发）会让 server 立刻向 MDS 发一次心跳，健康信息随之更新，client 下一次轮询（约 3 s）就看到，而不是最多等一个心跳间隔（10 s）。不指定设备的连接分到第一条不是 DOWN 的 rail。查询失败按未知处理，保持上次看到的状态；端口查询一直失败的设备（状态 -1）永远不会被确认为 DOWN，它上面的连接照旧靠自身的失败结束。`dfkv_rdma_rail_port_active{dev}` 是各 rail 最近一次看到的状态。“端口 ACTIVE 但路径不通”这里检测不到。
 >
+> **server retry-peer suspect（默认关闭）**：`DFKV_RDMA_RAIL_SUSPECT_PEERS`
+> 是 server 端显式 opt-in 的不同对端 IP 阈值，默认 `0` 完全保留原行为；可选
+> `1..64`，非法值或超过 64 回退到 0。**没有推荐或已在生产验证的 incident /
+> routing 阈值，不能照搬告警里的 3。** 只有现有窗口已经接收的
+> `IBV_WC_RETRY_EXC_ERR` 和 `IBV_WC_RNR_RETRY_EXC_ERR` 会参与：同一 host 的多个
+> QP 只算一次，非 retry 错误、静默 deadline、其他 rail 和 30 s 前的事件都不算；
+> RNR 还可能是对端 backpressure，只有有限 RNR retry 设置才会耗尽。达到阈值的实际
+> CQ failure 会把这条 rail 标为 *suspect*，唤醒且只唤醒这条 rail 上已有连接，随后
+> resolved-device bootstrap 在回复前关闭并记录明确日志，计数
+> `dfkv_rdma_suspect_rail_refusals_total`；未命名 client 的 DefaultRail 也排除当前
+> suspect。client 仍使用既有 busy/refusal、确认冷却和 sibling 行为，HLT1、client
+> 默认值、posted-PUT ambiguity/replay 规则均不变。该状态不写成物理端口 DOWN，不
+> 上报 MDS demotion，不改变 placement。它是租约长度为 30 s 的相关性窗口，不是
+> 永久隔离：下一次准入会确定性地重算，过期才允许该 rail 再接入，不新增后台线程；
+> 所有可用 rail 都 suspect/DOWN 时仍 fail closed，不静默改走 TCP，也不重放有歧义
+> PUT。开启前应评估 NAT/共享源地址、64-host LRU 上限、误判最后可用 rail 的可用性
+> 风险及真实 provider 的有限重传设置。Soft-RoCE 测试中的 CQ rewrite 只验证生产
+> 归因、状态转换和路由接线，**不能证明真实 NIC/link black-hole 的状态码、内核 /
+> provider 计时或恢复行为**，后者仍需不同 client 源地址和选择性丢路径的实网验收。
+>
 > GPU/CPU 异构示例（名称仅为示例，生产须用两端实际同 fabric 名）：
 > ```bash
 > # GPU host: two preferred rails plus one lower-bandwidth fallback

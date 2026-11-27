@@ -127,6 +127,19 @@ class RdmaServerTestPeer {
   static size_t DefaultRail(const RdmaServer& server) {
     return server.DefaultRail();
   }
+  static uint64_t RailSuspectPeers(const RdmaServer& server) {
+    return server.rail_suspect_peers_;
+  }
+  static void SeedRetryPeer(RdmaServer& server, size_t rail,
+                            const std::string& host, uint64_t now_ms) {
+    // Observation only. The test must still deliver a genuine polled CQE
+    // through the production rewrite seam to make a suspect transition.
+    server.rail_retry_peers_.at(rail)->Note(host, now_ms);
+  }
+  static void SetRetryObservationClock(
+      RdmaServer& server, std::function<uint64_t()> now_ms) {
+    server.retry_observation_ms_for_test_ = std::move(now_ms);
+  }
   static size_t AnchorCount(const RdmaServer& server) {
     return server.anchors_.size();
   }
@@ -8405,6 +8418,364 @@ TEST(RdmaLoopback, RetryExhaustedConnectionsCountTheirPeerHostOnce) {
   }
 }
 
+namespace {
+
+bool DriveRewrittenServerFailures(RdmaNode& node, RdmaTransport& transport,
+                                  size_t target) {
+  const std::vector<BlockKey> keys = {
+      ToBlockKey(SelfHdr(), "rail-suspect-drive")};
+  std::vector<char> exists;
+  for (int attempt = 0;
+       attempt < 20 && node.rsrv->CompletionErrors() < target; ++attempt) {
+    const uint64_t before = node.rsrv->CompletionErrors();
+    (void)transport.ExistMany(node.addr, keys, &exists);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (node.rsrv->CompletionErrors() == before &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return node.rsrv->CompletionErrors() >= target;
+}
+
+bool WaitForServerRailMetric(RdmaNode& node, const char* name,
+                             const std::string& rail, long expected) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (DeviceCounterVal(node.rsrv->MetricsText(), name, rail) == expected)
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return DeviceCounterVal(node.rsrv->MetricsText(), name, rail) == expected;
+}
+
+// Every negative case still completes a real operation afterwards. One idle
+// QP on another transport proves that a failed QP alone ended: no suspect
+// transition woke unrelated connections or refused subsequent admission.
+void ExerciseNoRailSuspect(const std::string& tag, const char* threshold,
+                           ibv_wc_status status, size_t seeded_hosts,
+                           bool seed_stale, size_t failures) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "500");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv suspect_threshold("DFKV_RDMA_RAIL_SUSPECT_PEERS", threshold);
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  std::atomic<uint64_t> now_ms{100000};
+  std::atomic<bool> armed{false};
+  std::atomic<size_t> rewritten{0};
+  RdmaNode node(tag, kMaxMsg, false, false, {},
+                [&](ibv_wc* batch, int* count, size_t) {
+                  if (*count <= 0 || !armed.load() ||
+                      rewritten.load() >= failures)
+                    return;
+                  rewritten.fetch_add(1);
+                  batch[0].status = status;
+                });
+  RdmaServerTestPeer::SetRetryObservationClock(
+      *node.rsrv, [&] { return now_ms.load(std::memory_order_relaxed); });
+  const uint64_t seed_at = now_ms.load() - (seed_stale ? 30001 : 0);
+  for (size_t i = 0; i < seeded_hosts; ++i)
+    RdmaServerTestPeer::SeedRetryPeer(
+        *node.rsrv, 0, "192.0.2." + std::to_string(i + 1), seed_at);
+
+  RdmaTransport guard(kMaxMsg, rail);
+  auto* idle = RdmaTransportTestPeer::AcquireControlOn(&guard, node.addr, 0);
+  ASSERT_NE(idle, nullptr);
+  RdmaTransportTestPeer::ReleaseControl(&guard, node.addr, idle);
+  ASSERT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0), 1u);
+  armed.store(true, std::memory_order_release);
+  RdmaTransport transport(kMaxMsg, rail);
+  ASSERT_TRUE(DriveRewrittenServerFailures(node, transport, failures));
+  const bool retry = status == IBV_WC_RETRY_EXC_ERR ||
+                     status == IBV_WC_RNR_RETRY_EXC_ERR;
+  const long expected_peers = static_cast<long>(
+      (seed_stale ? 0 : seeded_hosts) + (retry ? 1 : 0));
+  ASSERT_TRUE(WaitForServerRailMetric(
+      node, "dfkv_rdma_rail_retry_exhausted_peers", rail, expected_peers));
+  const std::string metrics = node.rsrv->MetricsText();
+  EXPECT_EQ(DeviceCounterVal(
+                metrics, "dfkv_rdma_rail_retry_exhausted_peers", rail),
+            expected_peers)
+      << "one loopback host contributes once, never one entry per QP";
+  EXPECT_EQ(DeviceCounterVal(metrics, "dfkv_rdma_rail_suspect", rail), 0);
+  for (int i = 0;
+       i < 600 &&
+       RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0) != 1; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0), 1u)
+      << "attribution and the failed QP teardown must both have finished";
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_suspect_rail_refusals_total"), 0);
+
+  RdmaTransport admitted(kMaxMsg, rail);
+  const BlockKey key = ToBlockKey(SelfHdr(), tag + "-admitted");
+  const std::string value = "admitted";
+  EXPECT_EQ(admitted.Cache(node.addr, key, value.data(), value.size()),
+            Status::kOk);
+  EXPECT_EQ(node.CacheDirectCalls(key), 1u);
+}
+
+TEST(RdmaRailSuspect, DefaultOffRetainsObservationOnlyBehavior) {
+  ExerciseNoRailSuspect("suspect-off", "0", IBV_WC_RETRY_EXC_ERR,
+                        /*seeded_hosts=*/3, /*seed_stale=*/false,
+                        /*failures=*/1);
+}
+
+TEST(RdmaRailSuspect, DuplicateHostNeverReachesThreshold) {
+  ExerciseNoRailSuspect("suspect-duplicate", "2", IBV_WC_RETRY_EXC_ERR,
+                        /*seeded_hosts=*/0, /*seed_stale=*/false,
+                        /*failures=*/3);
+}
+
+TEST(RdmaRailSuspect, NonRetryStatusDoesNotEnterWindow) {
+  ExerciseNoRailSuspect("suspect-nonretry", "2", IBV_WC_REM_ACCESS_ERR,
+                        /*seeded_hosts=*/1, /*seed_stale=*/false,
+                        /*failures=*/1);
+}
+
+TEST(RdmaRailSuspect, StaleSeedDoesNotParticipateInThreshold) {
+  ExerciseNoRailSuspect("suspect-stale", "2", IBV_WC_RETRY_EXC_ERR,
+                        /*seeded_hosts=*/1, /*seed_stale=*/true,
+                        /*failures=*/1);
+}
+
+void ExerciseActualSuspectCompletion(ibv_wc_status status, bool use_uring,
+                                     bool exercise_expiry) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "500");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv suspect_threshold("DFKV_RDMA_RAIL_SUSPECT_PEERS", "2");
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  std::atomic<uint64_t> now_ms{100000};
+  std::atomic<int> rewritten{0};
+  const std::string tag = std::string("suspect-") +
+                          rdma::WcStatusName(status) +
+                          (use_uring ? "-uring" : "-sync");
+  RdmaNode node(tag, kMaxMsg, false, use_uring, {},
+                [&](ibv_wc* batch, int* count, size_t) {
+                  if (*count <= 0 || rewritten.load() != 0) return;
+                  rewritten.store(1);
+                  batch[0].status = status;
+                });
+  RdmaServerTestPeer::SetRetryObservationClock(
+      *node.rsrv, [&] { return now_ms.load(std::memory_order_relaxed); });
+  RdmaServerTestPeer::SeedRetryPeer(*node.rsrv, 0, "198.51.100.8",
+                                    now_ms.load());
+  RdmaTransport transport(kMaxMsg, rail);
+  EXPECT_EQ(DeviceCounterVal(node.rsrv->MetricsText(),
+                             "dfkv_rdma_rail_suspect", rail),
+            0)
+      << "the seeded host alone is below threshold";
+  // The second distinct host arrives only in a real, polled completion that
+  // the existing CQ hook rewrites before the production attribution lambda.
+  ASSERT_TRUE(DriveRewrittenServerFailures(node, transport, 1));
+  ASSERT_TRUE(WaitForServerRailMetric(node, "dfkv_rdma_rail_suspect", rail, 1))
+      << "CompletionErrors precedes peer attribution; wait for the transition";
+  std::string metrics = node.rsrv->MetricsText();
+  if (use_uring &&
+      CounterVal(metrics, "dfkv_uring_init_fallbacks_total") != 0)
+    GTEST_SKIP() << "io_uring unavailable at runtime";
+  EXPECT_EQ(rewritten.load(), 1);
+  EXPECT_EQ(DeviceCounterVal(
+                metrics, "dfkv_rdma_rail_retry_exhausted_peers", rail),
+            2);
+  EXPECT_EQ(DeviceCounterVal(metrics, "dfkv_rdma_rail_suspect", rail), 1);
+
+  // A fresh sole-rail data connection is refused at its resolved-device
+  // bootstrap. There is no TCP fallback and no request reaches the PUT handler.
+  RdmaTransport refused(kMaxMsg, rail);
+  const BlockKey key = ToBlockKey(SelfHdr(), tag + "-last-rail");
+  const std::string value = "fail-closed";
+  EXPECT_EQ(refused.Cache(node.addr, key, value.data(), value.size()),
+            Status::kIOError);
+  EXPECT_EQ(node.CacheDirectCalls(key), 0u);
+  EXPECT_GE(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_suspect_rail_refusals_total"),
+            1);
+  if (!exercise_expiry) return;
+
+  // No 30-second sleep and no background recovery thread: advancing only the
+  // test observation clock makes the next actual admission re-evaluate, clear
+  // the expired state, and use the same rail again.
+  now_ms.fetch_add(30001);
+  RdmaTransport recovered(kMaxMsg, rail);
+  EXPECT_EQ(recovered.Cache(node.addr, key, value.data(), value.size()),
+            Status::kOk);
+  EXPECT_EQ(node.CacheDirectCalls(key), 1u);
+  metrics = node.rsrv->MetricsText();
+  EXPECT_EQ(DeviceCounterVal(metrics, "dfkv_rdma_rail_suspect", rail), 0);
+}
+
+TEST(RdmaRailSuspect, RetryActualCqDrivesSuspectAndExpirySync) {
+  ExerciseActualSuspectCompletion(IBV_WC_RETRY_EXC_ERR, /*use_uring=*/false,
+                                  /*exercise_expiry=*/true);
+}
+TEST(RdmaRailSuspect, RetryActualCqDrivesSuspectUring) {
+  ExerciseActualSuspectCompletion(IBV_WC_RETRY_EXC_ERR, /*use_uring=*/true,
+                                  /*exercise_expiry=*/false);
+}
+TEST(RdmaRailSuspect, RnrRetryActualCqDrivesSuspectSync) {
+  ExerciseActualSuspectCompletion(IBV_WC_RNR_RETRY_EXC_ERR,
+                                  /*use_uring=*/false,
+                                  /*exercise_expiry=*/false);
+}
+TEST(RdmaRailSuspect, RnrRetryActualCqDrivesSuspectUring) {
+  ExerciseActualSuspectCompletion(IBV_WC_RNR_RETRY_EXC_ERR,
+                                  /*use_uring=*/true,
+                                  /*exercise_expiry=*/false);
+}
+
+// Prove a genuine two-rail operation after the server transition: rail zero
+// refuses new admission, rail one's existing QP remains usable, and normal
+// static/MDS-shaped peer behavior selects the sibling on later operations.
+void ExerciseSuspectSibling(bool named) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "500");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv suspect_threshold("DFKV_RDMA_RAIL_SUSPECT_PEERS", "2");
+  ScopedEnv primary("DFKV_RDMA_PRIMARY_DEV", rails[0].c_str());
+  ScopedEnv numa("DFKV_RDMA_NUMA", "0");
+  ScopedEnv cooldown("DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS", "30000");
+  ScopedEnv max_cooldown("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS", "30000");
+  std::atomic<uint64_t> now_ms{100000};
+  std::atomic<bool> armed{false};
+  RdmaNode node(named ? "suspect-sibling-mds" : "suspect-sibling-static",
+                kMaxMsg, false, false, {},
+                [&](ibv_wc* batch, int* count, size_t) {
+                  if (*count <= 0 || !armed.load()) return;
+                  armed.store(false);
+                  batch[0].status = IBV_WC_RETRY_EXC_ERR;
+                });
+  RdmaServerTestPeer::SetRetryObservationClock(
+      *node.rsrv, [&] { return now_ms.load(std::memory_order_relaxed); });
+  RdmaServerTestPeer::SeedRetryPeer(*node.rsrv, 0, "203.0.113.9",
+                                    now_ms.load());
+  RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
+  if (named)
+    transport.OnPeerTopology(
+        PublishedPeer(node.addr, "rail-suspect-sibling-peer"));
+  {
+    auto* warm =
+        RdmaTransportTestPeer::AcquireControlOn(&transport, node.addr, 0);
+    ASSERT_NE(warm, nullptr);
+    RdmaTransportTestPeer::ReleaseControl(&transport, node.addr, warm);
+  }
+  std::unique_ptr<RdmaTransport> sibling_transport;
+  std::unique_ptr<KVClient> sibling;
+  {
+    ScopedEnv sibling_primary("DFKV_RDMA_PRIMARY_DEV", rails[1].c_str());
+    sibling_transport = std::make_unique<RdmaTransport>(kMaxMsg, rails[1]);
+    sibling = std::make_unique<KVClient>(
+        std::vector<std::pair<std::string, std::string>>{{"n", node.addr}},
+        SelfHdr(), sibling_transport.get());
+  }
+  const std::string sibling_value = "other-rail-survives";
+  ASSERT_TRUE(sibling->Put("sibling-before", sibling_value.data(),
+                           sibling_value.size()));
+  ASSERT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 1), 1u);
+
+  armed.store(true, std::memory_order_release);
+  ASSERT_TRUE(DriveRewrittenServerFailures(node, transport, 1));
+  ASSERT_TRUE(WaitForServerRailMetric(node, "dfkv_rdma_rail_suspect",
+                                      rails[0], 1));
+  std::string metrics = node.rsrv->MetricsText();
+  EXPECT_EQ(DeviceCounterVal(metrics, "dfkv_rdma_rail_suspect", rails[0]), 1);
+  EXPECT_EQ(DeviceCounterVal(metrics, "dfkv_rdma_rail_suspect", rails[1]), 0)
+      << "evidence and suspicion belong to their own rail";
+  EXPECT_EQ(RdmaServerTestPeer::DefaultRail(*node.rsrv), 1u)
+      << "unnamed clients must exclude the current suspect";
+  for (int i = 0;
+       i < 200 &&
+       RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0) != 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0), 0u)
+      << "the actual crossing wakes every existing QP on only this rail";
+  EXPECT_GE(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 1), 1u)
+      << "the original rail remains usable; the failing operation may also "
+         "have opened its expected sibling retry connection";
+  std::string sibling_out(sibling_value.size(), '\0');
+  ASSERT_TRUE(sibling->Get("sibling-before", sibling_out.data(),
+                           sibling_out.size()));
+  EXPECT_EQ(sibling_out, sibling_value);
+
+  // Force the resolved-device admission too: a normal operation's endpoint
+  // failure may already have cooled rail zero in `transport`, and otherwise
+  // it could choose its sibling without any dial reaching the server. A fresh
+  // transport has no such cached peer health, so this refusal is on the actual
+  // server handshake rather than a merely local denied-candidate result.
+  RdmaTransport refusal_probe(kMaxMsg, rails[0]);
+  const std::vector<BlockKey> refusal_key = {
+      ToBlockKey(SelfHdr(), "actual-suspect-refusal")};
+  std::vector<char> refusal_exists;
+  EXPECT_EQ(refusal_probe.ExistMany(node.addr, refusal_key, &refusal_exists)[0],
+            Status::kIOError);
+  EXPECT_GE(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_suspect_rail_refusals_total"),
+            1);
+  {
+    ScopedEnv admitted_primary("DFKV_RDMA_PRIMARY_DEV", rails[1].c_str());
+    RdmaTransport admitted_probe(kMaxMsg, rails[1]);
+    auto* admitted = RdmaTransportTestPeer::AcquireControlOn(
+        &admitted_probe, node.addr, 0);
+    ASSERT_NE(admitted, nullptr);
+    RdmaTransportTestPeer::ReleaseControl(&admitted_probe, node.addr, admitted);
+  }
+
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  bool served = false;
+  for (int attempt = 0; attempt < 5 && !served; ++attempt) {
+    const std::string key = "suspect-sibling-first-" + std::to_string(attempt);
+    served = client.Put(key, sibling_value.data(), sibling_value.size());
+  }
+  ASSERT_TRUE(served) << (named ? "MDS-shaped peer" : "static peer");
+  const std::string before = transport.MetricsText();
+  ASSERT_TRUE(client.Put("suspect-sibling-next", sibling_value.data(),
+                         sibling_value.size()));
+  const std::string after = transport.MetricsText();
+  EXPECT_EQ(DeviceCounterVal(after, "dfkv_rdma_client_rail_selections_total",
+                             rails[0]) -
+                DeviceCounterVal(before,
+                                 "dfkv_rdma_client_rail_selections_total",
+                                 rails[0]),
+            0)
+      << "the subsequent operation must not revisit the suspect rail";
+  EXPECT_EQ(DeviceCounterVal(after, "dfkv_rdma_client_rail_selections_total",
+                             rails[1]) -
+                DeviceCounterVal(before,
+                                 "dfkv_rdma_client_rail_selections_total",
+                                 rails[1]),
+            1)
+      << "the subsequent operation must really use its sibling";
+}
+
+TEST(RdmaRailSuspect, StaticPeerFailureChoosesSibling) {
+  ExerciseSuspectSibling(/*named=*/false);
+}
+TEST(RdmaRailSuspect, MdsNamedPeerFailureChoosesSibling) {
+  ExerciseSuspectSibling(/*named=*/true);
+}
+
+}  // namespace
+
 TEST(RdmaLoopback, ServerFailedCompletionNamesPeerDeviceAndStatusSync) {
   ExerciseServerFailedCompletionAttribution(false);
 }
@@ -10425,6 +10796,17 @@ TEST(RdmaBootstrapListener, PendingHandshakeLimitComesFromTheEnvironment) {
     ScopedEnv limit("DFKV_RDMA_MAX_PENDING_HANDSHAKES", "0");
     RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
     EXPECT_EQ(RdmaServerTestPeer::MaxPendingHandshakes(server), 0u);
+  }
+}
+
+TEST(RdmaBootstrapListener, RailSuspectThresholdComesFromTheEnvironment) {
+  for (const auto& [text, expected] : std::vector<std::pair<const char*, int>>{
+           {nullptr, 0}, {"0", 0}, {"2", 2}, {"64", 64},
+           {"65", 0}, {"-1", 0}, {"three", 0}}) {
+    ScopedEnv threshold("DFKV_RDMA_RAIL_SUSPECT_PEERS", text);
+    RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
+    EXPECT_EQ(RdmaServerTestPeer::RailSuspectPeers(server), expected)
+        << "setting=" << (text ? text : "(unset)");
   }
 }
 

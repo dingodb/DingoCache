@@ -273,7 +273,9 @@ RDMA-listener scrape inventory。
 | `dfkv_uring_reads_total` / `dfkv_uring_init_fallbacks_total` | counter | io_uring 路径实际读 / 初始化失败回退同步连接数 |
 | `dfkv_rdma_rail_active_conns{dev}` | gauge | 每个本地 HCA 上当前连接数 |
 | `dfkv_rdma_rail_completions_total{dev}` / `dfkv_rdma_rail_completion_errors_total{dev}` | counter | 每 rail 请求完成 / 错误完成 |
-| `dfkv_rdma_rail_retry_exhausted_peers{dev}` | gauge | 最近 30 s 内在这个设备上有连接以 RETRY_EXC 或 RNR_RETRY_EXC 结束的不同对端 IP 地址数（按地址计，不按 QP；同一台机器上不同 pod 的 client 各算一个；每 rail 最多记 64 个）。只有一个通常是那个 client 自己（进程被杀、卡住）；同一设备上有好几个、而本节点别的设备干净，多半是这个设备的端口或链路问题。只用于观察和告警（`DfkvRdmaRailRetriesExhaustedForManyPeers`：5 分钟内最大值 ≥3 即触发，因为 client 在一次突发之后很快就不再用这个设备，数值随之回落），不影响放置 |
+| `dfkv_rdma_rail_retry_exhausted_peers{dev}` | gauge | 最近 30 s 内在这个设备上有连接以 RETRY_EXC 或 RNR_RETRY_EXC 结束的不同对端 IP 地址数（按地址计，不按 QP；同一台机器上不同 pod 的 client 各算一个；每 rail 最多记 64 个）。只有一个通常是那个 client 自己（进程被杀、卡住）；同一设备上有好几个、而本节点别的设备干净，是这条路径的相关性信号，不是硬件结论。默认只用于观察和告警（`DfkvRdmaRailRetriesExhaustedForManyPeers`：5 分钟内最大值 ≥3 即触发，因为 client 在一次突发之后很快就不再用这个设备，数值随之回落）；告警的 3 不是验证过的路由阈值。只有显式配置 `DFKV_RDMA_RAIL_SUSPECT_PEERS>0` 才额外影响 server 新连接准入，不影响 MDS 放置 |
+| `dfkv_rdma_rail_suspect{dev}` | gauge | `DFKV_RDMA_RAIL_SUSPECT_PEERS>0` 时，该 rail 最近 30 s 的不同 retry-exhausted peer 数是否达到显式阈值：1 表示拒绝新 QP、已有的该 rail 连接已在对照到阈值时被唤醒；0 表示未达阈值、已过期或功能关闭。这里是 server 的临时相关性状态，不代表端口 DOWN、硬件故障或 MDS demotion；下一次准入/指标读取会重算过期状态 |
+| `dfkv_rdma_suspect_rail_refusals_total` | counter | server 因 resolved device 处于上述 retry-peer suspect 状态而在回复前关闭的 bootstrap 数。默认 0；与物理端口拒绝的 `dfkv_rdma_inactive_rail_refusals_total` 分开 |
 | `dfkv_rdma_rail_wc_errors_total{dev,status}` | counter | 上一行错误完成按 work completion status 分解；每条连接在首个失败完成处终止，所以同一 `dev` 各 `status` 之和等于 `dfkv_rdma_rail_completion_errors_total{dev}`。series 在首次出现时才导出，告警用上一行的总量；对端地址不做 label，见 §3.7 |
 | `dfkv_rdma_rail_put_writes_total{dev}` / `dfkv_rdma_rail_put_bytes_total{dev}` | counter | 每 rail 收到的 PUT one-sided writes / payload bytes |
 
