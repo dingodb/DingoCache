@@ -733,7 +733,8 @@ class ConnectorPrefixTest(unittest.TestCase):
         keys = self.keys[:2]
         sks = [sk for key in keys for sk in connector._stored_keys("kv", key)]
         connector._lib = _ExistLib(set(sks[:3]))
-        self.assertEqual(connector.batch_exists(keys), 0)
+        # The first of two pages is fully present; the second is incomplete.
+        self.assertEqual(connector.batch_exists(keys), 1)
         paths = writer.paths
         writer.close()
         event = next(record for record in _records(paths)
@@ -745,7 +746,7 @@ class ConnectorPrefixTest(unittest.TestCase):
         self.assertEqual([item["present"] for page in event["pages"]
                           for item in page["native_items"]],
                          [True, True, True, False])
-        self.assertEqual(event["result"]["contiguous_prefix"], 0)
+        self.assertEqual(event["result"]["contiguous_prefix"], 1)
         self.assertEqual(event["parent"]["state"], "unknown")
 
 
