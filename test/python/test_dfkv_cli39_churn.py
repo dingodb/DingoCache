@@ -467,18 +467,34 @@ class ChurnRun:
     def wait_client(self, client: ChurnClient, what: str,
                     predicate: Callable[[dict[str, Any]], bool],
                     timeout: float = 40.0) -> dict[str, Any]:
+        observed: dict[str, Any] = {}
+
         def sample() -> dict[str, Any] | None:
             try:
                 core = self.client_core(client)
+                observed.clear()
+                observed.update(core)
                 ring = core.get("ring_members")
                 if isinstance(ring, (int, float)) and self._last_views.get(client.client_id) != ring:
                     self._last_views[client.client_id] = int(ring)
                     self.timeline("client_ring_view", client=client.client_id,
                                   ring_members=int(ring))
                 return core if predicate(core) else None
-            except Exception:
+            except Exception as exc:
+                observed.clear()
+                observed["sample_error"] = f"{type(exc).__name__}: {exc}"
                 return None
-        return c35._until(f"{client.client_id}: {what}", sample, timeout)
+
+        try:
+            return c35._until(f"{client.client_id}: {what}", sample, timeout)
+        except RuntimeError as exc:
+            metric_path = self.root / "metrics" / f"client-{client.client_id}-wait-timeout.prom"
+            try:
+                metric_path.write_text(self.raw_client(client))
+                observed["raw_metrics_path"] = str(metric_path)
+            except Exception as raw_exc:
+                observed["raw_metrics_error"] = f"{type(raw_exc).__name__}: {raw_exc}"
+            raise RuntimeError(f"{exc}; wait_observation={observed}") from exc
 
     def wait_ring(self, client: ChurnClient, count: int,
                   timeout: float = 40.0) -> dict[str, Any]:
