@@ -1,5 +1,5 @@
-// Opt-in, evidence-preserving effective-capacity comparison for M3.  This is a
-// store-level correctness/capacity acceptance test, not a throughput benchmark.
+// Opt-in, evidence-preserving M3 store-level capacity, recovery, and I/O tests.
+// Existing capacity acceptance remains distinct from comparative I/O evidence.
 // The runner pins and reports the exact source HEAD separately; this test never
 // invokes git or discovers a benchmark directory on its own.
 #ifndef _GNU_SOURCE
@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +32,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1895,6 +1897,1164 @@ TEST(LseM3Recovery, CleanReopenAndSigkillAfterExplicitSync) {
     if (::testing::Test::HasFatalFailure()) return;
   }
   ASSERT_TRUE(reporter.good()) << reporter.path();
+}
+
+// ---- opt-in sustained-I/O and Zipf eviction evidence --------------------------
+//
+// These are measurements, not a cross-engine performance gate.  Cold fill is a
+// separate interval.  Write throughput uses the union of the eight workers'
+// CacheDirect call intervals, so payload generation and gaps with no API call in
+// flight are not reported as I/O time.  Whole-resident reads use the same rule
+// for RangeDirect.  Zipf hit, miss, and miss-admission latencies are disjoint.
+constexpr uint64_t kQualityObjectsPerCapacity = kStandardCapacity / kValueBytes;
+constexpr uint64_t kQualityZipfKeys = 2 * kQualityObjectsPerCapacity;
+constexpr uint64_t kQualityWarmupRequests = kQualityZipfKeys;
+constexpr uint64_t kQualityMeasuredRequests = 2 * kQualityZipfKeys;
+constexpr uint64_t kQualityZipfKeyBase = 1ull << 48;
+constexpr uint64_t kQualityZipfValueBase = 1ull << 50;
+constexpr uint64_t kQualityTraceSeedBase = 0x4d335a6970663930ull;
+constexpr size_t kQualityIoCapacity =
+    (kValueBytes + kIoAlignment - 1) / kIoAlignment * kIoAlignment;
+constexpr char kQualityJsonlName[] = "lse_m3_io.jsonl";
+static_assert(kQualityObjectsPerCapacity > 0 && kQualityZipfKeys > 0,
+              "the quality workload needs a nonempty capacity and key space");
+
+struct QualityPutStats {
+  uint64_t ok = 0;
+  uint64_t cache_full = 0;
+  uint64_t not_found = 0;
+  uint64_t quota = 0;
+  uint64_t io_error = 0;
+  uint64_t invalid = 0;
+  uint64_t resource_exhausted = 0;
+  uint64_t no_rail = 0;
+
+  void Add(Status status) {
+    switch (status) {
+      case Status::kOk: ++ok; break;
+      case Status::kCacheFull: ++cache_full; break;
+      case Status::kNotFound: ++not_found; break;
+      case Status::kQuotaExceeded: ++quota; break;
+      case Status::kIOError: ++io_error; break;
+      case Status::kInvalid: ++invalid; break;
+      case Status::kResourceExhausted: ++resource_exhausted; break;
+      case Status::kNoCompatibleRail: ++no_rail; break;
+    }
+  }
+  void Merge(const QualityPutStats& other) {
+    ok += other.ok;
+    cache_full += other.cache_full;
+    not_found += other.not_found;
+    quota += other.quota;
+    io_error += other.io_error;
+    invalid += other.invalid;
+    resource_exhausted += other.resource_exhausted;
+    no_rail += other.no_rail;
+  }
+  uint64_t Calls() const {
+    return ok + cache_full + not_found + quota + io_error + invalid +
+           resource_exhausted + no_rail;
+  }
+  uint64_t UnexpectedForChurn() const { return Calls() - ok - cache_full; }
+};
+
+struct QualityCallInterval {
+  uint64_t begin_ns = 0;
+  uint64_t end_ns = 0;
+  int32_t status = 0;  // actual Status enum value returned by this call
+};
+
+struct QualityLatency {
+  uint64_t calls = 0;
+  uint64_t total_ns = 0;
+  uint64_t p50_ns = 0;
+  uint64_t p99_ns = 0;
+};
+
+struct QualityCallMetrics {
+  QualityLatency latency;
+  uint64_t api_span_ns = 0;
+  uint64_t api_union_ns = 0;  // wall time with at least one measured call active
+};
+
+uint64_t QualityNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             Clock::now().time_since_epoch())
+      .count();
+}
+
+uint64_t QualityNearestRank(const std::vector<uint64_t>& sorted,
+                            uint32_t numerator) {
+  if (sorted.empty()) return 0;
+  return sorted[(static_cast<uint64_t>(sorted.size()) * numerator + 99) / 100 - 1];
+}
+
+QualityLatency QualityLatencyOf(std::vector<uint64_t>* samples) {
+  QualityLatency out;
+  out.calls = samples->size();
+  std::sort(samples->begin(), samples->end());
+  for (const uint64_t sample : *samples) out.total_ns += sample;
+  out.p50_ns = QualityNearestRank(*samples, 50);
+  out.p99_ns = QualityNearestRank(*samples, 99);
+  return out;
+}
+
+QualityCallMetrics QualityMetricsOf(std::vector<QualityCallInterval>* calls) {
+  QualityCallMetrics out;
+  if (calls->empty()) return out;
+  std::sort(calls->begin(), calls->end(),
+            [](const QualityCallInterval& a, const QualityCallInterval& b) {
+              return a.begin_ns != b.begin_ns ? a.begin_ns < b.begin_ns
+                                              : a.end_ns < b.end_ns;
+            });
+  std::vector<uint64_t> durations;
+  durations.reserve(calls->size());
+  out.api_span_ns = calls->front().begin_ns;
+  uint64_t union_begin = calls->front().begin_ns;
+  uint64_t union_end = calls->front().end_ns;
+  uint64_t last_end = 0;
+  for (const auto& call : *calls) {
+    durations.push_back(call.end_ns - call.begin_ns);
+    out.api_span_ns = std::min(out.api_span_ns, call.begin_ns);
+    last_end = std::max(last_end, call.end_ns);
+    if (call.begin_ns > union_end) {
+      out.api_union_ns += union_end - union_begin;
+      union_begin = call.begin_ns;
+      union_end = call.end_ns;
+    } else {
+      union_end = std::max(union_end, call.end_ns);
+    }
+  }
+  out.api_union_ns += union_end - union_begin;
+  out.api_span_ns = last_end - out.api_span_ns;
+  out.latency = QualityLatencyOf(&durations);
+  return out;
+}
+
+QualityLatency QualityLatencyForStatus(
+    const std::vector<QualityCallInterval>& calls, Status wanted) {
+  std::vector<uint64_t> durations;
+  durations.reserve(calls.size());
+  for (const auto& call : calls) {
+    if (call.status == static_cast<int32_t>(wanted))
+      durations.push_back(call.end_ns - call.begin_ns);
+  }
+  return QualityLatencyOf(&durations);
+}
+
+double QualitySeconds(uint64_t nanoseconds) {
+  return static_cast<double>(nanoseconds) / 1000000000.0;
+}
+
+double QualityMiBPerSecond(uint64_t bytes, uint64_t nanoseconds) {
+  return nanoseconds == 0
+             ? 0.0
+             : static_cast<double>(bytes) / QualitySeconds(nanoseconds) /
+                   static_cast<double>(1ull << 20);
+}
+
+void QualitySamplesJson(std::ostringstream* out, const std::string& name,
+                        const std::vector<QualityCallInterval>& calls) {
+  *out << ',' << JsonString(name) << ":[";
+  for (size_t i = 0; i < calls.size(); ++i) {
+    if (i != 0) *out << ',';
+    *out << '[' << calls[i].begin_ns << ',' << calls[i].end_ns << ','
+         << calls[i].status << ']';
+  }
+  *out << ']';
+}
+
+void QualityPutJson(std::ostringstream* out, const std::string& prefix,
+                    const QualityPutStats& stats) {
+  *out << ',' << JsonString(prefix + "_ok") << ':' << stats.ok
+       << ',' << JsonString(prefix + "_cache_full") << ':' << stats.cache_full
+       << ',' << JsonString(prefix + "_not_found") << ':' << stats.not_found
+       << ',' << JsonString(prefix + "_quota_exceeded") << ':' << stats.quota
+       << ',' << JsonString(prefix + "_io_error") << ':' << stats.io_error
+       << ',' << JsonString(prefix + "_invalid") << ':' << stats.invalid
+       << ',' << JsonString(prefix + "_resource_exhausted") << ':'
+       << stats.resource_exhausted
+       << ',' << JsonString(prefix + "_no_compatible_rail") << ':' << stats.no_rail;
+}
+
+void QualityLatencyJson(std::ostringstream* out, const std::string& prefix,
+                        const QualityLatency& latency) {
+  *out << ',' << JsonString(prefix + "_calls") << ':' << latency.calls
+       << ',' << JsonString(prefix + "_p50_ns") << ':' << latency.p50_ns
+       << ',' << JsonString(prefix + "_p99_ns") << ':' << latency.p99_ns
+       << ',' << JsonString(prefix + "_cumulative_seconds")
+       << ':' << QualitySeconds(latency.total_ns);
+}
+
+struct QualityWriteInterval {
+  uint64_t first_key = 0;
+  uint64_t planned_calls = 0;
+  uint32_t writers_started = 0;
+  uint64_t allocation_failures = 0;
+  double wall_seconds_including_generation = 0;
+  QualityPutStats puts;
+  QualityCallMetrics metrics;
+  std::vector<QualityCallInterval> calls;
+  std::string thread_error;
+};
+
+QualityWriteInterval RunQualityWrites(StoreEngine* store, uint64_t first_key,
+                                      uint64_t count) {
+  QualityWriteInterval out;
+  out.first_key = first_key;
+  out.planned_calls = count;
+  std::atomic<uint64_t> next{0};
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> writers;
+  struct WorkerResult {
+    QualityPutStats puts;
+    uint64_t allocation_failures = 0;
+    std::vector<QualityCallInterval> calls;
+  };
+  std::vector<WorkerResult> results(kWriters);
+  const auto wall_start = Clock::now();
+  try {
+    writers.reserve(kWriters);
+    for (uint32_t worker = 0; worker < kWriters; ++worker) {
+      writers.emplace_back([&, worker] {
+        auto& result = results[worker];
+        AlignedBuffer buffer(kQualityIoCapacity);
+        if (!buffer) {
+          ++result.allocation_failures;
+          stop.store(true, std::memory_order_relaxed);
+          return;
+        }
+        result.calls.reserve(count / kWriters + 1);
+        while (!stop.load(std::memory_order_relaxed)) {
+          const uint64_t sequence = next.fetch_add(1, std::memory_order_relaxed);
+          if (sequence >= count) break;
+          const uint64_t id = first_key + sequence;
+          FillValue(id, buffer.data(), kValueBytes);
+          const uint64_t begin = QualityNowNs();
+          const Status status = store->CacheDirect(
+              MakeKey(id), buffer.data(), kValueBytes, buffer.size());
+          const uint64_t end = QualityNowNs();
+          result.calls.push_back({begin, end, static_cast<int32_t>(status)});
+          result.puts.Add(status);
+          if (status != Status::kOk && status != Status::kCacheFull)
+            stop.store(true, std::memory_order_relaxed);
+        }
+      });
+    }
+  } catch (const std::exception& error) {
+    out.thread_error = error.what();
+    stop.store(true, std::memory_order_relaxed);
+  } catch (...) {
+    out.thread_error = "unknown std::thread creation failure";
+    stop.store(true, std::memory_order_relaxed);
+  }
+  out.writers_started = writers.size();
+  for (auto& writer : writers) writer.join();
+  out.wall_seconds_including_generation = Seconds(Clock::now() - wall_start);
+  std::vector<QualityCallInterval> calls;
+  for (auto& result : results) {
+    out.puts.Merge(result.puts);
+    out.allocation_failures += result.allocation_failures;
+    calls.insert(calls.end(), std::make_move_iterator(result.calls.begin()),
+                 std::make_move_iterator(result.calls.end()));
+  }
+  out.calls = std::move(calls);
+  out.metrics = QualityMetricsOf(&out.calls);
+  return out;
+}
+
+void QualityWriteJson(std::ostringstream* out, const std::string& prefix,
+                      const QualityWriteInterval& interval) {
+  *out << ',' << JsonString(prefix + "_first_key") << ':' << interval.first_key
+       << ',' << JsonString(prefix + "_planned_calls") << ':'
+       << interval.planned_calls
+       << ',' << JsonString(prefix + "_actual_calls") << ':' << interval.puts.Calls()
+       << ',' << JsonString(prefix + "_writers_started") << ':'
+       << interval.writers_started
+       << ',' << JsonString(prefix + "_allocation_failures") << ':'
+       << interval.allocation_failures
+       << ',' << JsonString(prefix + "_wall_seconds_including_generation") << ':'
+       << interval.wall_seconds_including_generation
+       << ',' << JsonString(prefix + "_api_span_seconds")
+       << ':' << QualitySeconds(interval.metrics.api_span_ns)
+       << ',' << JsonString(prefix + "_api_union_seconds")
+       << ':' << QualitySeconds(interval.metrics.api_union_ns)
+       << ',' << JsonString(prefix + "_successful_payload_mib_per_second")
+       << ':' << QualityMiBPerSecond(interval.puts.ok * kValueBytes,
+                                    interval.metrics.api_union_ns);
+  QualityPutJson(out, prefix + "_put", interval.puts);
+  QualityLatencyJson(out, prefix + "_cache_direct_latency",
+                     interval.metrics.latency);
+  QualitySamplesJson(out, prefix + "_cache_direct_samples", interval.calls);
+}
+
+struct QualityReadback {
+  uint64_t enumerated = 0;
+  uint64_t distinct = 0;
+  uint64_t duplicates = 0;
+  uint64_t unexpected = 0;
+  uint64_t allocation_failures = 0;
+  uint64_t lookup_ok = 0;
+  uint64_t lookup_not_found = 0;
+  uint64_t lookup_other = 0;
+  uint64_t lookup_length_mismatch = 0;
+  uint64_t read_ok = 0;
+  uint64_t read_not_found = 0;
+  uint64_t read_io_error = 0;
+  uint64_t read_other = 0;
+  uint64_t out_length_mismatch = 0;
+  uint64_t value_length_mismatch = 0;
+  uint64_t payload_mismatch = 0;
+  uint64_t verified_payload_bytes = 0;
+  QualityCallMetrics metrics;
+  std::vector<QualityCallInterval> calls;
+};
+
+QualityReadback ReadEveryResidentValue(StoreEngine* store, uint64_t first_key,
+                                       uint64_t last_key_exclusive) {
+  QualityReadback out;
+  std::vector<BlockKey> keys;
+  store->ForEachKey([&](const BlockKey& key) { keys.push_back(key); });
+  out.enumerated = keys.size();
+  std::sort(keys.begin(), keys.end(), KeyOrder);
+  for (size_t i = 1; i < keys.size(); ++i)
+    if (keys[i] == keys[i - 1]) ++out.duplicates;
+  keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+  out.distinct = keys.size();  // exactly this snapshot is read-eligible
+
+  AlignedBuffer read_buffer(kQualityIoCapacity);
+  if (!read_buffer) {
+    ++out.allocation_failures;
+    return out;
+  }
+  std::string expected(kValueBytes, '\0');
+  out.calls.reserve(keys.size());
+  for (const BlockKey& key : keys) {
+    const uint64_t id = key.digest_lo;
+    if (id < first_key || id >= last_key_exclusive || !(key == MakeKey(id)))
+      ++out.unexpected;
+    ValueMetadata metadata;
+    const Status lookup = store->Lookup(key, &metadata);
+    if (lookup == Status::kOk) {
+      ++out.lookup_ok;
+      if (metadata.value_len != kValueBytes) ++out.lookup_length_mismatch;
+    } else if (lookup == Status::kNotFound) {
+      ++out.lookup_not_found;
+    } else {
+      ++out.lookup_other;
+    }
+    FillValue(id, expected.data(), expected.size());
+    const char* data = nullptr;
+    size_t out_len = 0;
+    size_t value_len = 0;
+    const uint64_t begin = QualityNowNs();
+    const Status read = store->RangeDirect(
+        key, 0, 0, read_buffer.data(), read_buffer.size(), &data, &out_len,
+        &value_len);
+    const uint64_t end = QualityNowNs();
+    out.calls.push_back({begin, end, static_cast<int32_t>(read)});
+    if (read == Status::kOk) {
+      ++out.read_ok;
+      if (out_len != kValueBytes) ++out.out_length_mismatch;
+      if (value_len != kValueBytes) ++out.value_length_mismatch;
+      if (out_len == kValueBytes && value_len == kValueBytes &&
+          std::string(data, out_len) == expected) {
+        out.verified_payload_bytes += out_len;
+      } else if (out_len == kValueBytes && value_len == kValueBytes) {
+        ++out.payload_mismatch;
+      }
+    } else if (read == Status::kNotFound) {
+      ++out.read_not_found;
+    } else if (read == Status::kIOError) {
+      ++out.read_io_error;
+    } else {
+      ++out.read_other;
+    }
+  }
+  out.metrics = QualityMetricsOf(&out.calls);
+  return out;
+}
+
+void QualityReadbackJson(std::ostringstream* out, const QualityReadback& read) {
+  *out << ",\"resident_enumerated\":" << read.enumerated
+       << ",\"resident_distinct_eligible\":" << read.distinct
+       << ",\"resident_duplicates\":" << read.duplicates
+       << ",\"resident_unexpected_keys\":" << read.unexpected
+       << ",\"resident_allocation_failures\":" << read.allocation_failures
+       << ",\"resident_lookup_ok\":" << read.lookup_ok
+       << ",\"resident_lookup_not_found\":" << read.lookup_not_found
+       << ",\"resident_lookup_other_error\":" << read.lookup_other
+       << ",\"resident_lookup_length_mismatch\":" << read.lookup_length_mismatch
+       << ",\"resident_direct_read_ok\":" << read.read_ok
+       << ",\"resident_direct_read_not_found\":" << read.read_not_found
+       << ",\"resident_direct_read_io_error\":" << read.read_io_error
+       << ",\"resident_direct_read_other_error\":" << read.read_other
+       << ",\"resident_out_length_mismatch\":" << read.out_length_mismatch
+       << ",\"resident_value_length_mismatch\":" << read.value_length_mismatch
+       << ",\"resident_payload_mismatch\":" << read.payload_mismatch
+       << ",\"resident_verified_payload_bytes\":" << read.verified_payload_bytes
+       << ",\"resident_read_api_span_seconds\":"
+       << QualitySeconds(read.metrics.api_span_ns)
+       << ",\"resident_read_api_union_seconds\":"
+       << QualitySeconds(read.metrics.api_union_ns)
+       << ",\"resident_verified_payload_mib_per_second\":"
+       << QualityMiBPerSecond(read.verified_payload_bytes,
+                              read.metrics.api_union_ns);
+  QualityLatencyJson(out, "resident_range_direct_latency", read.metrics.latency);
+  QualitySamplesJson(out, "resident_range_direct_samples", read.calls);
+}
+
+struct QualityStore {
+  std::unique_ptr<StoreEngine> store;
+  DiskSlabStore* slab = nullptr;
+  LogStore* log = nullptr;
+  std::shared_ptr<StrictDirectIo> log_io;
+  bool open_ok = false;
+  bool fresh_directory = false;
+};
+
+QualityStore OpenQualityStore(EngineKind kind, const fs::path& dir) {
+  QualityStore opened;
+  std::error_code ec;
+  opened.fresh_directory = fs::create_directory(dir, ec) && !ec;
+  if (!opened.fresh_directory) return opened;
+  if (kind == EngineKind::kSlab) {
+    DiskSlabStore::Options options;
+    options.dir = dir.string();
+    options.capacity_bytes = kStandardCapacity;
+    options.extent_bytes = kSlabExtent;
+    options.slot_granularity = kSlabGranularity;
+    options.direct_writes = true;
+    options.balance = false;
+    // Keep ordinary defaults: warm restart kOff, table sync 100 ms, reclaim 50 ms.
+    auto store = std::make_unique<DiskSlabStore>(options, &opened.open_ok);
+    opened.slab = store.get();
+    opened.store = std::move(store);
+  } else {
+    LogStore::Options options;
+    options.dir = dir.string();
+    options.capacity_bytes = kStandardCapacity;
+    options.direct_writes = true;
+    options.segment_bytes = kLogSegment;
+    options.open_segments = 0;
+    options.relocate_pct = 25;
+    options.sync_ms = 1000;
+    options.cleaner = true;
+    options.preopen = true;
+    options.retain_enabled = false;
+    opened.log_io = std::make_shared<StrictDirectIo>();
+    options.io = opened.log_io;
+    auto store = std::make_unique<LogStore>(options, &opened.open_ok);
+    opened.log = store.get();
+    opened.store = std::move(store);
+  }
+  opened.open_ok = opened.open_ok && opened.store->Healthy();
+  return opened;
+}
+
+struct QualityFinalStats {
+  uint64_t evictions = 0;
+  uint64_t used_bytes = 0;
+  uint64_t slab_dio_write_fallbacks = 0;
+  uint64_t slab_dio_read_fallbacks = 0;
+  uint64_t slab_payload_crc_failures = 0;
+  uint64_t slab_metadata_io_errors = 0;
+  uint64_t log_read_crc_failures = 0;
+};
+
+QualityFinalStats QualityStatsOf(EngineKind kind, const QualityStore& opened) {
+  QualityFinalStats stats;
+  if (opened.store == nullptr) return stats;
+  stats.evictions = opened.store->Evictions();
+  stats.used_bytes = opened.store->UsedBytes();
+  if (kind == EngineKind::kSlab) {
+    const auto slab = opened.slab->GetStats();
+    stats.slab_dio_write_fallbacks = slab.dio_write_fallbacks;
+    stats.slab_dio_read_fallbacks = slab.dio_read_fallbacks;
+    stats.slab_payload_crc_failures = slab.payload_crc_failures;
+    stats.slab_metadata_io_errors = slab.metadata_io_errors;
+  } else {
+    stats.log_read_crc_failures = opened.log->GetStats().read_crc_failures;
+  }
+  return stats;
+}
+
+void QualityFinalStatsJson(std::ostringstream* out, const QualityFinalStats& stats) {
+  *out << ",\"evictions\":" << stats.evictions
+       << ",\"used_bytes\":" << stats.used_bytes
+       << ",\"slab_dio_write_fallbacks\":" << stats.slab_dio_write_fallbacks
+       << ",\"slab_dio_read_fallbacks\":" << stats.slab_dio_read_fallbacks
+       << ",\"slab_payload_crc_failures\":" << stats.slab_payload_crc_failures
+       << ",\"slab_metadata_io_errors\":" << stats.slab_metadata_io_errors
+       << ",\"log_read_crc_failures\":" << stats.log_read_crc_failures;
+}
+
+bool QualityFinalStatsClean(EngineKind kind, const QualityFinalStats& stats) {
+  return stats.slab_dio_write_fallbacks == 0 && stats.slab_dio_read_fallbacks == 0 &&
+         stats.slab_payload_crc_failures == 0 && stats.slab_metadata_io_errors == 0 &&
+         (kind == EngineKind::kSlab || stats.log_read_crc_failures == 0);
+}
+
+bool QualityDirectActive(EngineKind kind, const QualityStore& opened) {
+  if (opened.store == nullptr) return false;
+  return kind == EngineKind::kSlab
+             ? opened.slab->DirectWritesActive()
+             : opened.log_io->direct_successes() > 0 &&
+                   opened.log_io->direct_refusals() == 0;
+}
+
+struct QualityIoResult {
+  uint32_t pair = 0;
+  uint32_t order = 0;
+  EngineKind kind = EngineKind::kSlab;
+  bool valid = false;
+  std::vector<std::string> violations;
+  double write_mib_s = 0;
+  double write_p50_ns = 0;
+  double write_p99_ns = 0;
+  double read_mib_s = 0;
+  double read_p50_ns = 0;
+  double read_p99_ns = 0;
+};
+
+void QualityViolation(QualityIoResult* result, const std::string& reason) {
+  result->violations.push_back(reason);
+}
+
+QualityIoResult RunQualityIo(EngineKind kind, uint32_t pair, uint32_t order,
+                             const fs::path& dir, JsonlReporter* reporter) {
+  QualityIoResult result;
+  result.pair = pair;
+  result.order = order;
+  result.kind = kind;
+  QualityStore opened = OpenQualityStore(kind, dir);
+  if (!opened.fresh_directory || !opened.open_ok) {
+    QualityViolation(&result, "fresh directory or healthy direct open failed: " +
+                                  (opened.store ? opened.store->StartupError()
+                                                : std::string("directory exists")));
+  } else if (!QualityDirectActive(kind, opened)) {
+    QualityViolation(&result, "requested O_DIRECT is not active");
+  }
+  const uint64_t first =
+      static_cast<uint64_t>(pair) * 3 * kQualityObjectsPerCapacity;
+  QualityWriteInterval cold, steady;
+  uint64_t evictions_before_steady = 0;
+  uint64_t steady_evictions = 0;
+  QualityReadback readback;
+  double settle_seconds = 0;
+  bool slab_settled = true;
+  if (opened.open_ok && QualityDirectActive(kind, opened)) {
+    cold = RunQualityWrites(opened.store.get(), first, kQualityObjectsPerCapacity);
+    // The measured interval begins only after the separate full-capacity fill.
+    evictions_before_steady = opened.store->Evictions();
+    steady = RunQualityWrites(opened.store.get(), first + kQualityObjectsPerCapacity,
+                              2 * kQualityObjectsPerCapacity);
+    steady_evictions = opened.store->Evictions() - evictions_before_steady;
+    const auto settle_start = Clock::now();
+    if (kind == EngineKind::kSlab) {
+      const auto deadline = settle_start + std::chrono::seconds(30);
+      for (;;) {
+        const auto observation = opened.slab->GetWatermarkObservation();
+        if (observation.watermark_active == 0 &&
+            opened.store->UsedBytes() <= observation.watermark_high_bytes)
+          break;
+        if (Clock::now() >= deadline) {
+          slab_settled = false;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    } else {
+      // LSE exposes no idle gauge.  Its writers are joined; after this explicit
+      // quiet delay, any lookup/read loss from the sorted snapshot is still an
+      // error, never silently discarded from the resident-read denominator.
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    settle_seconds = Seconds(Clock::now() - settle_start);
+    readback = ReadEveryResidentValue(opened.store.get(), first,
+                                      first + 3 * kQualityObjectsPerCapacity);
+  }
+
+  for (const auto* interval : {&cold, &steady}) {
+    if (interval->writers_started != kWriters || !interval->thread_error.empty() ||
+        interval->allocation_failures != 0)
+      QualityViolation(&result, "could not run eight writers without setup failures");
+    if (interval->puts.Calls() != interval->planned_calls ||
+        interval->metrics.latency.calls != interval->planned_calls)
+      QualityViolation(&result, "actual/timed PUT calls differ from planned calls");
+    if (interval->puts.UnexpectedForChurn() != 0)
+      QualityViolation(&result, "PUT returned a non-Ok/non-CacheFull status");
+    if (interval->metrics.api_union_ns == 0)
+      QualityViolation(&result, "no real CacheDirect measurement interval");
+  }
+  if (steady.puts.ok == 0)
+    QualityViolation(&result, "steady interval admitted no successful values");
+  if (steady_evictions == 0)
+    QualityViolation(&result, "steady interval produced no eviction delta");
+  if (!slab_settled) QualityViolation(&result, "slab watermark did not settle");
+  if (readback.distinct == 0 || readback.enumerated != readback.distinct ||
+      readback.duplicates != 0 || readback.unexpected != 0 ||
+      readback.allocation_failures != 0 ||
+      readback.lookup_ok != readback.distinct || readback.lookup_not_found != 0 ||
+      readback.lookup_other != 0 || readback.lookup_length_mismatch != 0 ||
+      readback.read_ok != readback.distinct || readback.read_not_found != 0 ||
+      readback.read_io_error != 0 || readback.read_other != 0 ||
+      readback.out_length_mismatch != 0 || readback.value_length_mismatch != 0 ||
+      readback.payload_mismatch != 0 || readback.metrics.latency.calls != readback.distinct ||
+      readback.verified_payload_bytes != readback.distinct * kValueBytes ||
+      readback.metrics.api_union_ns == 0) {
+    QualityViolation(&result, "not every distinct resident value was fully verified");
+  }
+  const QualityFinalStats stats = QualityStatsOf(kind, opened);
+  if (!QualityFinalStatsClean(kind, stats))
+    QualityViolation(&result, "direct-I/O, CRC, or metadata error counter is nonzero");
+  if (opened.store != nullptr && !opened.store->Healthy())
+    QualityViolation(&result, "engine became unhealthy");
+  const bool close_ok = opened.store != nullptr && opened.store->Close();
+  if (!close_ok) QualityViolation(&result, "final Close failed");
+  opened.store.reset();
+  result.valid = result.violations.empty();
+  result.write_mib_s = QualityMiBPerSecond(steady.puts.ok * kValueBytes,
+                                           steady.metrics.api_union_ns);
+  result.write_p50_ns = steady.metrics.latency.p50_ns;
+  result.write_p99_ns = steady.metrics.latency.p99_ns;
+  result.read_mib_s = QualityMiBPerSecond(readback.verified_payload_bytes,
+                                          readback.metrics.api_union_ns);
+  result.read_p50_ns = readback.metrics.latency.p50_ns;
+  result.read_p99_ns = readback.metrics.latency.p99_ns;
+
+  std::ostringstream out;
+  out << std::setprecision(17) << std::boolalpha
+      << "{\"record\":\"steady_io\",\"schema_version\":1,\"pair\":" << pair
+      << ",\"engine_order\":" << order
+      << ",\"engine\":" << JsonString(EngineName(kind))
+      << ",\"capacity_bytes\":" << kStandardCapacity
+      << ",\"value_bytes\":" << kValueBytes
+      << ",\"objects_per_payload_capacity\":" << kQualityObjectsPerCapacity
+      << ",\"cold_fill_is_timed_steady_state\":false"
+      << ",\"steady_write_payload_bytes_requested\":"
+      << 2 * kQualityObjectsPerCapacity * kValueBytes
+      << ",\"steady_crosses_full_capacity\":true"
+      << ",\"evictions_before_steady\":" << evictions_before_steady
+      << ",\"steady_evictions\":" << steady_evictions
+      << ",\"steady_admitted_values\":" << steady.puts.ok
+      << ",\"settle_seconds\":" << settle_seconds
+      << ",\"slab_settled\":" << slab_settled
+      << ",\"close_ok\":" << close_ok;
+  QualityWriteJson(&out, "cold_fill", cold);
+  QualityWriteJson(&out, "steady", steady);
+  QualityReadbackJson(&out, readback);
+  QualityFinalStatsJson(&out, stats);
+  out << ",\"result\":" << JsonString(result.valid ? "VALID" : "FAIL")
+      << ",\"violations\":" << JsonStrings(result.violations) << '}';
+  reporter->Emit(out.str());
+  if (!reporter->good()) {
+    QualityViolation(&result, "steady_io JSONL write failed");
+    result.valid = false;
+  }
+  return result;
+}
+
+uint64_t QualitySplitMix64(uint64_t* state) {
+  *state += 0x9e3779b97f4a7c15ULL;
+  uint64_t z = *state;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+  return z ^ (z >> 31);
+}
+
+struct QualityTrace {
+  uint64_t seed = 0;
+  uint64_t key_base = 0;
+  std::vector<uint32_t> warmup;
+  std::vector<uint32_t> measured;
+  uint64_t measured_unique = 0;
+  uint64_t all_unique = 0;
+  uint64_t hash = 0;
+  bool valid = false;
+};
+
+void QualityTraceHashAdd(uint64_t value, uint64_t* hash) {
+  for (unsigned byte = 0; byte < 8; ++byte) {
+    *hash ^= static_cast<uint8_t>(value >> (byte * 8));
+    *hash *= 0x100000001b3ULL;
+  }
+}
+
+QualityTrace MakeQualityTrace(uint32_t pair) {
+  QualityTrace trace;
+  trace.seed = kQualityTraceSeedBase + pair;
+  trace.key_base = kQualityZipfKeyBase + pair * kQualityZipfKeys;
+  std::vector<double> cdf(kQualityZipfKeys);
+  double total = 0;
+  for (uint64_t i = 0; i < kQualityZipfKeys; ++i) {
+    total += std::pow(static_cast<double>(i + 1), -0.9);
+    cdf[i] = total;
+  }
+  uint64_t rng = trace.seed;
+  auto draw = [&] {
+    const double uniform =
+        (QualitySplitMix64(&rng) >> 11) * (1.0 / 9007199254740992.0);
+    return static_cast<uint32_t>(
+        std::lower_bound(cdf.begin(), cdf.end(), uniform * total) - cdf.begin());
+  };
+  trace.warmup.reserve(kQualityWarmupRequests);
+  trace.measured.reserve(kQualityMeasuredRequests);
+  for (uint64_t i = 0; i < kQualityWarmupRequests; ++i)
+    trace.warmup.push_back(draw());
+  for (uint64_t i = 0; i < kQualityMeasuredRequests; ++i)
+    trace.measured.push_back(draw());
+  std::vector<bool> seen(kQualityZipfKeys, false);
+  for (const uint32_t id : trace.measured) {
+    if (!seen[id]) {
+      seen[id] = true;
+      ++trace.measured_unique;
+    }
+  }
+  std::fill(seen.begin(), seen.end(), false);
+  for (const auto* requests : {&trace.warmup, &trace.measured}) {
+    for (const uint32_t id : *requests) {
+      if (!seen[id]) {
+        seen[id] = true;
+        ++trace.all_unique;
+      }
+    }
+  }
+  trace.hash = 1469598103934665603ULL;  // FNV-1a, little-endian request ids
+  QualityTraceHashAdd(trace.seed, &trace.hash);
+  QualityTraceHashAdd(trace.warmup.size(), &trace.hash);
+  for (const uint32_t id : trace.warmup) QualityTraceHashAdd(id, &trace.hash);
+  QualityTraceHashAdd(trace.measured.size(), &trace.hash);
+  for (const uint32_t id : trace.measured) QualityTraceHashAdd(id, &trace.hash);
+  trace.valid = trace.warmup.size() == kQualityWarmupRequests &&
+                trace.measured.size() == kQualityMeasuredRequests &&
+                trace.measured_unique >= kQualityZipfKeys / 4 &&
+                trace.all_unique >= 4 * kQualityZipfKeys / 5;
+  return trace;
+}
+
+uint64_t QualityZipfValueId(uint32_t object, uint64_t epoch) {
+  return kQualityZipfValueBase + epoch * kQualityZipfKeys + object;
+}
+
+struct QualityZipfPhase {
+  uint64_t requests = 0;
+  uint64_t allocation_failures = 0;
+  uint64_t hits = 0;
+  uint64_t misses = 0;
+  uint64_t range_io_error = 0;
+  uint64_t other_range_error = 0;
+  uint64_t out_length_mismatch = 0;
+  uint64_t value_length_mismatch = 0;
+  uint64_t payload_mismatch = 0;
+  uint64_t verified_hit_bytes = 0;
+  QualityPutStats admissions;
+  QualityLatency hit_latency;
+  QualityLatency miss_latency;
+  QualityLatency admission_latency;
+  std::vector<QualityCallInterval> read_calls;
+  std::vector<QualityCallInterval> admission_calls;
+  double wall_seconds = 0;
+};
+
+QualityZipfPhase RunQualityZipfPhase(StoreEngine* store, const QualityTrace& trace,
+                                     const std::vector<uint32_t>& requests,
+                                     std::vector<uint64_t>* epochs) {
+  QualityZipfPhase out;
+  out.requests = requests.size();
+  const auto wall_start = Clock::now();
+  AlignedBuffer buffer(kQualityIoCapacity);
+  if (!buffer) {
+    out.allocation_failures = 1;
+    out.wall_seconds = Seconds(Clock::now() - wall_start);
+    return out;
+  }
+  std::string expected(kValueBytes, '\0');
+  out.read_calls.reserve(requests.size());
+  out.admission_calls.reserve(requests.size());
+  for (const uint32_t object : requests) {
+    const BlockKey key = MakeKey(trace.key_base + object);
+    const char* data = nullptr;
+    size_t out_len = 0;
+    size_t value_len = 0;
+    const uint64_t read_begin = QualityNowNs();
+    const Status read = store->RangeDirect(
+        key, 0, 0, buffer.data(), buffer.size(), &data, &out_len, &value_len);
+    const uint64_t read_end = QualityNowNs();
+    out.read_calls.push_back(
+        {read_begin, read_end, static_cast<int32_t>(read)});
+    if (read == Status::kOk) {
+      ++out.hits;
+      FillValue(QualityZipfValueId(object, (*epochs)[object]), expected.data(),
+                expected.size());
+      if (out_len != kValueBytes) ++out.out_length_mismatch;
+      if (value_len != kValueBytes) ++out.value_length_mismatch;
+      if (out_len == kValueBytes && value_len == kValueBytes) {
+        if (std::string(data, out_len) != expected) {
+          ++out.payload_mismatch;
+        } else {
+          out.verified_hit_bytes += out_len;
+        }
+      }
+      continue;
+    }
+    if (read == Status::kIOError) {
+      ++out.range_io_error;
+      continue;
+    }
+    if (read != Status::kNotFound) {
+      ++out.other_range_error;
+      continue;
+    }
+    ++out.misses;
+    const uint64_t next_epoch = (*epochs)[object] + 1;
+    FillValue(QualityZipfValueId(object, next_epoch), buffer.data(), kValueBytes);
+    const uint64_t put_begin = QualityNowNs();
+    const Status put = store->CacheDirect(key, buffer.data(), kValueBytes, buffer.size());
+    const uint64_t put_end = QualityNowNs();
+    out.admission_calls.push_back(
+        {put_begin, put_end, static_cast<int32_t>(put)});
+    out.admissions.Add(put);
+    if (put == Status::kOk) (*epochs)[object] = next_epoch;
+  }
+  out.hit_latency = QualityLatencyForStatus(out.read_calls, Status::kOk);
+  out.miss_latency = QualityLatencyForStatus(out.read_calls, Status::kNotFound);
+  out.admission_latency =
+      QualityLatencyForStatus(out.admission_calls, Status::kOk);
+  out.wall_seconds = Seconds(Clock::now() - wall_start);
+  return out;
+}
+
+void QualityZipfPhaseJson(std::ostringstream* out, const std::string& prefix,
+                          const QualityZipfPhase& phase) {
+  *out << ',' << JsonString(prefix + "_requests") << ':' << phase.requests
+       << ',' << JsonString(prefix + "_allocation_failures") << ':'
+       << phase.allocation_failures
+       << ',' << JsonString(prefix + "_actual_gets")
+       << ':' << phase.hits + phase.misses + phase.range_io_error +
+                    phase.other_range_error
+       << ',' << JsonString(prefix + "_hits") << ':' << phase.hits
+       << ',' << JsonString(prefix + "_misses") << ':' << phase.misses
+       << ',' << JsonString(prefix + "_range_io_error") << ':'
+       << phase.range_io_error
+       << ',' << JsonString(prefix + "_other_range_error") << ':'
+       << phase.other_range_error
+       << ',' << JsonString(prefix + "_out_length_mismatch") << ':'
+       << phase.out_length_mismatch
+       << ',' << JsonString(prefix + "_value_length_mismatch") << ':'
+       << phase.value_length_mismatch
+       << ',' << JsonString(prefix + "_payload_mismatch") << ':'
+       << phase.payload_mismatch
+       << ',' << JsonString(prefix + "_verified_hit_bytes") << ':'
+       << phase.verified_hit_bytes
+       << ',' << JsonString(prefix + "_wall_seconds") << ':' << phase.wall_seconds;
+  QualityPutJson(out, prefix + "_admission_put", phase.admissions);
+  QualityLatencyJson(out, prefix + "_hit_range_direct_latency", phase.hit_latency);
+  QualityLatencyJson(out, prefix + "_miss_range_direct_latency", phase.miss_latency);
+  QualityLatencyJson(out, prefix + "_admission_cache_direct_latency",
+                     phase.admission_latency);
+  QualitySamplesJson(out, prefix + "_range_direct_samples", phase.read_calls);
+  QualitySamplesJson(out, prefix + "_admission_cache_direct_samples",
+                     phase.admission_calls);
+}
+
+struct QualityZipfResult {
+  uint32_t pair = 0;
+  uint32_t order = 0;
+  EngineKind kind = EngineKind::kSlab;
+  bool valid = false;
+  std::vector<std::string> violations;
+  uint64_t evictions = 0;
+  double hit_fraction = 0;
+  double hit_p50_ns = 0;
+  double hit_p99_ns = 0;
+  double miss_p50_ns = 0;
+  double miss_p99_ns = 0;
+  double admission_p50_ns = 0;
+  double admission_p99_ns = 0;
+};
+
+QualityZipfResult RunQualityZipf(EngineKind kind, uint32_t pair, uint32_t order,
+                                 const fs::path& dir, const QualityTrace& trace,
+                                 JsonlReporter* reporter) {
+  QualityZipfResult result;
+  result.pair = pair;
+  result.order = order;
+  result.kind = kind;
+  QualityStore opened = OpenQualityStore(kind, dir);
+  if (!opened.fresh_directory || !opened.open_ok) {
+    result.violations.push_back("fresh directory or healthy direct open failed");
+  } else if (!QualityDirectActive(kind, opened)) {
+    result.violations.push_back("requested O_DIRECT is not active");
+  }
+  std::vector<uint64_t> epochs(kQualityZipfKeys, 0);
+  QualityZipfPhase warmup, measured;
+  const uint64_t evictions_before =
+      opened.store == nullptr ? 0 : opened.store->Evictions();
+  if (opened.open_ok && QualityDirectActive(kind, opened)) {
+    // One synchronous worker consumes the exact request vectors supplied here.
+    warmup = RunQualityZipfPhase(opened.store.get(), trace, trace.warmup, &epochs);
+    measured = RunQualityZipfPhase(opened.store.get(), trace, trace.measured, &epochs);
+  }
+  result.evictions =
+      opened.store == nullptr ? 0 : opened.store->Evictions() - evictions_before;
+  const QualityFinalStats stats = QualityStatsOf(kind, opened);
+  if (opened.store != nullptr && !opened.store->Healthy())
+    result.violations.push_back("engine became unhealthy");
+  const bool close_ok = opened.store != nullptr && opened.store->Close();
+  if (!close_ok) result.violations.push_back("final Close failed");
+  opened.store.reset();
+
+  for (const auto* phase : {&warmup, &measured}) {
+    const uint64_t gets = phase->hits + phase->misses + phase->range_io_error +
+                          phase->other_range_error;
+    if (gets != phase->requests || phase->read_calls.size() != phase->requests ||
+        phase->admission_calls.size() != phase->admissions.Calls() ||
+        phase->allocation_failures != 0 || phase->range_io_error != 0 ||
+        phase->other_range_error != 0 ||
+        phase->out_length_mismatch != 0 ||
+        phase->value_length_mismatch != 0 || phase->payload_mismatch != 0 ||
+        phase->verified_hit_bytes != phase->hits * kValueBytes ||
+        phase->hit_latency.calls != phase->hits ||
+        phase->miss_latency.calls != phase->misses ||
+        phase->admission_latency.calls != phase->admissions.ok ||
+        phase->admissions.UnexpectedForChurn() != 0) {
+      result.violations.push_back("Zipf request, payload, latency, or status invariant failed");
+    }
+  }
+  if (measured.hits == 0 || measured.misses == 0 || measured.admissions.Calls() == 0 ||
+      measured.admissions.ok == 0 || warmup.misses == 0 || result.evictions == 0) {
+    result.violations.push_back("Zipf trace produced no representative hit/miss/admission/eviction");
+  }
+  if (!trace.valid) result.violations.push_back("fixed Zipf trace coverage is not representative");
+  if (!QualityFinalStatsClean(kind, stats))
+    result.violations.push_back("direct-I/O, CRC, or metadata error counter is nonzero");
+  result.valid = result.violations.empty();
+  result.hit_fraction =
+      measured.requests == 0 ? 0.0
+                            : static_cast<double>(measured.hits) / measured.requests;
+  result.hit_p50_ns = measured.hit_latency.p50_ns;
+  result.hit_p99_ns = measured.hit_latency.p99_ns;
+  result.miss_p50_ns = measured.miss_latency.p50_ns;
+  result.miss_p99_ns = measured.miss_latency.p99_ns;
+  result.admission_p50_ns = measured.admission_latency.p50_ns;
+  result.admission_p99_ns = measured.admission_latency.p99_ns;
+
+  std::ostringstream out;
+  out << std::setprecision(17) << std::boolalpha
+      << "{\"record\":\"zipf_eviction\",\"schema_version\":1,\"pair\":" << pair
+      << ",\"engine_order\":" << order
+      << ",\"engine\":" << JsonString(EngineName(kind))
+      << ",\"trace_seed\":" << trace.seed << ",\"trace_fnv1a64\":\""
+      << std::hex << std::setw(16) << std::setfill('0') << trace.hash << std::dec
+      << "\",\"trace_key_base\":" << trace.key_base
+      << ",\"zipf_exponent\":0.9,\"zipf_keyspace\":" << kQualityZipfKeys
+      << ",\"trace_value_transform\":\"value_base+epoch*keyspace+object\""
+      << ",\"trace_value_base\":" << kQualityZipfValueBase
+      << ",\"warmup_then_measured_same_epoch_table\":true"
+      << ",\"one_synchronous_worker\":true" << ",\"zipf_phase_evictions\":"
+      << result.evictions << ",\"close_ok\":" << close_ok;
+  QualityZipfPhaseJson(&out, "warmup", warmup);
+  QualityZipfPhaseJson(&out, "measured", measured);
+  QualityFinalStatsJson(&out, stats);
+  out << ",\"result\":" << JsonString(result.valid ? "VALID" : "FAIL")
+      << ",\"violations\":" << JsonStrings(result.violations) << '}';
+  reporter->Emit(out.str());
+  if (!reporter->good()) {
+    result.violations.push_back("zipf JSONL write failed");
+    result.valid = false;
+  }
+  return result;
+}
+
+void QualitySeriesJson(std::ostringstream* out, const std::string& name,
+                       std::vector<double> values) {
+  std::sort(values.begin(), values.end());
+  const double minimum = values.empty() ? 0 : values.front();
+  const double maximum = values.empty() ? 0 : values.back();
+  const double median = values.empty() ? 0 : values[values.size() / 2];
+  *out << ',' << JsonString(name + "_samples") << ':' << values.size()
+       << ',' << JsonString(name + "_median") << ':' << median
+       << ',' << JsonString(name + "_min") << ':' << minimum
+       << ',' << JsonString(name + "_max") << ':' << maximum
+       << ',' << JsonString(name + "_spread") << ':' << maximum - minimum;
+}
+
+TEST(LseM3Quality, SteadyIoAndZipfEviction) {
+  const char* const root_text = std::getenv("DFKV_LSE_M3_IO_ROOT");
+  if (root_text == nullptr || *root_text == '\0') {
+    EmitStdout(
+        "{\"record\":\"io_preflight\",\"schema_version\":1,"
+        "\"result\":\"SKIP\",\"reason\":\"DFKV_LSE_M3_IO_ROOT is required\"}");
+    GTEST_SKIP() << "set DFKV_LSE_M3_IO_ROOT to a fresh absolute real-NVMe "
+                    "directory satisfying the existing no-symlink/space checks";
+  }
+  RootEvidence root_evidence;
+  std::string root_error;
+  if (!PrepareFreshNvmeRoot(fs::path(root_text), &root_evidence, &root_error)) {
+    PreflightFailure(root_error, &root_evidence);
+    return;
+  }
+  const fs::path root = root_evidence.normalized_root;
+  const fs::path probe = root / "io_direct_io.probe";
+  std::string probe_error;
+  if (!ProbeDirectIo(probe, &probe_error)) {
+    PreflightFailure("quality O_DIRECT probe failed: " + probe_error, &root_evidence);
+    return;
+  }
+  JsonlReporter reporter(root / kQualityJsonlName);
+  std::ostringstream configuration;
+  configuration << std::setprecision(17) << std::boolalpha
+                << "{\"record\":\"io_configuration\",\"schema_version\":1"
+                << ",\"root\":" << JsonString(root.string())
+                << ",\"backing_device\":\"" << root_evidence.device_major << ':'
+                << root_evidence.device_minor << '"'
+                << ",\"backing_candidates\":" << BackingCandidatesJson(root_evidence)
+                << ",\"backing_all_leaves_nvme\":true"
+                << ",\"direct_io_probe_ok\":true"
+                << ",\"capacity_bytes\":" << kStandardCapacity
+                << ",\"value_bytes\":" << kValueBytes
+                << ",\"slab_granularity_bytes\":" << kSlabGranularity
+                << ",\"slab_warm_restart\":\"ordinary_default_kOff\""
+                << ",\"slab_table_sync_ms\":100,\"slab_reclaim_interval_ms\":50"
+                << ",\"steady_writers\":" << kWriters
+                << ",\"cold_fill_calls\":" << kQualityObjectsPerCapacity
+                << ",\"steady_calls_per_engine_pair\":"
+                << 2 * kQualityObjectsPerCapacity
+                << ",\"write_time_definition\":"
+                   "\"union of eight CacheDirect intervals; generation excluded\""
+                << ",\"read_time_definition\":"
+                   "\"union of full-whole-value RangeDirect intervals\""
+                << ",\"pairs_required\":3"
+                << ",\"zipf_exponent\":0.9,\"zipf_keyspace\":" << kQualityZipfKeys
+                << ",\"zipf_warmup_requests\":" << kQualityWarmupRequests
+                << ",\"zipf_measured_requests\":" << kQualityMeasuredRequests
+                << ",\"trace_recipe\":"
+                   "\"SplitMix64 top53 / 2^53; lower_bound in normalized N weights i^-0.9\""
+                << ",\"trace_seed_base\":" << kQualityTraceSeedBase
+                << ",\"trace_epoch_value\":"
+                   "\"value_base+epoch*keyspace+object; epoch advances only on admitted miss\""
+                << ",\"sample_clock\":\"steady_clock time_since_epoch in nanoseconds\""
+                << ",\"sample_tuple\":\"[begin_ns,end_ns,actual Status enum value]\""
+                << ",\"status_enum\":{\"kOk\":"
+                << static_cast<int32_t>(Status::kOk) << ",\"kNotFound\":"
+                << static_cast<int32_t>(Status::kNotFound) << ",\"kCacheFull\":"
+                << static_cast<int32_t>(Status::kCacheFull) << ",\"kQuotaExceeded\":"
+                << static_cast<int32_t>(Status::kQuotaExceeded) << ",\"kIOError\":"
+                << static_cast<int32_t>(Status::kIOError) << ",\"kInvalid\":"
+                << static_cast<int32_t>(Status::kInvalid)
+                << ",\"kResourceExhausted\":"
+                << static_cast<int32_t>(Status::kResourceExhausted)
+                << ",\"kNoCompatibleRail\":"
+                << static_cast<int32_t>(Status::kNoCompatibleRail) << '}'
+                << ",\"percentile_rule\":"
+                   "\"nearest-rank: sort end_ns-begin_ns ascending; zero-based index ceil(N*p/100)-1\""
+                << ",\"api_union_rule\":"
+                   "\"sort by begin_ns/end_ns; merge overlapping/touching intervals; sum union durations\""
+                << ",\"admission_latency_rule\":"
+                   "\"kOk admissions only; every refused PUT remains separately visible in raw all-attempt samples\""
+                << ",\"jsonl\":" << JsonString(reporter.path().string())
+                << ",\"performance_comparison_threshold\":\"none\"}";
+  reporter.Emit(configuration.str());
+
+  std::vector<QualityIoResult> io_results;
+  std::vector<QualityZipfResult> zipf_results;
+  bool traces_valid = true;
+  bool infrastructure_ok = reporter.good();
+  for (uint32_t pair = 0; pair < kStandardRepetitions; ++pair) {
+    const fs::path pair_dir = root / ("pair_" + ZeroPadding(pair));
+    std::error_code ec;
+    const bool pair_ok = fs::create_directory(pair_dir, ec) && !ec;
+    const bool steady_ok = pair_ok && fs::create_directory(pair_dir / "steady", ec) && !ec;
+    const bool zipf_ok = steady_ok && fs::create_directory(pair_dir / "zipf", ec) && !ec;
+    if (!zipf_ok) infrastructure_ok = false;
+    const QualityTrace trace = MakeQualityTrace(pair);
+    traces_valid = traces_valid && trace.valid;
+    std::ostringstream trace_line;
+    trace_line << std::boolalpha << "{\"record\":\"zipf_trace\",\"schema_version\":1"
+               << ",\"pair\":" << pair << ",\"seed\":" << trace.seed
+               << ",\"key_base\":" << trace.key_base
+               << ",\"warmup_requests\":" << trace.warmup.size()
+               << ",\"measured_requests\":" << trace.measured.size()
+               << ",\"measured_unique_keys\":" << trace.measured_unique
+               << ",\"all_unique_keys\":" << trace.all_unique
+               << ",\"fnv1a64\":\"" << std::hex << std::setw(16)
+               << std::setfill('0') << trace.hash << std::dec << '"'
+               << ",\"same_vector_supplied_to_both_engines\":true"
+               << ",\"valid\":" << trace.valid << '}';
+    reporter.Emit(trace_line.str());
+    if (!zipf_ok) continue;
+    const EngineKind first = pair % 2 == 0 ? EngineKind::kSlab : EngineKind::kLog;
+    const EngineKind second = first == EngineKind::kSlab ? EngineKind::kLog
+                                                         : EngineKind::kSlab;
+    int order = 0;
+    for (const EngineKind kind : {first, second}) {
+      io_results.push_back(RunQualityIo(kind, pair, order,
+                                        pair_dir / "steady" / EngineName(kind), &reporter));
+      zipf_results.push_back(RunQualityZipf(kind, pair, order,
+                                            pair_dir / "zipf" / EngineName(kind), trace,
+                                            &reporter));
+      ++order;
+    }
+  }
+
+  bool all_valid = infrastructure_ok && traces_valid && reporter.good() &&
+                   io_results.size() == 2 * kStandardRepetitions &&
+                   zipf_results.size() == 2 * kStandardRepetitions;
+  for (const auto& result : io_results) all_valid = all_valid && result.valid;
+  for (const auto& result : zipf_results) all_valid = all_valid && result.valid;
+  std::ostringstream aggregate;
+  aggregate << std::setprecision(17) << std::boolalpha
+            << "{\"record\":\"io_aggregate\",\"schema_version\":1"
+            << ",\"actual_pairs\":" << io_results.size() / 2
+            << ",\"steady_runs\":" << io_results.size()
+            << ",\"zipf_runs\":" << zipf_results.size()
+            << ",\"performance_gate\":\"none; invariant validity only\"";
+  for (const EngineKind kind : {EngineKind::kSlab, EngineKind::kLog}) {
+    const std::string prefix = std::string(kind == EngineKind::kSlab ? "slab" : "log");
+    std::vector<double> write_rate, write_p50, write_p99, read_rate, read_p50, read_p99;
+    std::vector<double> hit_fraction, hit_p50, hit_p99, miss_p50, miss_p99;
+    std::vector<double> admission_p50, admission_p99;
+    for (const auto& result : io_results) {
+      if (result.kind != kind) continue;
+      write_rate.push_back(result.write_mib_s);
+      write_p50.push_back(result.write_p50_ns);
+      write_p99.push_back(result.write_p99_ns);
+      read_rate.push_back(result.read_mib_s);
+      read_p50.push_back(result.read_p50_ns);
+      read_p99.push_back(result.read_p99_ns);
+    }
+    for (const auto& result : zipf_results) {
+      if (result.kind != kind) continue;
+      hit_fraction.push_back(result.hit_fraction);
+      hit_p50.push_back(result.hit_p50_ns);
+      hit_p99.push_back(result.hit_p99_ns);
+      miss_p50.push_back(result.miss_p50_ns);
+      miss_p99.push_back(result.miss_p99_ns);
+      admission_p50.push_back(result.admission_p50_ns);
+      admission_p99.push_back(result.admission_p99_ns);
+    }
+    aggregate << ',' << JsonString(prefix + "_actual_runs") << ':'
+              << write_rate.size();
+    QualitySeriesJson(&aggregate, prefix + "_steady_write_mib_per_second", write_rate);
+    QualitySeriesJson(&aggregate, prefix + "_steady_write_p50_ns", write_p50);
+    QualitySeriesJson(&aggregate, prefix + "_steady_write_p99_ns", write_p99);
+    QualitySeriesJson(&aggregate, prefix + "_resident_read_mib_per_second", read_rate);
+    QualitySeriesJson(&aggregate, prefix + "_resident_read_p50_ns", read_p50);
+    QualitySeriesJson(&aggregate, prefix + "_resident_read_p99_ns", read_p99);
+    QualitySeriesJson(&aggregate, prefix + "_zipf_hit_fraction", hit_fraction);
+    QualitySeriesJson(&aggregate, prefix + "_zipf_hit_p50_ns", hit_p50);
+    QualitySeriesJson(&aggregate, prefix + "_zipf_hit_p99_ns", hit_p99);
+    QualitySeriesJson(&aggregate, prefix + "_zipf_miss_p50_ns", miss_p50);
+    QualitySeriesJson(&aggregate, prefix + "_zipf_miss_p99_ns", miss_p99);
+    QualitySeriesJson(&aggregate, prefix + "_zipf_admission_p50_ns", admission_p50);
+    QualitySeriesJson(&aggregate, prefix + "_zipf_admission_p99_ns", admission_p99);
+  }
+  aggregate << ",\"validity\":" << JsonString(all_valid ? "PASS" : "FAIL") << '}';
+  reporter.Emit(aggregate.str());
+  if (!all_valid || !reporter.good()) {
+    ADD_FAILURE() << "LSE M3 I/O evidence validity failed; see " << reporter.path();
+  }
 }
 
 TEST(LseM3Capacity, EffectiveCapacity274MiB) {
