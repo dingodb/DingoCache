@@ -1250,10 +1250,14 @@ RETAIN 保护两份（排空节点那份还在服务读），哪边有 key 就�
 
 - **记什么：** 本节点确认过的每个 REMOVE（不管 key 当时在不在），在回复之前记下 key（含租户）和时间，
   只在内存里。之后对同一个 key 的 PUT 照常存、照常读，不清除这条记录。
-- **多久、多大：** 记录保留 `DFKV_REMOVE_MEMORY_MS`（打开时常用 600000，上限 3600000）；最多
-  `DFKV_REMOVE_MEMORY_ENTRIES` 条（默认 1048576，每条 40 字节，满时 40 MiB；不超过 4194304 条时按需翻倍增长，每次翻倍让 REMOVE 停顿几毫秒，超过时在启动时一次分配全部内存（条数 × 32 字节，加索引：4 字节 × 不小于 条数/0.7 的 2 的幂），之后不再增长，范围
-  1024–67108864），满了丢最旧的，
-  节点“知道”的时间段随之变短。回读要求它至少覆盖客户端的回读窗口加十个最长的轮询间隔（§3.4）。
+- **多久、多大：** 记录保留 `DFKV_REMOVE_MEMORY_MS`（上限 3600000），最多 `DFKV_REMOVE_MEMORY_ENTRIES` 条
+  （显式开启 M 且未设条数时默认 1048576，范围 1024–67108864）。容量按**每节点**在 H 内确认的 REMOVE 数估算，
+  重复 REMOVE 和不存在的 key 也计入，不能按不同 key、全组均值或数据大小估算。令 `H = R + 10 × Pmax`，
+  其中 R 是客户端回读窗口、Pmax 是最长成员/登记轮询间隔；配置 M 的毫秒数至少为 H，条数至少覆盖
+  `每节点 REMOVE/s × H/1000`。每条记录 32 字节，索引每槽 4 字节、按 2 的幂扩展且占用率低于 70%；默认条数
+  装满不同 key 时记录为 32 MiB、索引 2097152 槽为 8 MiB，共 40 MiB。M 默认关闭，不分配该表。不超过
+  4194304 条时按需翻倍，每次翻倍让 REMOVE 停顿几毫秒；超过时启动一次预分配（条数 × 32 字节加索引），
+  之后不再增长。满了丢最旧的，覆盖时长缩短，相关查询按 unknown 拒绝回读，不会因此多回读。
 - **重启：** 只在内存里。节点启动（包括带数据的热重启）之后只知道启动以来的删除，问更早的时间段
   答“不知道”，回读据此不回读。
 - **协议：** 新增 op `kRemovedWithin`（25），TCP 和 RDMA 都支持。关闭时（以及旧版本节点）对它回
@@ -1301,6 +1305,22 @@ RETAIN 保护两份（排空节点那份还在服务读），哪边有 key 就�
   refused_length、refused_gate、refused_cooling）、`dfkv_client_readback_changes_refused_total{reason}`
   （held、chained）、`dfkv_client_readback_window_active`、`dfkv_client_readback_memory_short_total`
   （节点的记忆长期短于需要的时长，每个节点一条 WARNING）。
+- **上线路径与观察门（为将来默认开启做准备；本版本仍默认关闭）：**
+  1. 升级各端产物时继续显式关闭 B，避免未来默认改变后提前启用。先部署支持 M 的节点，再打开 M；
+     旧客户端不会发 op 25。每个参与节点的 `dfkv_remove_memory_covered_seconds` 至少达到 `H/1000`
+     后才能开 B，否则查询按 unknown 拒绝，损失命中机会。
+  2. 再部署支持 REMOVE fan-out/read-back 标记的客户端。只要还有旧客户端或未带标记的已登记客户端，
+     `dfkv_client_registry_gate_open` 就保持关闭；这是 fail-closed，不是上线完成。支持范围仍是 MDS 动态发现、
+     每个删除者都登记、`DFKV_RING_REMOVE_FANOUT >= 3` 及既有轮询/登记要求。
+  3. 前提通过后再显式打开 B。A 仍是短暂消失成员残余风险的推荐配套；W 可作为命中优化单独启用，
+     不是所有环境的必需条件，客户时钟行为未知的 VM 上不得顺带开启。
+  4. 分别观察就绪、效果与成本：门看 `dfkv_client_registry_gate_open`、
+     `dfkv_client_registry_unmarked_clients`、`dfkv_client_registry_gate_failures_total`；M 看
+     `dfkv_remove_memory_covered_seconds`、持续增长的 `dfkv_remove_memory_dropped_total` 和
+     `dfkv_client_readback_memory_short_total`；效果看 `dfkv_client_readback_reads_total{result}`、
+     `dfkv_client_readback_changes_refused_total` 和 `dfkv_client_readback_window_active`；REMOVE
+     成本看 `dfkv_client_remove_unconfirmed_total` 及既有 fan-out 计数。故障期出现 held/chained、
+     cooling 拒绝或 REMOVE 未确认应作为诊断信号，不设成必须恒零的通用告警。
 
 ### 4c-6. 回读重写过的 key（rewrite，`DFKV_WRITE_MEMORY_ENTRIES` 节点侧 + `DFKV_RING_READBACK_REWRITE` 客户端侧，默认都关）<a name="4c-rewrite"></a>
 

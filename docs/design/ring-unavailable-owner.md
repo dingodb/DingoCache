@@ -366,12 +366,14 @@ refuse a read-back of a removed key, wherever the remover sent its REMOVE.
   every REMOVE the node acknowledges (present key or not) *before* the
   acknowledgement is sent. A PUT does not clear an entry.
 - **Bounds.** Entries older than `DFKV_REMOVE_MEMORY_MS` are dropped
-  (default when on: 600 s; at least B's lookback H, §3.4). Capacity
-  `DFKV_REMOVE_MEMORY_ENTRIES` (default 1 Mi; 40 B each, so 40 MiB at 1 Mi:
-  a 32-byte record in a ring that grows up to the capacity, and a 4-byte
-  slot of an open-addressing index at most 70 % full; CLI-33, replacing a
-  hash map at about 93-106 B an entry);
-  when full the oldest entry is dropped and the node's *coverage* shrinks.
+  (0 keeps M off; enabling it requires an explicit nonzero window at least
+  B's lookback H, §3.4). Capacity `DFKV_REMOVE_MEMORY_ENTRIES` defaults to
+  1 Mi when M is enabled without an explicit cap: a 32-byte record in a
+  ring that grows up to the capacity, plus a 4-byte slot of an
+  open-addressing index at most 70 % full (32 MiB + 8 MiB when the default
+  cap holds distinct keys; CLI-33, replacing a hash map at about
+  93-106 B an entry). With M off no table is allocated. When full the
+  oldest entry is dropped and the node's *coverage* shrinks.
 - **Coverage.** The node keeps `covered_since`: the latest of its start time
   and the time of the newest entry it dropped for capacity. It knows every
   REMOVE since `covered_since`. A question about an age reaching before that
@@ -513,9 +515,10 @@ current owner may ask the previous owner once.
   states the rule. A node
   whose coverage is shorter (a short setting, a capacity drop, or the first
   H after its start) answers *unknown*, so B fails closed there and reads
-  nothing back. At configuration time the client clamps
-  `DFKV_RING_READBACK_MS` to `600000 − settle` (so that H fits M's
-  default of 600 s) with a WARNING, against the current `poll_max`; if that
+  nothing back. At configuration time the client caps
+  `DFKV_RING_READBACK_MS` at `600000 − settle` with a WARNING, against the
+  current `poll_max`. This 600 s horizon cap does not enable M or imply
+  that its explicitly configured window covers H; if that
   leaves nothing (a `poll_max` of 60 s or more), B is off with a WARNING.
   The server documentation states the rule: M at least the clients'
   read-back window plus ten of the group's longest poll intervals.
@@ -548,10 +551,13 @@ current owner may ask the previous owner once.
   up to `DFKV_RING_REMOVE_FANOUT` × (recent rings + 1) + 2 nodes (3 in the
   usual case of no view change in S) and one read at P; nothing for a hit
   at the owner.
-- **Before B is ever default-on:** M's table costs about 106 B per entry
-  (§3.3, measured); a compact table (a ring buffer and an open-addressing
-  index, about 48 B) is a prerequisite, as is a per-node memory figure at
-  the group's REMOVE rate × H.
+- **Before B is ever default-on:** the compact M prerequisite is already
+  implemented (§3.3). Size M per node using acknowledged REMOVE/s × H,
+  including repeated and absent-key removals, and the exact record/index
+  formula in `DEPLOY.md`; then follow its staged rollout and readiness
+  gates. Any nonzero default flip remains a separate behavior change that
+  needs mixed-version, M-off/closed-gate, capacity and churn acceptance;
+  documenting the rollout does not enable it.
 
 ### 3.5 W: rewrite after REMOVE (CLI-35; server `DFKV_WRITE_MEMORY_ENTRIES`, client `DFKV_RING_READBACK_REWRITE`, both default 0 = off)
 
