@@ -4966,9 +4966,10 @@ TEST(RdmaLoopback, GrantOfAKilledClientIsReleasedAfterTheGrantTimeout) {
   }
 }
 
-// Stop() lets a connection that holds a grant finish, for at most
-// DFKV_RDMA_STOP_DRAIN_MS, before it closes it. Here the client is dead, so
-// the grant is never used: Stop takes the drain bound and no longer.
+// A live connection has an issued leased-PUT grant it never writes or
+// commits. Stop() must wait only for the configured drain bound before
+// closing it. The following exchange also fences the Serve thread's
+// grant-publication loop; the relaxed gauge alone is not that proof.
 TEST(RdmaLoopback, StopDrainOfAnUnreleasedGrantIsBounded) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
@@ -4977,35 +4978,36 @@ TEST(RdmaLoopback, StopDrainOfAnUnreleasedGrantIsBounded) {
   ScopedEnv idle("DFKV_RDMA_IDLE_MS", "60000");
   ScopedEnv grant("DFKV_RDMA_GRANT_TIMEOUT_MS", "0");
   ScopedEnv drain("DFKV_RDMA_STOP_DRAIN_MS", "800");
-  for (int attempt = 0;; ++attempt) {
-  std::atomic<pid_t> victim{0};
-  std::atomic<bool> killed{false};
-  RdmaNode* node_ptr = nullptr;
-  RdmaNode node("stop-drain", kMaxMsg, false, false, [&] {
-    const pid_t pid = victim.load();
-    if (pid <= 0 || killed.load() || node_ptr == nullptr) return;
-    if (RdmaServerTestPeer::LeasePutActive(*node_ptr->rsrv) == 0) return;
-    ::kill(pid, SIGKILL);
-    killed.store(true);
-  });
-  node_ptr = &node;
-  const pid_t child = SpawnGrantHolder(node.addr, /*lease=*/true);
-  ASSERT_GT(child, 0);
-  victim.store(child);
-  StartGrantHolder(child);
-  const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(20);
-  while (!killed.load() && std::chrono::steady_clock::now() < give_up)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  if (!killed.load()) ::kill(child, SIGKILL);
-  int status = 0;
-  ::waitpid(child, &status, 0);
-  ASSERT_TRUE(killed.load());
-  // The kill raced the client's own completion (see GrantOfAKilledClient...):
-  // no grant is left unreleased, so there is nothing to drain; try again.
-  if (attempt < 4 && RdmaServerTestPeer::LeasePutActive(*node.rsrv) == 0) {
-    std::printf("GRANT_RACED stop-drain: the client finished first; again\n");
-    continue;
-  }
+
+  RdmaNode node("stop-drain", kMaxMsg, false, false);
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node, 1, false, kMaxMsg,
+                        rdma::kDevFrameRequestLeasedPut));
+  const BlockKey key{90502, 1};
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kLeasePut,
+                   key, 0, 0, 8192);
+  Status status = Status::kIOError;
+  uint64_t bytes = 0;
+  ASSERT_TRUE(peer.Exchange(kReqPrefix, &status, &bytes));
+  ASSERT_EQ(status, Status::kOk);
+  ASSERT_EQ(bytes, rdma::kLeasePutReadyBytes);
+  rdma::LeasePutReady ready;
+  ASSERT_TRUE(rdma::DecodeLeasePutReady(peer.ep.rbuf(0) + kRespPrefix, &ready));
+  EXPECT_NE(ready.rkey, 0u);
+
+  // The STOP-facing setup must not race the automatic KVClient put/process
+  // completion path: this connection never writes or commits the PUT window,
+  // so it cannot release the grant on the normal kCache completion path.
+  // A second ordinary exchange also proves the Serve loop published its grant
+  // view before Stop() samples live connections. It is not a timing sleep.
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kExist,
+                   BlockKey{90502, 2}, 0, 0, 0);
+  status = Status::kIOError;
+  bytes = 0;
+  ASSERT_TRUE(peer.Exchange(kReqPrefix, &status, &bytes));
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+  ASSERT_EQ(RdmaServerTestPeer::LeasePutActive(*node.rsrv), 1u);
+
   const auto started = std::chrono::steady_clock::now();
   node.rsrv->Stop();
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -5018,8 +5020,6 @@ TEST(RdmaLoopback, StopDrainOfAnUnreleasedGrantIsBounded) {
                        "dfkv_rdma_stop_drains_cut_total"),
             1);
   EXPECT_EQ(CounterVal(node.rsrv->MetricsText(), "dfkv_rdma_leaseput_active"), 0);
-  break;
-  }
 }
 
 // A GET whose READY is out when the server starts stopping completes: the
