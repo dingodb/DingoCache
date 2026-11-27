@@ -1085,12 +1085,20 @@ class ChurnRun:
                            "registry_gate_open") == 1,
                        self.specific)
         else:
+            # A closed gate still counts refused candidates as refused_gate;
+            # those are not reads of the previous owner. Require no actual
+            # hit/miss, and require the fail-closed refusals to be observed.
+            for label in ("hit", "miss", "hit_rewritten"):
+                self.check(f"gated_readback_has_no_actual_{label}",
+                           after_read.get(f"readback_{label}")
+                           == before_read.get(f"readback_{label}"),
+                           {"before": before_read, "after": after_read})
             self.check("unmarked_old_remover_disables_C_and_B",
                        final_gate.get("registry_gate_open") == 0
                        and (final_gate.get("unmarked_clients") or 0) >= 1
                        and final_read["hits"] == 0
-                       and after_read.get("readback_total")
-                       == before_read.get("readback_total")
+                       and (after_read.get("readback_refused_gate") or 0)
+                       > (before_read.get("readback_refused_gate") or 0)
                        and cooling_probe["reroutes_get_delta"] == 0
                        and cooling_probe["after_down_owner_reads"].get(
                            "registry_gate_open") == 0,
