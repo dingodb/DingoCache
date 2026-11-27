@@ -955,6 +955,9 @@ TEST(RamTierWiring, AWatermarkWaitAdmitsThePutWhenTheFlushDrains) {
     st = n.Put(second, std::string(500, 'b'));
     done = true;
   });
+  EXPECT_TRUE(WaitFor([&] {
+    return n.Metric("dfkv_ram_ack_backpressure_waits_total") == 1;
+  }));
   std::this_thread::sleep_for(100ms);
   EXPECT_FALSE(done.load()) << "refused instead of waiting";
   n.barrier.Open();  // the flush drains; the waiting PUT is admitted
