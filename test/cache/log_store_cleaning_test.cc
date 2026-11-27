@@ -95,6 +95,144 @@ TEST(LogStoreCleaner, AReadValueGetsASecondChance) {
   fs::remove_all(dir);
 }
 
+// Legacy objects have only per-key identity and lifecycle. A shared-prefix
+// reuse must not turn retention of S into transitive protection of either
+// logical request's independent suffix, before or after recovery.
+TEST(LogStoreCleaner, SharedPrefixBranchObjectsRemainIndependentAcrossReopen) {
+  const fs::path dir = TestDir("sharedprefixfallback");
+  constexpr size_t kLen = 500000;
+  // These identify two logical branches (S,A) and (S,B). Their deliberately
+  // unrelated digests carry no ownership, prefix, or ordering semantics.
+  const BlockKey shared{0x5348415245445f31ULL, 0xa1b2c3d4e5f60718ULL, 0x4d35};
+  const BlockKey branch_a{0x4252414e43485f41ULL, 0x07195e2d8c4a6b01ULL, 0x4d35};
+  const BlockKey branch_b{0x4252414e43485f42ULL, 0xf7e6d5c4b3a29180ULL, 0x4d35};
+  const std::string shared_original = Val(51, kLen, 1);
+  const std::string shared_replacement = Val(51, kLen, 2);
+  const std::string a_value = Val(52, kLen, 1);
+  const std::string b_value = Val(53, kLen, 1);
+
+  std::vector<uint64_t> shared_generations;
+  std::vector<std::pair<BlockKey, uint64_t>> evicted;
+  auto options = [&] {
+    auto o = Quiet(dir);  // Deterministic inline reclaim, also quiet on reopen.
+    o.clock = [] { return kT0; };
+    o.on_commit = [&](const BlockKey& key, uint64_t generation) {
+      if (key == shared) shared_generations.push_back(generation);
+    };
+    o.on_evict = [&](const BlockKey& key, uint64_t generation) {
+      evicted.emplace_back(key, generation);
+    };
+    return o;
+  };
+  auto eviction_generation = [&](const BlockKey& key) -> std::optional<uint64_t> {
+    for (const auto& event : evicted) {
+      if (event.first == key) return event.second;
+    }
+    return std::nullopt;
+  };
+
+  uint64_t shared_generation = 0;
+  uint64_t b_generation = 0;
+  {
+    bool ok = false;
+    LogStore s(options(), &ok);
+    ASSERT_TRUE(ok) << s.StartupError();
+    ASSERT_STREQ(s.EngineName(), "log");
+
+    ASSERT_EQ(s.Cache(shared, shared_original.data(), shared_original.size()),
+              Status::kOk);
+    ValueMetadata metadata;
+    ASSERT_EQ(s.Lookup(shared, &metadata), Status::kOk);
+    shared_generation = metadata.generation;
+    // A second logical reference to S is keep-first: neither its bytes nor
+    // its store-local object version, nor its real commit count, changes.
+    ASSERT_EQ(s.Cache(shared, shared_replacement.data(), shared_replacement.size()),
+              Status::kOk);
+    ASSERT_EQ(shared_generations, std::vector<uint64_t>{shared_generation});
+    std::string out;
+    ASSERT_EQ(s.Range(shared, 0, 0, &out), Status::kOk);
+    EXPECT_EQ(out, shared_original);
+    ASSERT_EQ(s.Lookup(shared, &metadata), Status::kOk);
+    EXPECT_EQ(metadata.generation, shared_generation);
+
+    // Eight 500,000-byte records fit a 4 MiB segment (headers included).
+    // Seven lead-in objects therefore finish S's segment before A and B are
+    // written. Inline reclaim skips S's protected segment, not unprotected
+    // A/B by virtue of any inferred relationship.
+    for (uint64_t id = 100; id < 107; ++id) {
+      const std::string filler = Val(id, kLen);
+      ASSERT_EQ(s.Cache(Key(id), filler.data(), filler.size()), Status::kOk);
+    }
+    ASSERT_EQ(s.Cache(branch_a, a_value.data(), a_value.size()), Status::kOk);
+    ASSERT_EQ(s.Cache(branch_b, b_value.data(), b_value.size()), Status::kOk);
+    ASSERT_EQ(s.Lookup(branch_a, &metadata), Status::kOk);
+    ASSERT_EQ(s.Lookup(branch_b, &metadata), Status::kOk);
+    b_generation = metadata.generation;
+    ASSERT_EQ(s.Retain(shared, 3600, 0, kT0), kProtectedNew);
+
+    // At most 96 more 500,000-byte objects supply over six segments of real
+    // pressure. Stop on B's actual callback; never assume immediate eviction.
+    for (uint64_t id = 1000; id < 1096 && !eviction_generation(branch_b); ++id) {
+      const std::string filler = Val(id, kLen);
+      const Status st = s.Cache(Key(id), filler.data(), filler.size());
+      ASSERT_TRUE(st == Status::kOk || st == Status::kCacheFull) << int(st);
+    }
+    const auto b_eviction = eviction_generation(branch_b);
+    ASSERT_TRUE(b_eviction.has_value())
+        << "96 bounded pressure objects caused no eviction of B";
+    EXPECT_EQ(*b_eviction, b_generation);
+    EXPECT_TRUE(eviction_generation(branch_a).has_value());
+    EXPECT_FALSE(eviction_generation(shared).has_value());
+    EXPECT_GT(s.GetStats().inline_reclaims, 0u);
+    EXPECT_GT(s.GetStats().segments_reclaimed, 0u);
+    EXPECT_GT(s.Evictions(), 1u);
+
+    ASSERT_EQ(s.Range(shared, 0, 0, &out), Status::kOk);
+    EXPECT_EQ(out, shared_original);
+    ASSERT_EQ(s.Lookup(shared, &metadata), Status::kOk);
+    EXPECT_EQ(metadata.generation, shared_generation);
+    EXPECT_EQ(s.Range(branch_a, 0, 0, &out), Status::kNotFound);
+    EXPECT_EQ(s.Range(branch_b, 0, 0, &out), Status::kNotFound);
+    ASSERT_TRUE(s.Close());
+  }
+
+  bool ok = false;
+  LogStore s(options(), &ok);  // Quiet recovery cannot reclaim in background.
+  ASSERT_TRUE(ok) << s.StartupError();
+  std::vector<BlockKey> recovered;
+  s.ForEachKey([&](const BlockKey& key) { recovered.push_back(key); });
+  EXPECT_EQ(recovered.size(), s.Count());
+  auto recovered_count = [&](const BlockKey& key) {
+    size_t count = 0;
+    for (const BlockKey& candidate : recovered) count += candidate == key;
+    return count;
+  };
+  // This is only the persisted BlockKey inventory, not an owner registry.
+  EXPECT_EQ(recovered_count(shared), 1u);
+  EXPECT_EQ(recovered_count(branch_a), 0u);
+  EXPECT_EQ(recovered_count(branch_b), 0u);
+
+  ValueMetadata metadata;
+  ASSERT_EQ(s.Lookup(shared, &metadata), Status::kOk);
+  EXPECT_EQ(metadata.generation, shared_generation);
+  EXPECT_EQ(metadata.value_len, shared_original.size());
+  std::string out;
+  ASSERT_EQ(s.Range(shared, 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, shared_original);
+  ASSERT_EQ(s.Lookup(branch_a, &metadata), Status::kNotFound);
+  ASSERT_EQ(s.Lookup(branch_b, &metadata), Status::kNotFound);
+
+  ASSERT_EQ(s.Cache(shared, shared_replacement.data(), shared_replacement.size()),
+            Status::kOk);
+  ASSERT_EQ(shared_generations, std::vector<uint64_t>{shared_generation});
+  ASSERT_EQ(s.Lookup(shared, &metadata), Status::kOk);
+  EXPECT_EQ(metadata.generation, shared_generation);
+  ASSERT_EQ(s.Range(shared, 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, shared_original);
+  ASSERT_TRUE(s.Close());
+  fs::remove_all(dir);
+}
+
 // S2 of the #512 review: a long lease on the oldest segment does not stall
 // the cleaner while every other sealed segment is mostly protected; it
 // reclaims those (relocating what is protected) instead.
