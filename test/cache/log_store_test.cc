@@ -119,12 +119,18 @@ bool FinalSuperblocks(const fs::path& dir) {
 }
 
 // Mutates fixture copies only, preserving DFKVLSE1 geometry and recomputing
-// each superblock's real CRC. both=false leaves copy 1 final-format.
-bool MarkDevelopmentSuperblocks(const fs::path& dir, bool both) {
+// each superblock's real CRC. both=false marks copy 0 unless only_copy names
+// the other copy, allowing either asymmetric direction.
+bool MarkDevelopmentSuperblocks(const fs::path& dir, bool both,
+                                int only_copy = -1) {
   const int fd = ::open((dir / "lse_super").c_str(), O_RDWR);
   if (fd < 0) return false;
   bool ok = true;
-  for (int copy = 0; copy < (both ? 2 : 1); ++copy) {
+  for (int copy = 0; copy < 2; ++copy) {
+    if ((!both && only_copy < 0 && copy != 0) ||
+        (only_copy >= 0 && copy != only_copy)) {
+      continue;
+    }
     lse::Block block{};
     lse::Superblock super;
     ok = ::pread(fd, block.data(), block.size(), copy * lse::kBlockBytes) ==
@@ -492,6 +498,93 @@ TEST(LogStore, NewStoresAreFinalAndDevelopmentIsRefusedWithoutConversion) {
         << "development format was converted or mutated";
     fs::remove_all(dir);
   }
+}
+
+TEST(LogStore, InitializingMarkerCannotOverwriteDevelopmentSuperblocks) {
+  // -1 marks both copies; 0 and 1 exercise both asymmetric directions.
+  for (const int development_copy : {-1, 0, 1}) {
+    SCOPED_TRACE(development_copy);
+    const fs::path dir = TestDir("init-marker-development");
+    {
+      bool ok = false;
+      LogStore s(Opts(dir), &ok);
+      ASSERT_TRUE(ok) << s.StartupError();
+      const std::string original = Value(7, 0);
+      ASSERT_EQ(s.Cache(Key(7), original.data(), original.size()), Status::kOk);
+      ASSERT_TRUE(s.Close());
+    }
+    // This is the init.after_super-equivalent state: real segment files,
+    // journal and CRC-valid superblocks, followed by the initialization
+    // marker being present again. No filename-only development claim.
+    std::ofstream(dir / "lse_initializing", std::ios::binary | std::ios::trunc);
+    if (development_copy < 0) {
+      ASSERT_TRUE(MarkDevelopmentSuperblocks(dir, true))
+          << "development fixture setup failed";
+    } else {
+      ASSERT_TRUE(MarkDevelopmentSuperblocks(dir, false, development_copy))
+          << "development fixture setup failed";
+    }
+    const auto before = Snapshot(dir);
+    bool ok = true;
+    LogStore old(Opts(dir), &ok);
+    EXPECT_FALSE(ok);
+    EXPECT_NE(old.StartupError().find("development format"), std::string::npos)
+        << old.StartupError();
+    EXPECT_EQ(Snapshot(dir), before)
+        << "init preflight modified development data";
+    fs::remove_all(dir);
+  }
+}
+
+TEST(LogStore, InitializingMarkerWithUnreadableSuperCannotFallThroughToInit) {
+  const fs::path dir = TestDir("init-marker-super-read-error");
+  {
+    bool ok = false;
+    LogStore s(Opts(dir), &ok);
+    ASSERT_TRUE(ok) << s.StartupError();
+    ASSERT_TRUE(s.Close());
+  }
+  std::ofstream(dir / "lse_initializing", std::ios::binary | std::ios::trunc);
+  // Opening a directory read-only succeeds on Linux, but pread fails. The
+  // constructor must report that I/O error rather than truncate into InitStore.
+  fs::remove(dir / "lse_super");
+  fs::create_directory(dir / "lse_super");
+  const auto before = Snapshot(dir);
+  bool ok = true;
+  LogStore unreadable(Opts(dir), &ok);
+  EXPECT_FALSE(ok);
+  EXPECT_NE(unreadable.StartupError().find("before initialization"),
+            std::string::npos)
+      << unreadable.StartupError();
+  EXPECT_EQ(Snapshot(dir), before);
+  EXPECT_TRUE(fs::is_directory(dir / "lse_super"));
+  fs::remove_all(dir);
+}
+
+TEST(LogStore, FinalInitializingMarkerRemainsConstructibleAndUsable) {
+  const fs::path dir = TestDir("final-interrupted-init");
+  {
+    bool ok = false;
+    LogStore s(Opts(dir), &ok);
+    ASSERT_TRUE(ok) << s.StartupError();
+    const std::string original = Value(7, 0);
+    ASSERT_EQ(s.Cache(Key(7), original.data(), original.size()), Status::kOk);
+    ASSERT_TRUE(s.Close());
+  }
+  std::ofstream(dir / "lse_initializing", std::ios::binary | std::ios::trunc);
+  bool ok = true;
+  LogStore initialized(Opts(dir), &ok);
+  ASSERT_TRUE(ok) << initialized.StartupError();
+  ASSERT_TRUE(initialized.Healthy()) << initialized.StartupError();
+  EXPECT_FALSE(fs::exists(dir / "lse_initializing"));
+  EXPECT_TRUE(FinalSuperblocks(dir));
+  const std::string value = Value(77, 1);
+  ASSERT_EQ(initialized.Cache(Key(77), value.data(), value.size()), Status::kOk);
+  std::string out;
+  ASSERT_EQ(initialized.Range(Key(77), 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, value);
+  ASSERT_TRUE(initialized.Close());
+  fs::remove_all(dir);
 }
 
 TEST(LogStore, AnOpenedStoreThatIsNotActivatedChangesNothing) {
