@@ -2568,9 +2568,11 @@ struct QualityTrace {
   uint64_t key_base = 0;
   std::vector<uint32_t> warmup;
   std::vector<uint32_t> measured;
+  uint64_t warmup_unique = 0;
   uint64_t measured_unique = 0;
   uint64_t all_unique = 0;
   uint64_t hash = 0;
+  uint64_t measured_hash = 0;
   bool valid = false;
 };
 
@@ -2591,20 +2593,41 @@ QualityTrace MakeQualityTrace(uint32_t pair) {
     total += std::pow(static_cast<double>(i + 1), -0.9);
     cdf[i] = total;
   }
-  uint64_t rng = trace.seed;
+  // Warm-up is declared initialization, not a sampled Zipf measurement.  Every
+  // key is requested exactly once, in a reproducible per-pair permutation.
+  trace.warmup.reserve(kQualityWarmupRequests);
+  for (uint64_t i = 0; i < kQualityZipfKeys; ++i)
+    trace.warmup.push_back(static_cast<uint32_t>(i));
+  uint64_t shuffle_rng = trace.seed;
+  for (uint64_t remaining = kQualityZipfKeys; remaining > 1; --remaining) {
+    const double uniform =
+        (QualitySplitMix64(&shuffle_rng) >> 11) * (1.0 / 9007199254740992.0);
+    const size_t selected = static_cast<size_t>(uniform * remaining);
+    std::swap(trace.warmup[remaining - 1], trace.warmup[selected]);
+  }
+
+  // Keep the measured vector independent of shuffle consumption.  Advancing a
+  // separate stream by the old warm-up draw count preserves its prior derivation.
+  uint64_t measured_rng = trace.seed;
+  for (uint64_t i = 0; i < kQualityWarmupRequests; ++i)
+    (void)QualitySplitMix64(&measured_rng);
   auto draw = [&] {
     const double uniform =
-        (QualitySplitMix64(&rng) >> 11) * (1.0 / 9007199254740992.0);
+        (QualitySplitMix64(&measured_rng) >> 11) * (1.0 / 9007199254740992.0);
     return static_cast<uint32_t>(
         std::lower_bound(cdf.begin(), cdf.end(), uniform * total) - cdf.begin());
   };
-  trace.warmup.reserve(kQualityWarmupRequests);
   trace.measured.reserve(kQualityMeasuredRequests);
-  for (uint64_t i = 0; i < kQualityWarmupRequests; ++i)
-    trace.warmup.push_back(draw());
   for (uint64_t i = 0; i < kQualityMeasuredRequests; ++i)
     trace.measured.push_back(draw());
   std::vector<bool> seen(kQualityZipfKeys, false);
+  for (const uint32_t id : trace.warmup) {
+    if (!seen[id]) {
+      seen[id] = true;
+      ++trace.warmup_unique;
+    }
+  }
+  std::fill(seen.begin(), seen.end(), false);
   for (const uint32_t id : trace.measured) {
     if (!seen[id]) {
       seen[id] = true;
@@ -2620,6 +2643,11 @@ QualityTrace MakeQualityTrace(uint32_t pair) {
       }
     }
   }
+  trace.measured_hash = 1469598103934665603ULL;
+  QualityTraceHashAdd(trace.seed, &trace.measured_hash);
+  QualityTraceHashAdd(trace.measured.size(), &trace.measured_hash);
+  for (const uint32_t id : trace.measured)
+    QualityTraceHashAdd(id, &trace.measured_hash);
   trace.hash = 1469598103934665603ULL;  // FNV-1a, little-endian request ids
   QualityTraceHashAdd(trace.seed, &trace.hash);
   QualityTraceHashAdd(trace.warmup.size(), &trace.hash);
@@ -2628,8 +2656,8 @@ QualityTrace MakeQualityTrace(uint32_t pair) {
   for (const uint32_t id : trace.measured) QualityTraceHashAdd(id, &trace.hash);
   trace.valid = trace.warmup.size() == kQualityWarmupRequests &&
                 trace.measured.size() == kQualityMeasuredRequests &&
-                trace.measured_unique >= kQualityZipfKeys / 4 &&
-                trace.all_unique >= 4 * kQualityZipfKeys / 5;
+                trace.warmup_unique == kQualityZipfKeys &&
+                trace.measured_unique >= kQualityZipfKeys / 4;
   return trace;
 }
 
@@ -2792,6 +2820,8 @@ QualityZipfResult RunQualityZipf(EngineKind kind, uint32_t pair, uint32_t order,
   const uint64_t evictions_before =
       opened.store == nullptr ? 0 : opened.store->Evictions();
   if (opened.open_ok && QualityDirectActive(kind, opened)) {
+    // Each directory is fresh and empty.  Warm-up is declared full-keyspace
+    // permutation initialization; only the following vector is Zipf measurement.
     // One synchronous worker consumes the exact request vectors supplied here.
     warmup = RunQualityZipfPhase(opened.store.get(), trace, trace.warmup, &epochs);
     measured = RunQualityZipfPhase(opened.store.get(), trace, trace.measured, &epochs);
@@ -2849,6 +2879,8 @@ QualityZipfResult RunQualityZipf(EngineKind kind, uint32_t pair, uint32_t order,
       << std::hex << std::setw(16) << std::setfill('0') << trace.hash << std::dec
       << "\",\"trace_key_base\":" << trace.key_base
       << ",\"zipf_exponent\":0.9,\"zipf_keyspace\":" << kQualityZipfKeys
+      << ",\"warmup_unique_keys\":" << trace.warmup_unique
+      << ",\"warmup_is_full_keyspace_initialization\":true"
       << ",\"trace_value_transform\":\"value_base+epoch*keyspace+object\""
       << ",\"trace_value_base\":" << kQualityZipfValueBase
       << ",\"warmup_then_measured_same_epoch_table\":true"
@@ -2929,8 +2961,12 @@ TEST(LseM3Quality, SteadyIoAndZipfEviction) {
                 << ",\"zipf_exponent\":0.9,\"zipf_keyspace\":" << kQualityZipfKeys
                 << ",\"zipf_warmup_requests\":" << kQualityWarmupRequests
                 << ",\"zipf_measured_requests\":" << kQualityMeasuredRequests
+                << ",\"warmup_recipe\":"
+                   "\"seeded Fisher-Yates permutation containing every key exactly once\""
+                << ",\"sequence_semantics\":"
+                   "\"(warmup by seeded full-keyspace permutation) -> (measured by independent Zipf(0.9))\""
                 << ",\"trace_recipe\":"
-                   "\"SplitMix64 top53 / 2^53; lower_bound in normalized N weights i^-0.9\""
+                   "\"SplitMix64 top53 / 2^53; lower_bound in normalized N weights i^-0.9; measured RNG independent of shuffle\""
                 << ",\"trace_seed_base\":" << kQualityTraceSeedBase
                 << ",\"trace_epoch_value\":"
                    "\"value_base+epoch*keyspace+object; epoch advances only on admitted miss\""
@@ -2975,11 +3011,20 @@ TEST(LseM3Quality, SteadyIoAndZipfEviction) {
                << ",\"pair\":" << pair << ",\"seed\":" << trace.seed
                << ",\"key_base\":" << trace.key_base
                << ",\"warmup_requests\":" << trace.warmup.size()
+               << ",\"warmup_unique_keys\":" << trace.warmup_unique
+               << ",\"warmup_recipe\":"
+                  "\"Fisher-Yates full-keyspace permutation; SplitMix64 top53/2^53; selected=floor(u*remaining)\""
+               << ",\"measured_recipe\":"
+                  "\"independent Zipf(0.9) inverse-CDF; separate RNG advanced by old warmup draw count\""
+               << ",\"semantic_recipe\":"
+                  "\"(warmup by seeded full-keyspace permutation) -> (measured by independent Zipf(0.9))\""
                << ",\"measured_requests\":" << trace.measured.size()
                << ",\"measured_unique_keys\":" << trace.measured_unique
                << ",\"all_unique_keys\":" << trace.all_unique
                << ",\"fnv1a64\":\"" << std::hex << std::setw(16)
                << std::setfill('0') << trace.hash << std::dec << '"'
+               << ",\"measured_fnv1a64\":\"" << std::hex << std::setw(16)
+               << std::setfill('0') << trace.measured_hash << std::dec << '"'
                << ",\"same_vector_supplied_to_both_engines\":true"
                << ",\"valid\":" << trace.valid << '}';
     reporter.Emit(trace_line.str());
