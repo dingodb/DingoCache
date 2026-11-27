@@ -5,6 +5,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -97,6 +98,23 @@ bool ValidKey(const void* ptr, uint64_t size) {
 
 std::string CopyKey(const void* ptr, uint64_t size) {
   return std::string(static_cast<const char*>(ptr), static_cast<size_t>(size));
+}
+
+// A null route vector preserves the legacy placement. An empty per-item anchor
+// falls back to that item's actual key; any other malformed anchor is rejected
+// independently, exactly like a malformed actual key.
+bool ValidRouteKey(const void* const* route_keys,
+                   const uint64_t* route_key_lens, int i) {
+  if (route_keys == nullptr) return true;
+  return route_key_lens != nullptr &&
+         (route_key_lens[i] == 0 || ValidKey(route_keys[i], route_key_lens[i]));
+}
+
+std::string_view RouteKeyView(const void* const* route_keys,
+                              const uint64_t* route_key_lens, int i) {
+  if (route_keys == nullptr || route_key_lens[i] == 0) return {};
+  return {static_cast<const char*>(route_keys[i]),
+          static_cast<size_t>(route_key_lens[i])};
 }
 
 template <class T>
@@ -310,7 +328,8 @@ uint64_t dfkv_max_block_bytes(dfkv_client_t c) {
 }
 
 static int BatchPutC(dfkv_client_t c, const void* const* keys,
-                     const uint64_t* key_lens, const void** ptrs,
+                     const uint64_t* key_lens, const void* const* route_keys,
+                     const uint64_t* route_key_lens, const void** ptrs,
                      const uint64_t* sizes, int n, int* out_ok,
                      uint8_t* out_status) {
   ZeroArray(out_ok, n);
@@ -323,12 +342,14 @@ static int BatchPutC(dfkv_client_t c, const void* const* keys,
     items.reserve(static_cast<size_t>(n));
     positions.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
-      if (!ValidKey(keys[i], key_lens[i]) || sizes[i] == 0 ||
+      if (!ValidKey(keys[i], key_lens[i]) ||
+          !ValidRouteKey(route_keys, route_key_lens, i) || sizes[i] == 0 ||
           !ValidBuffer(ptrs[i], sizes[i]))
         continue;
       positions.push_back(static_cast<size_t>(i));
       items.push_back({CopyKey(keys[i], key_lens[i]), ptrs[i],
-                       static_cast<size_t>(sizes[i])});
+                       static_cast<size_t>(sizes[i]),
+                       RouteKeyView(route_keys, route_key_lens, i)});
     }
     std::vector<dfkv::ItemStatus> status;
     const auto result = static_cast<KVClient*>(c)->BatchPut(
@@ -341,7 +362,8 @@ static int BatchPutC(dfkv_client_t c, const void* const* keys,
 }
 
 static int BatchGetC(dfkv_client_t c, const void* const* keys,
-                     const uint64_t* key_lens, void** ptrs,
+                     const uint64_t* key_lens, const void* const* route_keys,
+                     const uint64_t* route_key_lens, void** ptrs,
                      const uint64_t* sizes, int n, int* out_hit,
                      uint8_t* out_status) {
   ZeroArray(out_hit, n);
@@ -355,11 +377,13 @@ static int BatchGetC(dfkv_client_t c, const void* const* keys,
     positions.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
       if (!ValidKey(keys[i], key_lens[i]) ||
+          !ValidRouteKey(route_keys, route_key_lens, i) ||
           !ValidBuffer(ptrs[i], sizes[i]))
         continue;
       positions.push_back(static_cast<size_t>(i));
       items.push_back({CopyKey(keys[i], key_lens[i]), ptrs[i],
-                       static_cast<size_t>(sizes[i])});
+                       static_cast<size_t>(sizes[i]),
+                       RouteKeyView(route_keys, route_key_lens, i)});
     }
     std::vector<dfkv::ItemStatus> status;
     const auto result = static_cast<KVClient*>(c)->BatchGet(
@@ -372,7 +396,8 @@ static int BatchGetC(dfkv_client_t c, const void* const* keys,
 }
 
 static int BatchGetAutoC(dfkv_client_t c, const void* const* keys,
-                         const uint64_t* key_lens, void** ptrs,
+                         const uint64_t* key_lens, const void* const* route_keys,
+                         const uint64_t* route_key_lens, void** ptrs,
                          const uint64_t* caps, int n, int* out_hit,
                          uint64_t* out_len, uint8_t* out_status) {
   ZeroArray(out_hit, n);
@@ -389,11 +414,13 @@ static int BatchGetAutoC(dfkv_client_t c, const void* const* keys,
     positions.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
       if (!ValidKey(keys[i], key_lens[i]) ||
+          !ValidRouteKey(route_keys, route_key_lens, i) ||
           !ValidBuffer(ptrs[i], caps[i]))
         continue;
       positions.push_back(static_cast<size_t>(i));
       items.push_back({CopyKey(keys[i], key_lens[i]), ptrs[i],
-                       static_cast<size_t>(caps[i])});
+                       static_cast<size_t>(caps[i]),
+                       RouteKeyView(route_keys, route_key_lens, i)});
     }
     std::vector<size_t> lengths;
     std::vector<dfkv::ItemStatus> status;
@@ -409,31 +436,54 @@ static int BatchGetAutoC(dfkv_client_t c, const void* const* keys,
   });
 }
 
-int dfkv_batch_exist(dfkv_client_t c, const void* const* keys,
-                     const uint64_t* key_lens, int n, int* out_exist) {
+static int BatchExistC(dfkv_client_t c, const void* const* keys,
+                       const uint64_t* key_lens, const void* const* route_keys,
+                       const uint64_t* route_key_lens, int n, int* out_exist) {
   ZeroArray(out_exist, n);
   return NoThrow(-1, [&] {
     if (!c || n < 0) return -1;
     if (n > 0 && (!keys || !key_lens || !out_exist)) return -1;
     std::vector<std::string> valid_keys;
+    dfkv::KvRouteKeys valid_routes;
     std::vector<size_t> positions;
     valid_keys.reserve(static_cast<size_t>(n));
+    if (route_keys) valid_routes.reserve(static_cast<size_t>(n));
     positions.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
-      if (!ValidKey(keys[i], key_lens[i])) continue;
+      if (!ValidKey(keys[i], key_lens[i]) ||
+          !ValidRouteKey(route_keys, route_key_lens, i))
+        continue;
       positions.push_back(static_cast<size_t>(i));
       valid_keys.push_back(CopyKey(keys[i], key_lens[i]));
+      if (route_keys)
+        valid_routes.push_back(RouteKeyView(route_keys, route_key_lens, i));
     }
-    const auto result = static_cast<KVClient*>(c)->BatchExist(valid_keys);
+    const auto result = static_cast<KVClient*>(c)->BatchExist(
+        valid_keys, route_keys ? &valid_routes : nullptr);
     for (size_t i = 0; i < positions.size() && i < result.size(); ++i)
       out_exist[positions[i]] = result[i] ? 1 : 0;
     return 0;
   });
 }
 
-int dfkv_batch_retain(dfkv_client_t c, const void* const* keys,
-                      const uint64_t* key_lens, int n,
-                      const dfkv_retain_options* opt, uint8_t* out_result) {
+int dfkv_batch_exist(dfkv_client_t c, const void* const* keys,
+                     const uint64_t* key_lens, int n, int* out_exist) {
+  return BatchExistC(c, keys, key_lens, nullptr, nullptr, n, out_exist);
+}
+
+int dfkv_batch_exist_anchored(dfkv_client_t c, const void* const* keys,
+                              const uint64_t* key_lens,
+                              const void* const* route_keys,
+                              const uint64_t* route_key_lens, int n,
+                              int* out_exist) {
+  return BatchExistC(c, keys, key_lens, route_keys, route_key_lens, n,
+                     out_exist);
+}
+
+static int BatchRetainC(dfkv_client_t c, const void* const* keys,
+                        const uint64_t* key_lens, const void* const* route_keys,
+                        const uint64_t* route_key_lens, int n,
+                        const dfkv_retain_options* opt, uint8_t* out_result) {
   if (out_result && n > 0)
     std::fill(out_result, out_result + n, static_cast<uint8_t>(DFKV_RET_ERROR));
   return NoThrow(-1, [&] {
@@ -446,13 +496,19 @@ int dfkv_batch_retain(dfkv_client_t c, const void* const* keys,
       return -1;
     if (n > 0 && (!keys || !key_lens || !out_result)) return -1;
     std::vector<std::string> valid_keys;
+    dfkv::KvRouteKeys valid_routes;
     std::vector<size_t> positions;
     valid_keys.reserve(static_cast<size_t>(n));
+    if (route_keys) valid_routes.reserve(static_cast<size_t>(n));
     positions.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
-      if (!ValidKey(keys[i], key_lens[i])) continue;
+      if (!ValidKey(keys[i], key_lens[i]) ||
+          !ValidRouteKey(route_keys, route_key_lens, i))
+        continue;
       positions.push_back(static_cast<size_t>(i));
       valid_keys.push_back(CopyKey(keys[i], key_lens[i]));
+      if (route_keys)
+        valid_routes.push_back(RouteKeyView(route_keys, route_key_lens, i));
     }
     KVClient::RetainRequest req;
     req.ttl_s = opt->ttl_s;
@@ -460,11 +516,28 @@ int dfkv_batch_retain(dfkv_client_t c, const void* const* keys,
     req.no_debounce = (opt->flags & DFKV_RETAIN_F_NO_DEBOUNCE) != 0;
     req.min_refresh_ms = opt->min_refresh_ms;
     std::vector<uint8_t> result(valid_keys.size(), DFKV_RET_ERROR);
-    static_cast<KVClient*>(c)->BatchRetain(valid_keys, req, result.data());
+    static_cast<KVClient*>(c)->BatchRetain(
+        valid_keys, req, result.data(), route_keys ? &valid_routes : nullptr);
     for (size_t i = 0; i < positions.size(); ++i)
       out_result[positions[i]] = result[i];
     return 0;
   });
+}
+
+int dfkv_batch_retain(dfkv_client_t c, const void* const* keys,
+                      const uint64_t* key_lens, int n,
+                      const dfkv_retain_options* opt, uint8_t* out_result) {
+  return BatchRetainC(c, keys, key_lens, nullptr, nullptr, n, opt, out_result);
+}
+
+int dfkv_batch_retain_anchored(dfkv_client_t c, const void* const* keys,
+                               const uint64_t* key_lens,
+                               const void* const* route_keys,
+                               const uint64_t* route_key_lens, int n,
+                               const dfkv_retain_options* opt,
+                               uint8_t* out_result) {
+  return BatchRetainC(c, keys, key_lens, route_keys, route_key_lens, n, opt,
+                      out_result);
 }
 
 int dfkv_retain_limits(dfkv_client_t c, int* supported, uint32_t* max_ttl_s) {
@@ -477,9 +550,11 @@ int dfkv_retain_limits(dfkv_client_t c, int* supported, uint32_t* max_ttl_s) {
   });
 }
 
-int dfkv_retain_precheck(dfkv_client_t c, const void* const* keys,
-                         const uint64_t* key_lens, int n,
-                         uint8_t min_headroom_pct, int* ok) {
+static int RetainPrecheckC(dfkv_client_t c, const void* const* keys,
+                           const uint64_t* key_lens,
+                           const void* const* route_keys,
+                           const uint64_t* route_key_lens, int n,
+                           uint8_t min_headroom_pct, int* ok) {
   if (ok) *ok = 0;
   return NoThrow(-1, [&] {
     if (!c || n < 0 || !ok) return -1;
@@ -500,42 +575,87 @@ int dfkv_retain_precheck(dfkv_client_t c, const void* const* keys,
       (void)reported;
     }
     std::vector<std::string> valid_keys;
+    dfkv::KvRouteKeys valid_routes;
     valid_keys.reserve(static_cast<size_t>(n));
-    for (int i = 0; i < n; ++i)
-      if (ValidKey(keys[i], key_lens[i]))
-        valid_keys.push_back(CopyKey(keys[i], key_lens[i]));
-    *ok = static_cast<KVClient*>(c)->RetainPrecheck(valid_keys,
-                                                    min_headroom_pct)
+    if (route_keys) valid_routes.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+      if (!ValidKey(keys[i], key_lens[i]) ||
+          !ValidRouteKey(route_keys, route_key_lens, i))
+        continue;
+      valid_keys.push_back(CopyKey(keys[i], key_lens[i]));
+      if (route_keys)
+        valid_routes.push_back(RouteKeyView(route_keys, route_key_lens, i));
+    }
+    *ok = static_cast<KVClient*>(c)->RetainPrecheck(
+              valid_keys, min_headroom_pct,
+              route_keys ? &valid_routes : nullptr)
               ? 1
               : 0;
     return 0;
   });
 }
 
-int dfkv_batch_remove(dfkv_client_t c, const void* const* keys,
-                      const uint64_t* key_lens, int n, int* out_ok) {
+int dfkv_retain_precheck(dfkv_client_t c, const void* const* keys,
+                         const uint64_t* key_lens, int n,
+                         uint8_t min_headroom_pct, int* ok) {
+  return RetainPrecheckC(c, keys, key_lens, nullptr, nullptr, n,
+                         min_headroom_pct, ok);
+}
+
+int dfkv_retain_precheck_anchored(
+    dfkv_client_t c, const void* const* keys, const uint64_t* key_lens,
+    const void* const* route_keys, const uint64_t* route_key_lens, int n,
+    uint8_t min_headroom_pct, int* ok) {
+  return RetainPrecheckC(c, keys, key_lens, route_keys, route_key_lens, n,
+                         min_headroom_pct, ok);
+}
+
+static int BatchRemoveC(dfkv_client_t c, const void* const* keys,
+                        const uint64_t* key_lens, const void* const* route_keys,
+                        const uint64_t* route_key_lens, int n, int* out_ok) {
   ZeroArray(out_ok, n);
   return NoThrow(-1, [&] {
     if (!c || n < 0) return -1;
     if (n > 0 && (!keys || !key_lens || !out_ok)) return -1;
     std::vector<std::string> valid_keys;
+    dfkv::KvRouteKeys valid_routes;
     std::vector<size_t> positions;
     valid_keys.reserve(static_cast<size_t>(n));
+    if (route_keys) valid_routes.reserve(static_cast<size_t>(n));
     positions.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
-      if (!ValidKey(keys[i], key_lens[i])) continue;
+      if (!ValidKey(keys[i], key_lens[i]) ||
+          !ValidRouteKey(route_keys, route_key_lens, i))
+        continue;
       positions.push_back(static_cast<size_t>(i));
       valid_keys.push_back(CopyKey(keys[i], key_lens[i]));
+      if (route_keys)
+        valid_routes.push_back(RouteKeyView(route_keys, route_key_lens, i));
     }
-    const auto result = static_cast<KVClient*>(c)->BatchRemove(valid_keys);
+    const auto result = static_cast<KVClient*>(c)->BatchRemove(
+        valid_keys, route_keys ? &valid_routes : nullptr);
     for (size_t i = 0; i < positions.size() && i < result.size(); ++i)
       out_ok[positions[i]] = result[i] ? 1 : 0;
     return 0;
   });
 }
 
+int dfkv_batch_remove(dfkv_client_t c, const void* const* keys,
+                      const uint64_t* key_lens, int n, int* out_ok) {
+  return BatchRemoveC(c, keys, key_lens, nullptr, nullptr, n, out_ok);
+}
+
+int dfkv_batch_remove_anchored(dfkv_client_t c, const void* const* keys,
+                               const uint64_t* key_lens,
+                               const void* const* route_keys,
+                               const uint64_t* route_key_lens, int n,
+                               int* out_ok) {
+  return BatchRemoveC(c, keys, key_lens, route_keys, route_key_lens, n, out_ok);
+}
+
 static int BatchPutSgC(dfkv_client_t c, const void* const* keys,
-                       const uint64_t* key_lens, const void*** ptrs,
+                       const uint64_t* key_lens, const void* const* route_keys,
+                       const uint64_t* route_key_lens, const void*** ptrs,
                        const uint64_t** sizes, const int* num_bufs, int n,
                        int* out_ok, uint8_t* out_status) {
   ZeroArray(out_ok, n);
@@ -551,7 +671,8 @@ static int BatchPutSgC(dfkv_client_t c, const void* const* keys,
     positions.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
       const int count = num_bufs[i];
-      if (!ValidKey(keys[i], key_lens[i]) || count < 0 ||
+      if (!ValidKey(keys[i], key_lens[i]) ||
+          !ValidRouteKey(route_keys, route_key_lens, i) || count < 0 ||
           (count > 0 && (!ptrs[i] || !sizes[i])))
         continue;
       bool valid = true;
@@ -566,6 +687,7 @@ static int BatchPutSgC(dfkv_client_t c, const void* const* keys,
       if (!valid || total == 0) continue;
       dfkv::KvPutItemSg item;
       item.key = CopyKey(keys[i], key_lens[i]);
+      item.route_key = RouteKeyView(route_keys, route_key_lens, i);
       item.ptrs.reserve(static_cast<size_t>(count));
       item.sizes.reserve(static_cast<size_t>(count));
       for (int j = 0; j < count; ++j) {
@@ -586,7 +708,9 @@ static int BatchPutSgC(dfkv_client_t c, const void* const* keys,
 }
 
 static int BatchGetAutoSgC(dfkv_client_t c, const void* const* keys,
-                           const uint64_t* key_lens, void*** dsts,
+                           const uint64_t* key_lens,
+                           const void* const* route_keys,
+                           const uint64_t* route_key_lens, void*** dsts,
                            const uint64_t** caps, const int* num_dsts, int n,
                            int* out_hit, uint64_t* out_len,
                            uint8_t* out_status) {
@@ -604,7 +728,8 @@ static int BatchGetAutoSgC(dfkv_client_t c, const void* const* keys,
     positions.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
       const int count = num_dsts[i];
-      if (!ValidKey(keys[i], key_lens[i]) || count < 0 ||
+      if (!ValidKey(keys[i], key_lens[i]) ||
+          !ValidRouteKey(route_keys, route_key_lens, i) || count < 0 ||
           (count > 0 && (!dsts[i] || !caps[i])))
         continue;
       bool valid = true;
@@ -619,6 +744,7 @@ static int BatchGetAutoSgC(dfkv_client_t c, const void* const* keys,
       if (!valid) continue;
       dfkv::KvGetItemSg item;
       item.key = CopyKey(keys[i], key_lens[i]);
+      item.route_key = RouteKeyView(route_keys, route_key_lens, i);
       item.dsts.reserve(static_cast<size_t>(count));
       item.caps.reserve(static_cast<size_t>(count));
       for (int j = 0; j < count; ++j) {
@@ -645,7 +771,7 @@ static int BatchGetAutoSgC(dfkv_client_t c, const void* const* keys,
 int dfkv_batch_put(dfkv_client_t c, const void* const* keys,
                    const uint64_t* key_lens, const void** ptrs,
                    const uint64_t* sizes, int n, int* out_ok) {
-  return BatchPutC(c, keys, key_lens, ptrs, sizes, n, out_ok, nullptr);
+  return BatchPutC(c, keys, key_lens, nullptr, nullptr, ptrs, sizes, n, out_ok, nullptr);
 }
 int dfkv_batch_put_st(dfkv_client_t c, const void* const* keys,
                       const uint64_t* key_lens, const void** ptrs,
@@ -655,12 +781,12 @@ int dfkv_batch_put_st(dfkv_client_t c, const void* const* keys,
     ZeroArray(out_ok, n);
     return -1;
   }
-  return BatchPutC(c, keys, key_lens, ptrs, sizes, n, out_ok, out_status);
+  return BatchPutC(c, keys, key_lens, nullptr, nullptr, ptrs, sizes, n, out_ok, out_status);
 }
 int dfkv_batch_get(dfkv_client_t c, const void* const* keys,
                    const uint64_t* key_lens, void** ptrs,
                    const uint64_t* sizes, int n, int* out_hit) {
-  return BatchGetC(c, keys, key_lens, ptrs, sizes, n, out_hit, nullptr);
+  return BatchGetC(c, keys, key_lens, nullptr, nullptr, ptrs, sizes, n, out_hit, nullptr);
 }
 int dfkv_batch_get_st(dfkv_client_t c, const void* const* keys,
                       const uint64_t* key_lens, void** ptrs,
@@ -670,13 +796,13 @@ int dfkv_batch_get_st(dfkv_client_t c, const void* const* keys,
     ZeroArray(out_hit, n);
     return -1;
   }
-  return BatchGetC(c, keys, key_lens, ptrs, sizes, n, out_hit, out_status);
+  return BatchGetC(c, keys, key_lens, nullptr, nullptr, ptrs, sizes, n, out_hit, out_status);
 }
 int dfkv_batch_get_auto(dfkv_client_t c, const void* const* keys,
                         const uint64_t* key_lens, void** ptrs,
                         const uint64_t* caps, int n, int* out_hit,
                         uint64_t* out_len) {
-  return BatchGetAutoC(c, keys, key_lens, ptrs, caps, n, out_hit, out_len,
+  return BatchGetAutoC(c, keys, key_lens, nullptr, nullptr, ptrs, caps, n, out_hit, out_len,
                        nullptr);
 }
 int dfkv_batch_get_auto_st(dfkv_client_t c, const void* const* keys,
@@ -687,14 +813,14 @@ int dfkv_batch_get_auto_st(dfkv_client_t c, const void* const* keys,
     ZeroArray(out_hit, n);
     return -1;
   }
-  return BatchGetAutoC(c, keys, key_lens, ptrs, caps, n, out_hit, out_len,
+  return BatchGetAutoC(c, keys, key_lens, nullptr, nullptr, ptrs, caps, n, out_hit, out_len,
                        out_status);
 }
 int dfkv_batch_put_sg(dfkv_client_t c, const void* const* keys,
                       const uint64_t* key_lens, const void*** ptrs,
                       const uint64_t** sizes, const int* num_bufs, int n,
                       int* out_ok) {
-  return BatchPutSgC(c, keys, key_lens, ptrs, sizes, num_bufs, n, out_ok,
+  return BatchPutSgC(c, keys, key_lens, nullptr, nullptr, ptrs, sizes, num_bufs, n, out_ok,
                      nullptr);
 }
 int dfkv_batch_put_sg_st(dfkv_client_t c, const void* const* keys,
@@ -705,14 +831,14 @@ int dfkv_batch_put_sg_st(dfkv_client_t c, const void* const* keys,
     ZeroArray(out_ok, n);
     return -1;
   }
-  return BatchPutSgC(c, keys, key_lens, ptrs, sizes, num_bufs, n, out_ok,
+  return BatchPutSgC(c, keys, key_lens, nullptr, nullptr, ptrs, sizes, num_bufs, n, out_ok,
                      out_status);
 }
 int dfkv_batch_get_auto_sg(dfkv_client_t c, const void* const* keys,
                            const uint64_t* key_lens, void*** dsts,
                            const uint64_t** caps, const int* num_dsts, int n,
                            int* out_hit, uint64_t* out_len) {
-  return BatchGetAutoSgC(c, keys, key_lens, dsts, caps, num_dsts, n, out_hit,
+  return BatchGetAutoSgC(c, keys, key_lens, nullptr, nullptr, dsts, caps, num_dsts, n, out_hit,
                          out_len, nullptr);
 }
 int dfkv_batch_get_auto_sg_st(dfkv_client_t c, const void* const* keys,
@@ -724,8 +850,122 @@ int dfkv_batch_get_auto_sg_st(dfkv_client_t c, const void* const* keys,
     ZeroArray(out_hit, n);
     return -1;
   }
-  return BatchGetAutoSgC(c, keys, key_lens, dsts, caps, num_dsts, n, out_hit,
+  return BatchGetAutoSgC(c, keys, key_lens, nullptr, nullptr, dsts, caps, num_dsts, n, out_hit,
                          out_len, out_status);
+}
+
+int dfkv_batch_put_anchored(dfkv_client_t c, const void* const* keys,
+                            const uint64_t* key_lens,
+                            const void* const* route_keys,
+                            const uint64_t* route_key_lens, const void** ptrs,
+                            const uint64_t* sizes, int n, int* out_ok) {
+  return BatchPutC(c, keys, key_lens, route_keys, route_key_lens, ptrs, sizes,
+                   n, out_ok, nullptr);
+}
+
+int dfkv_batch_put_st_anchored(dfkv_client_t c, const void* const* keys,
+                               const uint64_t* key_lens,
+                               const void* const* route_keys,
+                               const uint64_t* route_key_lens, const void** ptrs,
+                               const uint64_t* sizes, int n, int* out_ok,
+                               uint8_t* out_status) {
+  if (n > 0 && !out_status) {
+    ZeroArray(out_ok, n);
+    return -1;
+  }
+  return BatchPutC(c, keys, key_lens, route_keys, route_key_lens, ptrs, sizes,
+                   n, out_ok, out_status);
+}
+
+int dfkv_batch_get_anchored(dfkv_client_t c, const void* const* keys,
+                            const uint64_t* key_lens,
+                            const void* const* route_keys,
+                            const uint64_t* route_key_lens, void** ptrs,
+                            const uint64_t* sizes, int n, int* out_hit) {
+  return BatchGetC(c, keys, key_lens, route_keys, route_key_lens, ptrs, sizes,
+                   n, out_hit, nullptr);
+}
+
+int dfkv_batch_get_st_anchored(dfkv_client_t c, const void* const* keys,
+                               const uint64_t* key_lens,
+                               const void* const* route_keys,
+                               const uint64_t* route_key_lens, void** ptrs,
+                               const uint64_t* sizes, int n, int* out_hit,
+                               uint8_t* out_status) {
+  if (n > 0 && !out_status) {
+    ZeroArray(out_hit, n);
+    return -1;
+  }
+  return BatchGetC(c, keys, key_lens, route_keys, route_key_lens, ptrs, sizes,
+                   n, out_hit, out_status);
+}
+
+int dfkv_batch_get_auto_anchored(dfkv_client_t c, const void* const* keys,
+                                 const uint64_t* key_lens,
+                                 const void* const* route_keys,
+                                 const uint64_t* route_key_lens, void** ptrs,
+                                 const uint64_t* caps, int n, int* out_hit,
+                                 uint64_t* out_len) {
+  return BatchGetAutoC(c, keys, key_lens, route_keys, route_key_lens, ptrs,
+                       caps, n, out_hit, out_len, nullptr);
+}
+
+int dfkv_batch_get_auto_st_anchored(
+    dfkv_client_t c, const void* const* keys, const uint64_t* key_lens,
+    const void* const* route_keys, const uint64_t* route_key_lens, void** ptrs,
+    const uint64_t* caps, int n, int* out_hit, uint64_t* out_len,
+    uint8_t* out_status) {
+  if (n > 0 && !out_status) {
+    ZeroArray(out_hit, n);
+    return -1;
+  }
+  return BatchGetAutoC(c, keys, key_lens, route_keys, route_key_lens, ptrs,
+                       caps, n, out_hit, out_len, out_status);
+}
+
+int dfkv_batch_put_sg_anchored(dfkv_client_t c, const void* const* keys,
+                               const uint64_t* key_lens,
+                               const void* const* route_keys,
+                               const uint64_t* route_key_lens,
+                               const void*** ptrs, const uint64_t** sizes,
+                               const int* num_bufs, int n, int* out_ok) {
+  return BatchPutSgC(c, keys, key_lens, route_keys, route_key_lens, ptrs, sizes,
+                     num_bufs, n, out_ok, nullptr);
+}
+
+int dfkv_batch_put_sg_st_anchored(
+    dfkv_client_t c, const void* const* keys, const uint64_t* key_lens,
+    const void* const* route_keys, const uint64_t* route_key_lens,
+    const void*** ptrs, const uint64_t** sizes, const int* num_bufs, int n,
+    int* out_ok, uint8_t* out_status) {
+  if (n > 0 && !out_status) {
+    ZeroArray(out_ok, n);
+    return -1;
+  }
+  return BatchPutSgC(c, keys, key_lens, route_keys, route_key_lens, ptrs, sizes,
+                     num_bufs, n, out_ok, out_status);
+}
+
+int dfkv_batch_get_auto_sg_anchored(
+    dfkv_client_t c, const void* const* keys, const uint64_t* key_lens,
+    const void* const* route_keys, const uint64_t* route_key_lens, void*** dsts,
+    const uint64_t** caps, const int* num_dsts, int n, int* out_hit,
+    uint64_t* out_len) {
+  return BatchGetAutoSgC(c, keys, key_lens, route_keys, route_key_lens, dsts,
+                         caps, num_dsts, n, out_hit, out_len, nullptr);
+}
+
+int dfkv_batch_get_auto_sg_st_anchored(
+    dfkv_client_t c, const void* const* keys, const uint64_t* key_lens,
+    const void* const* route_keys, const uint64_t* route_key_lens, void*** dsts,
+    const uint64_t** caps, const int* num_dsts, int n, int* out_hit,
+    uint64_t* out_len, uint8_t* out_status) {
+  if (n > 0 && !out_status) {
+    ZeroArray(out_hit, n);
+    return -1;
+  }
+  return BatchGetAutoSgC(c, keys, key_lens, route_keys, route_key_lens, dsts,
+                         caps, num_dsts, n, out_hit, out_len, out_status);
 }
 
 const char* dfkv_transport_mode(dfkv_client_t c) {

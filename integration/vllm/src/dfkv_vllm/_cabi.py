@@ -21,6 +21,60 @@ c_uint32 = ctypes.c_uint32
 c_int = ctypes.c_int
 POINTER = ctypes.POINTER
 
+_ANCHORED_BATCH_ARGTYPES = {
+    "dfkv_batch_put_anchored": [
+        c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(c_void_p), POINTER(c_uint64), c_int, POINTER(c_int),
+    ],
+    "dfkv_batch_get_auto_anchored": [
+        c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(c_void_p), POINTER(c_uint64), c_int,
+        POINTER(c_int), POINTER(c_uint64),
+    ],
+    "dfkv_batch_exist_anchored": [
+        c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(c_void_p), POINTER(c_uint64), c_int, POINTER(c_int),
+    ],
+    "dfkv_batch_remove_anchored": [
+        c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(c_void_p), POINTER(c_uint64), c_int, POINTER(c_int),
+    ],
+    "dfkv_batch_put_sg_anchored": [
+        c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(POINTER(c_void_p)), POINTER(POINTER(c_uint64)),
+        POINTER(c_int), c_int, POINTER(c_int),
+    ],
+    "dfkv_batch_get_auto_sg_anchored": [
+        c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(POINTER(c_void_p)), POINTER(POINTER(c_uint64)),
+        POINTER(c_int), c_int, POINTER(c_int), POINTER(c_uint64),
+    ],
+}
+ANCHORED_BATCH_SYMBOLS = tuple(_ANCHORED_BATCH_ARGTYPES)
+
+
+def bind_anchored(lib: ctypes.CDLL) -> list[str]:
+    """Bind available route-anchor symbols and return the missing names.
+
+    Discovery is deliberately lazy: an older libdfkv remains usable for all
+    legacy operations. The device client rejects an affinity opt-in when this
+    list is non-empty, before opening a native handle.
+    """
+    missing = []
+    for name, argtypes in _ANCHORED_BATCH_ARGTYPES.items():
+        try:
+            symbol = getattr(lib, name)
+        except AttributeError:
+            missing.append(name)
+            continue
+        symbol.restype = c_int
+        symbol.argtypes = argtypes
+    return missing
+
 
 def resolve_lib_path(lib_path: Optional[str] = None) -> str:
     if lib_path:

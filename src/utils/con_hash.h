@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace dfkv {
@@ -21,6 +22,7 @@ class ConHash {
   // The same with the key's hash, KeyHash(key), computed by the caller (for
   // example outside a lock).
   static uint32_t KeyHash(const std::string& key);
+  static uint32_t KeyHash(std::string_view key);
   bool LookupHash(uint32_t hash, std::string* node) const;
   // The distinct nodes clockwise from `hash`, the owner first: `visit` is
   // called for each until it returns false or every node was visited.
