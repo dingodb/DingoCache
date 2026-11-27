@@ -9,6 +9,7 @@ import logging
 import os
 import subprocess
 import shutil
+import socket
 import sys
 import tempfile
 import time
@@ -210,16 +211,25 @@ class FakeTupleNoneAnchorPool:
         return (None, None)
 
 
+def _unused_tcp_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 def _spawn_node(tag, engine_args=("--store-engine", "file"), env=None,
-                directory=None):
+                directory=None, metrics_port=None):
     # Supplying a directory is only for reopening a test-owned node; the
-    # default keeps its original fresh-file-engine behavior.
+    # default keeps its original fresh-file-engine behavior and metrics off.
     d = (tempfile.mkdtemp(prefix=f"dfkv_py_{tag}_") if directory is None
          else directory)
+    argv = [SERVER_BIN, "--dir", d, "--port", "0", "--cap", str(1 << 30),
+            *engine_args]
+    if metrics_port is not None:
+        argv += ["--metrics-bind", "127.0.0.1",
+                 "--metrics-port", str(metrics_port)]
     p = subprocess.Popen(
-        [SERVER_BIN, "--dir", d, "--port", "0", "--cap", str(1 << 30),
-         *engine_args],
-        stdout=subprocess.PIPE, text=True,
+        argv, stdout=subprocess.PIPE, text=True,
         env=None if env is None else {**os.environ, **env})
     line = p.stdout.readline().strip()
     assert line.startswith("PORT "), f"bad server greeting: {line!r}"
@@ -236,9 +246,19 @@ def _count_objects(node_dir):
 
 def _server_used_bytes(port):
     """The store's dfkv_used_bytes gauge: live record/slot bytes, not payload."""
-    with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/metrics", timeout=5) as response:
-        text = response.read().decode("utf-8")
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            # PORT precedes the optional metrics startup in dfkv_server; require
+            # this endpoint to become readable rather than checking the data port.
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/metrics", timeout=1) as response:
+                text = response.read().decode("utf-8")
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
     values = [line.split()[1] for line in text.splitlines()
               if line.startswith("dfkv_used_bytes ")]
     if len(values) != 1:
@@ -269,8 +289,10 @@ class DingoFSHiCacheTest(unittest.TestCase):
         for d in cls.dirs:
             shutil.rmtree(d, ignore_errors=True)
 
-    def _node(self, tag, engine_args=("--store-engine", "file"), env=None):
-        p, d, port = _spawn_node(tag, engine_args, env)
+    def _node(self, tag, engine_args=("--store-engine", "file"), env=None,
+              metrics_port=None):
+        p, d, port = _spawn_node(tag, engine_args, env,
+                                 metrics_port=metrics_port)
         self.procs.append(p)
         self.dirs.append(d)
         return f"{tag}=127.0.0.1:{port}", port, d
@@ -1265,8 +1287,10 @@ class DingoFSHiCacheTest(unittest.TestCase):
         for pool_type in (FakeLogicalAnchorPool, FakeTupleNoneAnchorPool):
             with self.subTest(pool=pool_type.__name__):
                 tag = "lseanchor_" + pool_type.__name__
+                metrics_port = _unused_tcp_port()
                 members, port, ndir = self._node(
-                    tag, engine_args=("--store-engine", "log"))
+                    tag, engine_args=("--store-engine", "log"),
+                    metrics_port=metrics_port)
                 st = self._plugin(self._cfg(members, model="glm-5.2"),
                                   pool_type(self.PAGE_SIZE))
                 keys = ["lse0", "lse1", "lse2"]
@@ -1278,7 +1302,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 # One-byte values fit inline. dfkv_used_bytes charges each live
                 # LSE record block (4096B), not 1B payload, 64KiB ctypes scratch,
                 # or the separate 64B sealed-summary entry.
-                self.assertEqual(_server_used_bytes(port), 3 * 4096)
+                self.assertEqual(_server_used_bytes(metrics_port), 3 * 4096)
                 self.assertEqual(st.batch_exists(all_keys), 3)
 
                 side = FakeMlaPool(4, self.PAGE_BYTES, self.PAGE_SIZE)
@@ -1295,14 +1319,14 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 # PAGE_BYTES is 4096, above LSE's 4008B inline ceiling: each
                 # non-inline side value costs 4096 + round_up(4096, 4096).
                 occupied = 3 * 4096 + 2 * 8192
-                self.assertEqual(_server_used_bytes(port), occupied)
+                self.assertEqual(_server_used_bytes(metrics_port), occupied)
                 self.assertEqual(st.batch_exists_v2(all_keys, [side_all]).kv_hit_pages,
                                  2)
                 self.assertEqual(st.batch_set_v2([PoolTransfer(
                     name="side", host_indices=hi[2 * self.PAGE_SIZE:3 * self.PAGE_SIZE],
                     keys=keys[2:3])])["side"], [True])
                 occupied = 3 * 4096 + 3 * 8192
-                self.assertEqual(_server_used_bytes(port), occupied)
+                self.assertEqual(_server_used_bytes(metrics_port), occupied)
                 self.assertEqual(st.batch_exists_v2(all_keys, [side_all]).kv_hit_pages,
                                  3)
 
@@ -1340,9 +1364,10 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 old_process = self.procs[-1]
                 old_process.terminate()
                 old_process.wait(timeout=5)
+                metrics_port = _unused_tcp_port()
                 reopened, reopened_dir, port = _spawn_node(
                     tag + "_reopen", engine_args=("--store-engine", "log"),
-                    directory=ndir)
+                    directory=ndir, metrics_port=metrics_port)
                 self.assertEqual(reopened_dir, ndir)
                 self.procs.append(reopened)
                 members = f"{tag}=127.0.0.1:{port}"
@@ -1351,7 +1376,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 st2.register_mem_host_pool_v2(pool_type(self.PAGE_SIZE), "kv")
                 side2 = FakeMlaPool(4, self.PAGE_BYTES, self.PAGE_SIZE)
                 st2.register_mem_host_pool_v2(side2, "side")
-                self.assertEqual(_server_used_bytes(port), occupied)
+                self.assertEqual(_server_used_bytes(metrics_port), occupied)
                 self.assertEqual(st2.batch_exists(all_keys), 3)
                 self.assertEqual(st2.batch_exists_v2(all_keys, [side_all]).kv_hit_pages,
                                  3)
