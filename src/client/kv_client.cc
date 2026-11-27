@@ -81,6 +81,28 @@ struct DrainPass {
   DrainPass& operator=(const DrainPass&) = delete;
 };
 
+// ParallelExecutor workers have independent thread-local state. Carry the
+// caller's drain/read-back route into each item and restore the worker's
+// previous state on exit, so a drainer or previous-owner replay cannot be
+// silently routed to the current owner or participate in a nested read-back.
+struct ReadRouteScope {
+  ReadRouteScope(bool drain, const std::string* route)
+      : drain_(t_drain_pass), route_(t_route_to) {
+    t_drain_pass = drain;
+    t_route_to = route;
+  }
+  ~ReadRouteScope() {
+    t_drain_pass = drain_;
+    t_route_to = route_;
+  }
+  ReadRouteScope(const ReadRouteScope&) = delete;
+  ReadRouteScope& operator=(const ReadRouteScope&) = delete;
+
+ private:
+  bool drain_;
+  const std::string* route_;
+};
+
 // Summarize a membership change as "+A -R (added: ...; removed: ...)", comparing
 // new node ids against the currently-adopted ones. Empty when there is no id
 // churn (e.g. only an address/weight changed). Ids only; small lists spelled out
@@ -2777,12 +2799,11 @@ std::vector<bool> KVClient::BatchGetDirect(
     const std::function<void(size_t)>& on_hit, ItemStatus* st) {
   // Read-back needs each key's answer, also when the caller wants none.
   std::vector<ItemStatus> own;
-  if (!st && readback_on_ && t_->pipelined()) {
+  if (!st && readback_on_) {
     own.assign(items.size(), ItemStatus::kNoRoute);
     st = own.data();
   }
   std::vector<bool> hit = BatchGetDirectRouted(items, on_hit, st);
-  if (!t_->pipelined()) return hit;  // the scalar bodies do both passes
   std::vector<ItemStatus> first;
   if (st) first.assign(st, st + items.size());
   const std::vector<size_t> again = DrainerOwned(
@@ -2846,12 +2867,11 @@ std::vector<bool> KVClient::BatchGetAutoDirect(
     const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens,
     const std::function<void(size_t, size_t)>& on_hit, ItemStatus* st) {
   std::vector<ItemStatus> own;
-  if (!st && readback_on_ && t_->pipelined()) {
+  if (!st && readback_on_) {
     own.assign(items.size(), ItemStatus::kNoRoute);
     st = own.data();
   }
   std::vector<bool> hit = BatchGetAutoDirectRouted(items, out_lens, on_hit, st);
-  if (!t_->pipelined()) return hit;  // the scalar bodies do both passes
   std::vector<ItemStatus> first;
   if (st) first.assign(st, st + items.size());
   const std::vector<size_t> again = DrainerOwned(
@@ -2991,9 +3011,8 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(
 std::vector<bool> KVClient::BatchExistDirect(
     const std::vector<std::string>& keys, std::vector<Status>* statuses) {
   std::vector<Status> own;
-  if (!statuses && readback_on_ && t_->pipelined()) statuses = &own;
+  if (!statuses && readback_on_) statuses = &own;
   std::vector<bool> hit = BatchExistDirectRouted(keys, statuses);
-  if (!t_->pipelined()) return hit;  // the scalar bodies do both passes
   std::vector<Status> first;
   if (statuses) first = *statuses;
   const std::vector<size_t> again = DrainerOwned(
@@ -3456,8 +3475,11 @@ std::vector<bool> KVClient::BatchGetDirectRouted(
   std::vector<char> hit(N, 0);
   if (st) std::fill(st, st + N, ItemStatus::kNoRoute);
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
+    const bool drain = t_drain_pass;
+    const std::string* route = t_route_to;
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
-      hit[i] = GetDirect(items[i].key, items[i].out, items[i].n,
+      ReadRouteScope scope(drain, route);
+      hit[i] = GetDirectRouted(items[i].key, items[i].out, items[i].n,
                          st ? st + i : nullptr)
                    ? 1
                    : 0;
@@ -3672,9 +3694,12 @@ std::vector<bool> KVClient::BatchGetAutoDirectRouted(
   std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
   if (st) std::fill(st, st + N, ItemStatus::kNoRoute);
   if (!t_->pipelined()) {  // TCP: parallelize per item with our own threads.
+    const bool drain = t_drain_pass;
+    const std::string* route = t_route_to;
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
+      ReadRouteScope scope(drain, route);
       size_t got = 0;
-      if (GetAutoDirect(items[i].key, items[i].out, items[i].n, &got,
+      if (GetAutoDirectRouted(items[i].key, items[i].out, items[i].n, &got,
                         st ? st + i : nullptr)) {
         hit[i] = 1;
         lens[i] = got;
@@ -4850,8 +4875,11 @@ std::vector<bool> KVClient::BatchExistDirectRouted(
   std::chrono::steady_clock::time_point call_t0;
   if (pernode_on) call_t0 = std::chrono::steady_clock::now();
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
+    const bool drain = t_drain_pass;
+    const std::string* route = t_route_to;
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
-      e[i] = ExistDirect(keys[i], &raw[i]) ? 1 : 0;
+      ReadRouteScope scope(drain, route);
+      e[i] = ExistDirectRouted(keys[i], &raw[i]) ? 1 : 0;
     });
     if (statuses) *statuses = std::move(raw);
     return std::vector<bool>(e.begin(), e.end());
