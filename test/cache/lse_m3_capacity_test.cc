@@ -8,9 +8,13 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -19,6 +23,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -28,6 +33,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -38,6 +44,34 @@
 #include "cache/disk_slab_store.h"
 #include "cache/log_store.h"
 #include "common/status.h"
+
+namespace dfkv {
+
+// Test-only barriers.  Neither one records a clean shutdown: the process is
+// killed only after the writes and their persistent index metadata are synced.
+class LogStoreTestPeer {
+ public:
+  static bool SyncDirtySegments(LogStore* store) {
+    LogStore::Lock lock(store->mu_);
+    for (auto& segment : store->segments_) {
+      if (!segment.dirty) continue;
+      if (segment.fd < 0 || store->io_->Fdatasync(segment.fd) != 0) return false;
+    }
+    return true;
+  }
+};
+
+class DiskSlabStoreTestPeer {
+ public:
+  static bool SyncPayloadsAndTable(DiskSlabStore* store) {
+    // A valid table record must never become durable ahead of its payload.
+    // SyncTable also finishes withdrawing and regranting the trust token.
+    return store->SyncPayloads() &&
+           store->SyncTable(store->TableWriteStamp());
+  }
+};
+
+}  // namespace dfkv
 
 namespace {
 
@@ -1291,6 +1325,576 @@ void PreflightFailure(const std::string& reason,
   line << '}';
   EmitStdout(line.str());
   FAIL() << reason;
+}
+
+constexpr uint32_t kRecoveryKeysPerBatch = 16;
+constexpr size_t kRecoveryIoCapacity =
+    (kValueBytes + kIoAlignment - 1) / kIoAlignment * kIoAlignment;
+constexpr char kRecoveryJsonlName[] = "lse_m3_recovery.jsonl";
+constexpr uint32_t kRecoveryReportMagic = 0x44464b56;  // "DFKV"
+constexpr int kRecoveryReadyTimeoutMs = 120000;
+
+struct RecoveryOptions {
+  EngineKind kind = EngineKind::kSlab;
+  DiskSlabStore::Options slab;
+  LogStore::Options log;
+  std::shared_ptr<StrictDirectIo> log_io;
+};
+
+struct RecoveryOpened {
+  std::unique_ptr<StoreEngine> store;
+  DiskSlabStore* slab = nullptr;
+  LogStore* log = nullptr;
+};
+
+RecoveryOptions MakeRecoveryOptions(EngineKind kind, const fs::path& dir) {
+  RecoveryOptions options;
+  options.kind = kind;
+  if (kind == EngineKind::kSlab) {
+    options.slab.dir = dir.string();
+    options.slab.capacity_bytes = kStandardCapacity;
+    options.slab.extent_bytes = kSlabExtent;
+    options.slab.slot_granularity = kSlabGranularity;
+    options.slab.direct_writes = true;
+    options.slab.balance = false;
+    options.slab.table_sync_ms = 0;
+    options.slab.reclaim_interval_ms = 0;
+    options.slab.warm_restart = DiskSlabStore::Options::WarmRestart::kAuto;
+    // Deliberately use the constructor's actual boot/mount identity, the real
+    // /dev/shm token location, and the default local-filesystem requirement.
+    options.slab.require_local_filesystem = true;
+  } else {
+    options.log.dir = dir.string();
+    options.log.capacity_bytes = kStandardCapacity;
+    options.log.direct_writes = true;
+    options.log.segment_bytes = kLogSegment;
+    options.log.open_segments = 0;
+    options.log.relocate_pct = 25;
+    options.log.sync_ms = 1000;
+    options.log.cleaner = true;
+    options.log.preopen = true;
+    options.log.retain_enabled = false;
+    options.log_io = std::make_shared<StrictDirectIo>();
+    options.log.io = options.log_io;
+  }
+  return options;
+}
+
+RecoveryOpened OpenRecoveryEngine(const RecoveryOptions& options, bool* ok) {
+  RecoveryOpened opened;
+  bool open_ok = false;
+  if (options.kind == EngineKind::kSlab) {
+    auto store = std::make_unique<DiskSlabStore>(options.slab, &open_ok);
+    opened.slab = store.get();
+    opened.store = std::move(store);
+  } else {
+    auto store = std::make_unique<LogStore>(options.log, &open_ok);
+    opened.log = store.get();
+    opened.store = std::move(store);
+  }
+  *ok = open_ok && opened.store->Healthy();
+  return opened;
+}
+
+std::string RecoveryDirectError(const RecoveryOptions& options,
+                                const RecoveryOpened& opened) {
+  if (options.kind == EngineKind::kSlab) {
+    if (!opened.slab->DirectWritesActive()) return "slab O_DIRECT is not active";
+    if (opened.slab->GetStats().dio_write_fallbacks != 0)
+      return "slab unexpectedly used a buffered payload-write fallback";
+  } else if (options.log_io->direct_successes() == 0 ||
+             options.log_io->direct_refusals() != 0) {
+    return "log O_DIRECT open was not observed or was refused";
+  }
+  return {};
+}
+
+bool RecoveryWriteBatch(StoreEngine* store, uint64_t first_key,
+                        uint32_t* completed, std::string* error) {
+  AlignedBuffer value(kRecoveryIoCapacity);
+  if (!value) {
+    *error = "cannot allocate the aligned PUT buffer";
+    return false;
+  }
+  *completed = 0;
+  for (uint64_t id = first_key; id < first_key + kRecoveryKeysPerBatch; ++id) {
+    FillValue(id, value.data(), kValueBytes);
+    const Status status =
+        store->CacheDirect(MakeKey(id), value.data(), kValueBytes, value.size());
+    if (status != Status::kOk) {
+      *error = "PUT key " + std::to_string(id) + " returned status " +
+               std::to_string(static_cast<int>(status));
+      return false;
+    }
+    ++*completed;
+  }
+  return true;
+}
+
+bool RecoveryVerifyValues(StoreEngine* store, uint64_t first_key,
+                          uint64_t last_key_exclusive, std::string* error) {
+  if (!store->Healthy()) {
+    *error = "store is unhealthy: " + store->StartupError();
+    return false;
+  }
+  const size_t expected_count = last_key_exclusive - first_key;
+  if (store->Count() != expected_count) {
+    *error = "Count is " + std::to_string(store->Count()) + ", expected " +
+             std::to_string(expected_count);
+    return false;
+  }
+  std::vector<BlockKey> keys;
+  store->ForEachKey([&](const BlockKey& key) { keys.push_back(key); });
+  if (keys.size() != expected_count) {
+    *error = "ForEachKey returned " + std::to_string(keys.size()) +
+             " keys, expected " + std::to_string(expected_count);
+    return false;
+  }
+  std::vector<uint32_t> seen(expected_count, 0);
+  for (const BlockKey& key : keys) {
+    const uint64_t id = key.digest_lo;
+    if (id < first_key || id >= last_key_exclusive || !(key == MakeKey(id))) {
+      *error = "ForEachKey returned an unexpected key (digest_lo=" +
+               std::to_string(id) + ")";
+      return false;
+    }
+    ++seen[id - first_key];
+  }
+  for (size_t i = 0; i < seen.size(); ++i) {
+    if (seen[i] != 1) {
+      *error = "key " + std::to_string(first_key + i) + " was enumerated " +
+               std::to_string(seen[i]) + " times";
+      return false;
+    }
+  }
+
+  AlignedBuffer read_buffer(kRecoveryIoCapacity);
+  if (!read_buffer) {
+    *error = "cannot allocate the aligned read buffer";
+    return false;
+  }
+  std::string expected(kValueBytes, '\0');
+  for (uint64_t id = first_key; id < last_key_exclusive; ++id) {
+    const BlockKey key = MakeKey(id);
+    ValueMetadata metadata;
+    const Status lookup = store->Lookup(key, &metadata);
+    if (lookup != Status::kOk || metadata.value_len != kValueBytes) {
+      *error = "Lookup key " + std::to_string(id) + " returned status " +
+               std::to_string(static_cast<int>(lookup)) + " and value_len " +
+               std::to_string(metadata.value_len);
+      return false;
+    }
+    const char* data = nullptr;
+    size_t out_len = 0;
+    size_t value_len = 0;
+    const Status read = store->RangeDirect(
+        key, 0, 0, read_buffer.data(), read_buffer.size(), &data, &out_len,
+        &value_len);
+    if (read != Status::kOk || out_len != kValueBytes ||
+        value_len != kValueBytes) {
+      *error = "RangeDirect key " + std::to_string(id) + " returned status " +
+               std::to_string(static_cast<int>(read)) + ", out_len " +
+               std::to_string(out_len) + ", value_len " +
+               std::to_string(value_len);
+      return false;
+    }
+    FillValue(id, expected.data(), expected.size());
+    if (std::string(data, out_len) != expected) {
+      *error = "full payload mismatch for key " + std::to_string(id);
+      return false;
+    }
+  }
+  return true;
+}
+
+enum RecoveryChildStep : uint32_t {
+  kRecoveryChildOpen = 1,
+  kRecoveryChildDirect = 2,
+  kRecoveryChildPut = 3,
+  kRecoveryChildCount = 4,
+  kRecoveryChildSync = 5,
+  kRecoveryChildReady = 6,
+};
+
+struct RecoveryChildReport {
+  uint32_t magic = kRecoveryReportMagic;
+  uint32_t ready = 0;
+  uint32_t step = 0;
+  uint32_t writes_completed = 0;
+  int32_t status_code = 0;
+  int32_t saved_errno = 0;
+  char detail[192] = {};
+};
+
+static_assert(sizeof(RecoveryChildReport) <= 512,
+              "the child report must fit an atomic bounded pipe write");
+
+[[noreturn]] void RecoveryChildExit(int code) {
+  ::syscall(SYS_exit_group, code);
+  __builtin_unreachable();
+}
+
+[[noreturn]] void RecoveryChildFail(int fd, RecoveryChildStep step,
+                                    int status_code, int saved_errno,
+                                    uint32_t writes_completed,
+                                    const std::string& detail) {
+  RecoveryChildReport report;
+  report.step = step;
+  report.writes_completed = writes_completed;
+  report.status_code = status_code;
+  report.saved_errno = saved_errno;
+  std::snprintf(report.detail, sizeof(report.detail), "%s", detail.c_str());
+  ssize_t written;
+  do {
+    written = ::write(fd, &report, sizeof(report));
+  } while (written < 0 && errno == EINTR);
+  RecoveryChildExit(written == sizeof(report) ? 0 : 90);
+}
+
+[[noreturn]] void RecoveryChildMain(const RecoveryOptions& options, int fd) {
+  bool ok = false;
+  RecoveryOpened opened = OpenRecoveryEngine(options, &ok);
+  if (!ok) {
+    RecoveryChildFail(fd, kRecoveryChildOpen, 0, errno, 0,
+                      opened.store->StartupError());
+  }
+  const std::string direct_error = RecoveryDirectError(options, opened);
+  if (!direct_error.empty()) {
+    RecoveryChildFail(fd, kRecoveryChildDirect, 0, errno, 0, direct_error);
+  }
+  if (opened.store->Count() != kRecoveryKeysPerBatch) {
+    RecoveryChildFail(fd, kRecoveryChildCount, 0, 0, 0,
+                      "clean dataset count before crash writes is " +
+                          std::to_string(opened.store->Count()));
+  }
+  uint32_t completed = 0;
+  std::string error;
+  if (!RecoveryWriteBatch(opened.store.get(), kRecoveryKeysPerBatch, &completed,
+                          &error)) {
+    RecoveryChildFail(fd, kRecoveryChildPut, 0, errno, completed, error);
+  }
+  if (!opened.store->Healthy() ||
+      opened.store->Count() != 2 * kRecoveryKeysPerBatch) {
+    RecoveryChildFail(fd, kRecoveryChildCount, 0, 0, completed,
+                      "post-PUT health/count check failed: count=" +
+                          std::to_string(opened.store->Count()) + ", error=" +
+                          opened.store->StartupError());
+  }
+  const bool synced = options.kind == EngineKind::kSlab
+                          ? dfkv::DiskSlabStoreTestPeer::SyncPayloadsAndTable(
+                                opened.slab)
+                          : dfkv::LogStoreTestPeer::SyncDirtySegments(opened.log);
+  if (!synced) {
+    RecoveryChildFail(fd, kRecoveryChildSync, 0, errno, completed,
+                      ErrnoMessage(errno));
+  }
+
+  RecoveryChildReport report;
+  report.ready = 1;
+  report.step = kRecoveryChildReady;
+  report.writes_completed = completed;
+  ssize_t written;
+  do {
+    written = ::write(fd, &report, sizeof(report));
+  } while (written < 0 && errno == EINTR);
+  if (written != sizeof(report)) RecoveryChildExit(90);
+  for (;;) ::pause();
+}
+
+class RecoveryChildGuard {
+ public:
+  explicit RecoveryChildGuard(pid_t pid) : pid_(pid) {}
+  RecoveryChildGuard(const RecoveryChildGuard&) = delete;
+  RecoveryChildGuard& operator=(const RecoveryChildGuard&) = delete;
+  ~RecoveryChildGuard() {
+    if (pid_ <= 0) return;
+    ::kill(pid_, SIGKILL);
+    int status = 0;
+    // A kernel-stuck child cannot be forced to reap.  Bound cleanup as well,
+    // and leave its ownership marked unresolved rather than claiming success.
+    (void)WaitUntil(pid_, Clock::now() + std::chrono::seconds(30), &status);
+  }
+
+  bool Reap(int* status) {
+    if (pid_ <= 0) {
+      errno = ECHILD;
+      return false;
+    }
+    const bool reaped =
+        WaitUntil(pid_, Clock::now() + std::chrono::seconds(30), status);
+    if (reaped) pid_ = -1;
+    return reaped;
+  }
+
+ private:
+  static bool WaitUntil(pid_t pid, Clock::time_point deadline, int* status) {
+    for (;;) {
+      const pid_t result = ::waitpid(pid, status, WNOHANG);
+      if (result == pid) return true;
+      if (result < 0) {
+        if (errno != EINTR || Clock::now() >= deadline) return false;
+        continue;
+      }
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
+      if (remaining <= std::chrono::milliseconds::zero()) return false;
+      std::this_thread::sleep_for(
+          std::min(remaining, std::chrono::milliseconds(10)));
+    }
+  }
+
+  pid_t pid_;
+};
+
+bool RecoveryWaitForReport(int fd, RecoveryChildReport* report,
+                           std::string* error) {
+  const auto deadline =
+      Clock::now() + std::chrono::milliseconds(kRecoveryReadyTimeoutMs);
+  for (;;) {
+    const int64_t remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now())
+            .count();
+    if (remaining <= 0) {
+      *error = "timed out waiting for the crash child's sync-ready report";
+      return false;
+    }
+    pollfd waiter{fd, POLLIN, 0};
+    const int polled = ::poll(&waiter, 1, static_cast<int>(remaining));
+    if (polled < 0) {
+      if (errno == EINTR) continue;
+      *error = "poll of crash-child report failed: " + ErrnoMessage(errno);
+      return false;
+    }
+    if (polled == 0) continue;
+    if ((waiter.revents & POLLNVAL) != 0) {
+      *error = "crash-child report pipe is invalid";
+      return false;
+    }
+    if ((waiter.revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+    ssize_t n;
+    do {
+      n = ::read(fd, report, sizeof(*report));
+    } while (n < 0 && errno == EINTR);
+    if (n != sizeof(*report)) {
+      *error = n < 0 ? "read of crash-child report failed: " + ErrnoMessage(errno)
+                     : "crash-child report EOF/short read: " + std::to_string(n) +
+                           " of " + std::to_string(sizeof(*report)) + " bytes";
+      return false;
+    }
+    if (report->magic != kRecoveryReportMagic) {
+      *error = "crash-child report has an invalid magic value";
+      return false;
+    }
+    return true;
+  }
+}
+
+bool RecoveryEmit(JsonlReporter* reporter, const std::string& line) {
+  reporter->Emit(line);
+  if (!reporter->good()) {
+    ADD_FAILURE() << "cannot append recovery evidence to " << reporter->path();
+    return false;
+  }
+  return true;
+}
+
+void RunRecoveryEngine(EngineKind kind, const fs::path& root,
+                       JsonlReporter* reporter) {
+  const fs::path dir = root / EngineName(kind);
+  std::error_code ec;
+  ASSERT_TRUE(fs::create_directory(dir, ec) && !ec)
+      << "cannot create fresh per-engine recovery directory " << dir << ": "
+      << ec.message();
+  const RecoveryOptions options = MakeRecoveryOptions(kind, dir);
+
+  bool ok = false;
+  RecoveryOpened initial = OpenRecoveryEngine(options, &ok);
+  ASSERT_TRUE(ok) << initial.store->StartupError();
+  ASSERT_TRUE(RecoveryDirectError(options, initial).empty())
+      << RecoveryDirectError(options, initial);
+  uint32_t completed = 0;
+  std::string operation_error;
+  ASSERT_TRUE(RecoveryWriteBatch(initial.store.get(), 0, &completed,
+                                 &operation_error))
+      << operation_error;
+  ASSERT_EQ(completed, kRecoveryKeysPerBatch);
+  ASSERT_TRUE(initial.store->Healthy() &&
+              initial.store->Count() == kRecoveryKeysPerBatch);
+  ASSERT_TRUE(initial.store->Close());
+  initial.store.reset();
+
+  RecoveryOpened clean = OpenRecoveryEngine(options, &ok);
+  ASSERT_TRUE(ok) << clean.store->StartupError();
+  ASSERT_TRUE(RecoveryDirectError(options, clean).empty())
+      << RecoveryDirectError(options, clean);
+  ASSERT_TRUE(RecoveryVerifyValues(clean.store.get(), 0, kRecoveryKeysPerBatch,
+                                   &operation_error))
+      << operation_error;
+  ASSERT_TRUE(clean.store->Close());
+  clean.store.reset();
+
+  std::ostringstream clean_record;
+  clean_record << "{\"record\":\"clean_reopen\",\"schema_version\":1"
+               << ",\"engine\":" << JsonString(EngineName(kind))
+               << ",\"value_bytes\":" << kValueBytes
+               << ",\"keys\":" << kRecoveryKeysPerBatch
+               << ",\"count\":" << kRecoveryKeysPerBatch
+               << ",\"lookup_verified\":true,\"out_len_verified\":true"
+               << ",\"value_len_verified\":true,\"full_payload_verified\":true"
+               << ",\"clean_close_after_verification\":true,\"result\":\"PASS\"}";
+  ASSERT_TRUE(RecoveryEmit(reporter, clean_record.str()));
+
+  int report_pipe[2];
+  ASSERT_EQ(::pipe(report_pipe), 0) << ErrnoMessage(errno);
+  ScopedFd report_read(report_pipe[0]);
+  ScopedFd report_write(report_pipe[1]);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0) << ErrnoMessage(errno);
+  if (child == 0) {
+    report_read.Reset(-1);
+    RecoveryChildMain(options, report_write.get());
+  }
+  report_write.Reset(-1);
+  RecoveryChildGuard child_guard(child);
+  RecoveryChildReport child_report;
+  ASSERT_TRUE(RecoveryWaitForReport(report_read.get(), &child_report,
+                                    &operation_error))
+      << operation_error;
+  if (child_report.ready != 1 || child_report.step != kRecoveryChildReady) {
+    FAIL() << "crash child did not reach explicit sync readiness: step="
+           << child_report.step << ", status=" << child_report.status_code
+           << ", errno=" << child_report.saved_errno << ", writes="
+           << child_report.writes_completed << ", detail=" << child_report.detail;
+  }
+  ASSERT_EQ(child_report.writes_completed, kRecoveryKeysPerBatch);
+  ASSERT_EQ(::kill(child, SIGKILL), 0) << ErrnoMessage(errno);
+  int child_status = 0;
+  ASSERT_TRUE(child_guard.Reap(&child_status)) << ErrnoMessage(errno);
+  ASSERT_TRUE(WIFSIGNALED(child_status) && WTERMSIG(child_status) == SIGKILL)
+      << "crash child status " << child_status;
+
+  std::ostringstream kill_record;
+  kill_record << "{\"record\":\"sigkill\",\"schema_version\":1"
+              << ",\"engine\":" << JsonString(EngineName(kind))
+              << ",\"pid\":" << child
+              << ",\"ready_step\":" << child_report.step
+              << ",\"synced_writes\":" << child_report.writes_completed
+              << ",\"signal\":" << WTERMSIG(child_status)
+              << ",\"close_before_kill\":false,\"result\":\"PASS\"}";
+  ASSERT_TRUE(RecoveryEmit(reporter, kill_record.str()));
+
+  RecoveryOpened recovered = OpenRecoveryEngine(options, &ok);
+  ASSERT_TRUE(ok) << recovered.store->StartupError();
+  ASSERT_TRUE(RecoveryDirectError(options, recovered).empty())
+      << RecoveryDirectError(options, recovered);
+  uint64_t warm_restarts = 0;
+  uint64_t unclean_resets = 0;
+  std::string unclean_reset_reason;
+  if (kind == EngineKind::kSlab) {
+    const auto stats = recovered.slab->GetStats();
+    warm_restarts = stats.warm_restarts;
+    unclean_resets = stats.unclean_resets;
+    unclean_reset_reason = recovered.slab->UncleanResetReason();
+    ASSERT_EQ(warm_restarts, 1u);
+    ASSERT_EQ(unclean_resets, 0u);
+    ASSERT_TRUE(unclean_reset_reason.empty()) << unclean_reset_reason;
+  }
+  ASSERT_TRUE(RecoveryVerifyValues(recovered.store.get(), 0,
+                                   2 * kRecoveryKeysPerBatch, &operation_error))
+      << operation_error;
+  ASSERT_TRUE(recovered.store->Close());
+  recovered.store.reset();
+
+  std::ostringstream recovery_record;
+  recovery_record << "{\"record\":\"recovery\",\"schema_version\":1"
+                  << ",\"engine\":" << JsonString(EngineName(kind))
+                  << ",\"expected_keys\":" << 2 * kRecoveryKeysPerBatch
+                  << ",\"verified_keys\":" << 2 * kRecoveryKeysPerBatch
+                  << ",\"value_bytes\":" << kValueBytes
+                  << ",\"all_clean_and_synced_keys_present\":true"
+                  << ",\"unexpected_keys\":0,\"missing_keys\":0"
+                  << ",\"corrupt_keys\":0"
+                  << ",\"warm_restarts\":" << warm_restarts
+                  << ",\"unclean_resets\":" << unclean_resets
+                  << ",\"unclean_reset_reason\":"
+                  << JsonString(unclean_reset_reason)
+                  << ",\"clean_close_after_verification\":true"
+                  << ",\"result\":\"PASS\"}";
+  ASSERT_TRUE(RecoveryEmit(reporter, recovery_record.str()));
+}
+
+TEST(LseM3Recovery, CleanReopenAndSigkillAfterExplicitSync) {
+  const char* const root_text = std::getenv("DFKV_LSE_M3_RECOVERY_ROOT");
+  if (root_text == nullptr || *root_text == '\0') {
+    EmitStdout(
+        "{\"record\":\"recovery_preflight\",\"schema_version\":1,"
+        "\"result\":\"SKIP\",\"reason\":\"DFKV_LSE_M3_RECOVERY_ROOT is required\"}");
+    GTEST_SKIP() << "set DFKV_LSE_M3_RECOVERY_ROOT to a new absolute directory; "
+                    "every parent component must be a real directory (no "
+                    "symlinks), its mounted backing must resolve to NVMe, and "
+                    "at least 400 GiB must be free";
+  }
+
+  RootEvidence root_evidence;
+  std::string root_error;
+  if (!PrepareFreshNvmeRoot(fs::path(root_text), &root_evidence, &root_error)) {
+    PreflightFailure(root_error, &root_evidence);
+    return;
+  }
+  const fs::path root = root_evidence.normalized_root;
+  const fs::path probe = root / "recovery_direct_io.probe";
+  std::string probe_error;
+  if (!ProbeDirectIo(probe, &probe_error)) {
+    PreflightFailure("recovery O_DIRECT probe failed: " + probe_error,
+                     &root_evidence);
+    return;
+  }
+
+  JsonlReporter reporter(root / kRecoveryJsonlName);
+  std::ostringstream configuration;
+  configuration << std::boolalpha
+                << "{\"record\":\"recovery_configuration\",\"schema_version\":1"
+                << ",\"supplied_root\":"
+                << JsonString(root_evidence.supplied_root.string())
+                << ",\"root\":" << JsonString(root.string())
+                << ",\"parent_component_walk\":"
+                   "\"openat O_PATH|O_DIRECTORY|O_NOFOLLOW\""
+                << ",\"root_creation\":\"mkdirat in validated parent descriptor\""
+                << ",\"backing_device\":\"" << root_evidence.device_major << ':'
+                << root_evidence.device_minor << '"'
+                << ",\"sysfs_dev_block\":"
+                << JsonString(root_evidence.sysfs_dev_block)
+                << ",\"resolved_device\":"
+                << JsonString(root_evidence.resolved_device)
+                << ",\"backing_physical_leaf_count\":"
+                << root_evidence.physical_leaf_count
+                << ",\"backing_all_leaves_nvme\":"
+                << root_evidence.all_leaves_nvme
+                << ",\"backing_candidates\":" << BackingCandidatesJson(root_evidence)
+                << ",\"filesystem_available_bytes\":"
+                << root_evidence.available_bytes
+                << ",\"minimum_free_bytes\":" << kRequiredFreeBytes
+                << ",\"capacity_bytes_per_engine\":" << kStandardCapacity
+                << ",\"value_bytes\":" << kValueBytes
+                << ",\"keys_per_batch\":" << kRecoveryKeysPerBatch
+                << ",\"direct_io_probe\":" << JsonString(probe.string())
+                << ",\"direct_io_probe_ok\":true"
+                << ",\"slab_warm_restart\":\"auto_real_boot_mount_dev_shm\""
+                << ",\"slab_table_sync_ms\":0,\"slab_reclaim_interval_ms\":0"
+                << ",\"log_segment_bytes\":" << kLogSegment
+                << ",\"prekill_barrier\":"
+                   "\"fdatasync payloads before persistent index while unclean\""
+                << ",\"jsonl\":" << JsonString(reporter.path().string())
+                << ",\"power_cycle_tested\":false,\"reboot_or_remount_tested\":false"
+                << ",\"cold_cache_proof\":false}";
+  ASSERT_TRUE(RecoveryEmit(&reporter, configuration.str()));
+
+  for (const EngineKind kind : {EngineKind::kSlab, EngineKind::kLog}) {
+    SCOPED_TRACE(EngineName(kind));
+    RunRecoveryEngine(kind, root, &reporter);
+    if (::testing::Test::HasFatalFailure()) return;
+  }
+  ASSERT_TRUE(reporter.good()) << reporter.path();
 }
 
 TEST(LseM3Capacity, EffectiveCapacity274MiB) {
