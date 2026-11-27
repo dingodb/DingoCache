@@ -31,6 +31,7 @@
 #include "client/group_shard.h"
 #include "client/key_map.h"
 #include "client/read_scheduler.h"
+#include "client/replay_trace.h"
 #include "utils/log.h"
 #include "utils/env_parse.h"
 #include "utils/sha256.h"
@@ -269,6 +270,7 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
       health_(EnvSize("DFKV_PEER_COOLDOWN_MS", 2000),
               EnvSize("DFKV_PEER_COOLDOWN_MAX_MS", 30000),
               EnvSize("DFKV_PEER_BAD_GRACE_MS", 1000)) {
+  replay_trace_ = ReplayTrace::FromEnv(key_namespace_);
   SetMembers(std::move(members));
   if (transport) {
     t_ = transport;
@@ -3401,6 +3403,21 @@ bool KVClient::RemoveDirectRouted(const std::string& key,
 
 std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items,
                                      std::vector<ItemStatus>* status) {
+  if (!replay_trace_) return BatchPutImpl(items, status);
+  ReplayTrace::Mark trace_start;
+  std::vector<ItemStatus> observed_status;
+  if (replay_trace_) {
+    trace_start = replay_trace_->Now();
+    if (status == nullptr) status = &observed_status;
+  }
+  auto result = BatchPutImpl(items, status);
+  if (replay_trace_)
+    replay_trace_->RecordPut(trace_start, items, result, status);
+  return result;
+}
+
+std::vector<bool> KVClient::BatchPutImpl(const std::vector<KvPutItem>& items,
+                                         std::vector<ItemStatus>* status) {
   auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
@@ -3467,6 +3484,21 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items,
 
 std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items,
                                      std::vector<ItemStatus>* status) {
+  if (!replay_trace_) return BatchGetImpl(items, status);
+  ReplayTrace::Mark trace_start;
+  std::vector<ItemStatus> observed_status;
+  if (replay_trace_) {
+    trace_start = replay_trace_->Now();
+    if (status == nullptr) status = &observed_status;
+  }
+  auto result = BatchGetImpl(items, status);
+  if (replay_trace_)
+    replay_trace_->RecordGet(trace_start, "get", items, result, nullptr, status);
+  return result;
+}
+
+std::vector<bool> KVClient::BatchGetImpl(const std::vector<KvGetItem>& items,
+                                         std::vector<ItemStatus>* status) {
   const auto t0 = std::chrono::steady_clock::now();
   ItemStatus* st = nullptr;
   if (status) {
@@ -3701,6 +3733,25 @@ std::vector<bool> KVClient::BatchGetDirectRouted(
 std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
                                          std::vector<size_t>* out_lens,
                                          std::vector<ItemStatus>* status) {
+  if (!replay_trace_) return BatchGetAutoImpl(items, out_lens, status);
+  ReplayTrace::Mark trace_start;
+  std::vector<ItemStatus> observed_status;
+  std::vector<size_t> observed_lengths;
+  if (replay_trace_) {
+    trace_start = replay_trace_->Now();
+    if (status == nullptr) status = &observed_status;
+    if (out_lens == nullptr) out_lens = &observed_lengths;
+  }
+  auto result = BatchGetAutoImpl(items, out_lens, status);
+  if (replay_trace_)
+    replay_trace_->RecordGet(trace_start, "get_auto", items, result,
+                             out_lens, status);
+  return result;
+}
+
+std::vector<bool> KVClient::BatchGetAutoImpl(const std::vector<KvGetItem>& items,
+                                             std::vector<size_t>* out_lens,
+                                             std::vector<ItemStatus>* status) {
   const auto t0 = std::chrono::steady_clock::now();
   ItemStatus* st = nullptr;
   if (status) {
@@ -3907,6 +3958,17 @@ std::vector<bool> KVClient::BatchGetAutoDirectRouted(
 }
 
 std::vector<bool> KVClient::BatchExist(
+    const std::vector<std::string>& keys, const KvRouteKeys* route_keys) {
+  if (!replay_trace_) return BatchExistImpl(keys, route_keys);
+  ReplayTrace::Mark trace_start;
+  if (replay_trace_) trace_start = replay_trace_->Now();
+  auto result = BatchExistImpl(keys, route_keys);
+  if (replay_trace_)
+    replay_trace_->RecordKeyResult(trace_start, "exist", keys, result);
+  return result;
+}
+
+std::vector<bool> KVClient::BatchExistImpl(
     const std::vector<std::string>& keys, const KvRouteKeys* route_keys) {
   const auto t0 = std::chrono::steady_clock::now();
   if (!dedup_) {
@@ -4150,6 +4212,21 @@ void KVClient::RetainNode(const std::string& node, uint64_t tenant,
 void KVClient::BatchRetain(const std::vector<std::string>& keys,
                            const RetainRequest& req, uint8_t* out,
                            const KvRouteKeys* route_keys) {
+  if (!replay_trace_) {
+    BatchRetainImpl(keys, req, out, route_keys);
+    return;
+  }
+  ReplayTrace::Mark trace_start;
+  if (replay_trace_) trace_start = replay_trace_->Now();
+  BatchRetainImpl(keys, req, out, route_keys);
+  if (replay_trace_)
+    replay_trace_->RecordRetain(trace_start, keys, req.ttl_s, req.mode,
+                                req.no_debounce, req.min_refresh_ms, out);
+}
+
+void KVClient::BatchRetainImpl(const std::vector<std::string>& keys,
+                               const RetainRequest& req, uint8_t* out,
+                               const KvRouteKeys* route_keys) {
   const auto t0 = std::chrono::steady_clock::now();
   const size_t n = keys.size();
   // Counted once like every public call. A REFRESH without a TTL is how the
@@ -5176,6 +5253,17 @@ std::vector<bool> KVClient::BatchExistDirectRouted(
 
 std::vector<bool> KVClient::BatchRemove(
     const std::vector<std::string>& keys, const KvRouteKeys* route_keys) {
+  if (!replay_trace_) return BatchRemoveImpl(keys, route_keys);
+  ReplayTrace::Mark trace_start;
+  if (replay_trace_) trace_start = replay_trace_->Now();
+  auto result = BatchRemoveImpl(keys, route_keys);
+  if (replay_trace_)
+    replay_trace_->RecordKeyResult(trace_start, "remove", keys, result);
+  return result;
+}
+
+std::vector<bool> KVClient::BatchRemoveImpl(
+    const std::vector<std::string>& keys, const KvRouteKeys* route_keys) {
   const auto t0 = std::chrono::steady_clock::now();
   const size_t N = keys.size();
   std::vector<char> ok(N, 0);
@@ -5256,6 +5344,21 @@ std::vector<char> KVClient::BatchRemoveRouted(
 
 std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items,
                                        std::vector<ItemStatus>* status) {
+  if (!replay_trace_) return BatchPutSgImpl(items, status);
+  ReplayTrace::Mark trace_start;
+  std::vector<ItemStatus> observed_status;
+  if (replay_trace_) {
+    trace_start = replay_trace_->Now();
+    if (status == nullptr) status = &observed_status;
+  }
+  auto result = BatchPutSgImpl(items, status);
+  if (replay_trace_)
+    replay_trace_->RecordPutSg(trace_start, items, result, status);
+  return result;
+}
+
+std::vector<bool> KVClient::BatchPutSgImpl(const std::vector<KvPutItemSg>& items,
+                                           std::vector<ItemStatus>* status) {
   auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
@@ -5496,6 +5599,25 @@ GpuNodeDedup* KVClient::GpuDedup(const void* device_dst_hint) {
 std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                            std::vector<size_t>* out_lens,
                                            std::vector<ItemStatus>* status) {
+  if (!replay_trace_) return BatchGetAutoSgImpl(items, out_lens, status);
+  ReplayTrace::Mark trace_start;
+  std::vector<ItemStatus> observed_status;
+  std::vector<size_t> observed_lengths;
+  if (replay_trace_) {
+    trace_start = replay_trace_->Now();
+    if (status == nullptr) status = &observed_status;
+    if (out_lens == nullptr) out_lens = &observed_lengths;
+  }
+  auto result = BatchGetAutoSgImpl(items, out_lens, status);
+  if (replay_trace_)
+    replay_trace_->RecordGetAutoSg(trace_start, items, result,
+                                   out_lens, status);
+  return result;
+}
+
+std::vector<bool> KVClient::BatchGetAutoSgImpl(
+    const std::vector<KvGetItemSg>& items, std::vector<size_t>* out_lens,
+    std::vector<ItemStatus>* status) {
   const auto t0 = std::chrono::steady_clock::now();
   ItemStatus* st = nullptr;
   if (status) {

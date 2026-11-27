@@ -7,6 +7,12 @@
 
 > **分布式追踪（traces）** 是独立的连接器侧能力（OTLP `/v1/traces`），
 > 见 [tracing.md](tracing.md)。本文只覆盖 metrics。
+> STO-18 另提供默认关闭、按记录发布顺序保存 batch 实测起止时间、BlockKey 与
+> connector 前缀事件的 JSONL 观测层；并发调用按单调时钟区间重排，其排他文件、
+> rotation/drop/start/end 与
+> `complete_for_replay` 严格校验语义见
+> [design/replay-trace.md](design/replay-trace.md)。它不是 Prometheus family，
+> 不会把访问日志或错误状态转换成淘汰证据。
 
 ## 1. 抓取端点
 
