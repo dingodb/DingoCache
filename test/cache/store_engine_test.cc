@@ -313,7 +313,10 @@ TEST_F(EngineTest, InvalidExplicitSlabCapacityRefusesStartup) {
   EXPECT_NE(group.StartupError().find("multiple"), std::string::npos);
   EXPECT_FALSE(fs::exists(fs::path(dirs[0]) / "blocks"));
 
-  KvNodeServer server(options);
+  // The public server constructor selects its store through the environment;
+  // keep this negative slab case on that supported interface.
+  ::setenv("DFKV_STORE_ENGINE", "slab", 1);
+  KvNodeServer server(options.cache_dirs, options.capacity_bytes);
   EXPECT_EQ(server.engine_name(), "slab");
   EXPECT_FALSE(server.Healthy());
   EXPECT_EQ(server.Start(0), Status::kIOError);
