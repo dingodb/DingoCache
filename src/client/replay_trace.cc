@@ -213,7 +213,7 @@ class ReplayTrace::Impl {
                         ",\"dropped_record_count\":" +
                         std::to_string(dropped_records_ +
                                        pending_dropped_records_) +
-                        ",\"durability\":\"fsync_before_end\"";
+                        ",\"durability\":\"fsync_before_end\"");
       WriteRecordLocked("end", end_body);
       ::close(fd_);
       fd_ = -1;
