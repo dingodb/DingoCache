@@ -12,6 +12,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -116,11 +117,13 @@ class TraceTransport final : public Transport {
   bool pipelined() const override { return false; }
   Status Cache(const std::string&, const BlockKey& key, const void* data,
                size_t n) override {
+    std::lock_guard<std::mutex> lock(values_mutex);
     values[key.Filename()] = std::string(static_cast<const char*>(data), n);
     return Status::kOk;
   }
   Status Range(const std::string&, const BlockKey& key, uint64_t,
                uint64_t length, std::string* out, uint64_t* stored) override {
+    std::lock_guard<std::mutex> lock(values_mutex);
     const auto found = values.find(key.Filename());
     if (found == values.end()) return Status::kNotFound;
     if (stored) *stored = found->second.size();
@@ -130,16 +133,19 @@ class TraceTransport final : public Transport {
   }
   Status Lookup(const std::string&, const BlockKey& key,
                 uint64_t* size) override {
+    std::lock_guard<std::mutex> lock(values_mutex);
     const auto found = values.find(key.Filename());
     if (found == values.end()) return Status::kNotFound;
     if (size) *size = found->second.size();
     return Status::kOk;
   }
   Status Exist(const std::string&, const BlockKey& key, bool* exists) override {
+    std::lock_guard<std::mutex> lock(values_mutex);
     *exists = values.count(key.Filename()) != 0;
     return Status::kOk;
   }
   Status Remove(const std::string&, const BlockKey& key) override {
+    std::lock_guard<std::mutex> lock(values_mutex);
     values.erase(key.Filename());
     return Status::kOk;
   }
@@ -153,6 +159,7 @@ class TraceTransport final : public Transport {
     EncodeRetainTrailer(&(*out)[count], trailer);
     return Status::kOk;
   }
+  std::mutex values_mutex;
   std::map<std::string, std::string> values;
 };
 
