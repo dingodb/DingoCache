@@ -47,7 +47,9 @@ class FreshRootAndSnapshotTest(unittest.TestCase):
                 HARNESS.resolve_roots(Path("/mnt/disk-test-run/root"), parent / "cache-two")
 
     def test_nested_run_and_cache_roots_are_rejected(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        # The run role rejects /mnt/disk* before checking nesting. Do not let
+        # a task-scoped TMPDIR on such a mount select that different rejection.
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
             parent = Path(temporary)
             with self.assertRaisesRegex(HARNESS.AcceptanceFailure, "independent"):
                 HARNESS.resolve_roots(parent / "run", parent / "run" / "cache")
