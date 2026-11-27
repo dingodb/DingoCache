@@ -1176,10 +1176,10 @@ RunRecord RunOne(EngineKind kind, uint32_t pair, uint32_t order,
   }
 
   run.healthy_before_close = store->Healthy();
-  run.key_count_at_end = store->Count();
-  run.used_bytes = store->UsedBytes();
-  run.evictions = store->Evictions();
   if (kind == EngineKind::kSlab) {
+    run.key_count_at_end = store->Count();
+    run.used_bytes = store->UsedBytes();
+    run.evictions = store->Evictions();
     const auto stats = slab->GetStats();
     run.slab_put_no_slot = stats.put_no_slot;
     run.slab_put_busy = stats.put_busy;
@@ -1187,7 +1187,18 @@ RunRecord RunOne(EngineKind kind, uint32_t pair, uint32_t order,
     run.slab_payload_crc_failures = stats.payload_crc_failures;
     run.slab_metadata_io_errors = stats.metadata_io_errors;
     run.slab_balance_moves = stats.balance_moves;
-  } else {
+  }
+
+  const auto close_start = Clock::now();
+  run.close_ok = store->Close();
+  run.close_seconds = Seconds(Clock::now() - close_start);
+  if (kind == EngineKind::kLog && run.close_ok) {
+    // Close joined the cleaner/sealer and admitted flights. These direct
+    // accessors remain mt-locked readers over the retained index/stats state;
+    // do not mix them with pre-close metrics on the running LSE cleaner.
+    run.key_count_at_end = store->Count();
+    run.used_bytes = store->UsedBytes();
+    run.evictions = store->Evictions();
     const auto stats = log->GetStats();
     run.log_stat_cache_full = stats.cache_full;
     run.log_records_relocated = stats.records_relocated;
@@ -1196,10 +1207,6 @@ RunRecord RunOne(EngineKind kind, uint32_t pair, uint32_t order,
     run.log_direct_open_successes = strict_io->direct_successes();
     run.log_direct_open_refusals = strict_io->direct_refusals();
   }
-
-  const auto close_start = Clock::now();
-  run.close_ok = store->Close();
-  run.close_seconds = Seconds(Clock::now() - close_start);
   store.reset();
 
   if (run.CacheFullRatio() >= 0.001)
