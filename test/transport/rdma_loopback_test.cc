@@ -124,6 +124,18 @@ class RdmaServerTestPeer {
     for (const auto& [ep, live] : server.live_eps_) n += live.rail == rail;
     return n;
   }
+  static uint32_t OnlyLiveQpnOnRail(RdmaServer& server, size_t rail,
+                                    size_t expected_live) {
+    std::lock_guard<std::mutex> lock(server.conn_mu_);
+    if (server.live_eps_.size() != expected_live) return 0;
+    uint32_t qpn = 0;
+    for (const auto& [ep, live] : server.live_eps_) {
+      if (live.rail != rail) continue;
+      if (qpn != 0) return 0;
+      qpn = ep->Local().qpn;
+    }
+    return qpn;
+  }
   static size_t DefaultRail(const RdmaServer& server) {
     return server.DefaultRail();
   }
@@ -8668,13 +8680,22 @@ void ExerciseSuspectSibling(bool named) {
   ScopedEnv max_cooldown("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS", "30000");
   std::atomic<uint64_t> now_ms{100000};
   std::atomic<bool> armed{false};
-  RdmaNode node(named ? "suspect-sibling-mds" : "suspect-sibling-static",
-                kMaxMsg, false, false, {},
-                [&](ibv_wc* batch, int* count, size_t) {
-                  if (*count <= 0 || !armed.load()) return;
-                  armed.store(false);
-                  batch[0].status = IBV_WC_RETRY_EXC_ERR;
-                });
+  std::atomic<uint32_t> intended_qpn{0};
+  RdmaNode node(
+      named ? "suspect-sibling-mds" : "suspect-sibling-static", kMaxMsg,
+      false, false, {},
+      [&](ibv_wc* batch, int* count, size_t) {
+        if (*count <= 0 || !armed.load()) return;
+        const uint32_t qpn = intended_qpn.load(std::memory_order_relaxed);
+        // This hook runs on every server QP's CQ. Unrelated completions must
+        // pass through, or their global CompletionErrors release the driver.
+        for (int i = 0; i < *count; ++i) {
+          if (batch[i].qp_num != qpn) continue;
+          armed.store(false);
+          batch[i].status = IBV_WC_RETRY_EXC_ERR;
+          return;
+        }
+      });
   RdmaServerTestPeer::SetRetryObservationClock(
       *node.rsrv, [&] { return now_ms.load(std::memory_order_relaxed); });
   RdmaServerTestPeer::SeedRetryPeer(*node.rsrv, 0, "203.0.113.9",
@@ -8683,12 +8704,42 @@ void ExerciseSuspectSibling(bool named) {
   if (named)
     transport.OnPeerTopology(
         PublishedPeer(node.addr, "rail-suspect-sibling-peer"));
+
+  // ExistMany uses the control lane, so this returns the exact pooled QP that
+  // the dedicated single-rail driver reuses; sibling CQEs stay untouched.
+  RdmaTransport trigger(kMaxMsg, rails[0]);
+  {
+    auto* warm =
+        RdmaTransportTestPeer::AcquireControlOn(&trigger, node.addr, 0);
+    ASSERT_NE(warm, nullptr);
+    RdmaTransportTestPeer::ReleaseControl(&trigger, node.addr, warm);
+  }
+  uint32_t captured_qpn = 0;
+  for (int i = 0; i < 600 && captured_qpn == 0; ++i) {
+    captured_qpn =
+        RdmaServerTestPeer::OnlyLiveQpnOnRail(*node.rsrv, 0, 1);
+    if (captured_qpn == 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_NE(captured_qpn, 0u)
+      << "the trigger QP never appeared alone in the server's live registry";
+  intended_qpn.store(captured_qpn, std::memory_order_relaxed);
+
+  // Keep an independent QP from the original dual-transport alive on rail
+  // zero so the final zero-live assertion covers its suspect wake as well as
+  // natural teardown of the failed trigger QP.
   {
     auto* warm =
         RdmaTransportTestPeer::AcquireControlOn(&transport, node.addr, 0);
     ASSERT_NE(warm, nullptr);
     RdmaTransportTestPeer::ReleaseControl(&transport, node.addr, warm);
   }
+  for (int i = 0;
+       i < 600 &&
+       RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0) != 2; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0), 2u)
+      << "the trigger and original dual-transport guard must both be live";
   std::unique_ptr<RdmaTransport> sibling_transport;
   std::unique_ptr<KVClient> sibling;
   {
@@ -8701,10 +8752,14 @@ void ExerciseSuspectSibling(bool named) {
   const std::string sibling_value = "other-rail-survives";
   ASSERT_TRUE(sibling->Put("sibling-before", sibling_value.data(),
                            sibling_value.size()));
+  for (int i = 0;
+       i < 600 &&
+       RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 1) != 1; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   ASSERT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 1), 1u);
 
   armed.store(true, std::memory_order_release);
-  ASSERT_TRUE(DriveRewrittenServerFailures(node, transport, 1));
+  ASSERT_TRUE(DriveRewrittenServerFailures(node, trigger, 1));
   ASSERT_TRUE(WaitForServerRailMetric(node, "dfkv_rdma_rail_suspect",
                                       rails[0], 1));
   std::string metrics = node.rsrv->MetricsText();
@@ -8714,14 +8769,13 @@ void ExerciseSuspectSibling(bool named) {
   EXPECT_EQ(RdmaServerTestPeer::DefaultRail(*node.rsrv), 1u)
       << "unnamed clients must exclude the current suspect";
   for (int i = 0;
-       i < 200 &&
+       i < 600 &&
        RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0) != 0; ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   EXPECT_EQ(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 0), 0u)
-      << "the actual crossing wakes every existing QP on only this rail";
+      << "trigger teardown and the actual crossing wake every rail-zero QP";
   EXPECT_GE(RdmaServerTestPeer::LiveConnectionsOnRail(*node.rsrv, 1), 1u)
-      << "the original rail remains usable; the failing operation may also "
-         "have opened its expected sibling retry connection";
+      << "the original rail remains usable";
   std::string sibling_out(sibling_value.size(), '\0');
   ASSERT_TRUE(sibling->Get("sibling-before", sibling_out.data(),
                            sibling_out.size()));
@@ -8749,6 +8803,16 @@ void ExerciseSuspectSibling(bool named) {
     ASSERT_NE(admitted, nullptr);
     RdmaTransportTestPeer::ReleaseControl(&admitted_probe, node.addr, admitted);
   }
+
+  // The dedicated trigger has separate peer health. Preserve the original
+  // dual-rail transport's real post-suspect observation, formerly supplied by
+  // its failed Drive call, before measuring its later rail selection.
+  const std::vector<BlockKey> selection_probe_key = {
+      ToBlockKey(SelfHdr(), "rail-suspect-drive")};
+  std::vector<char> selection_exists;
+  ASSERT_EQ(transport.ExistMany(node.addr, selection_probe_key,
+                                &selection_exists)[0],
+            Status::kNotFound);
 
   KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
   bool served = false;
