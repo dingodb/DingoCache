@@ -9025,7 +9025,15 @@ TEST(RdmaRailSuspect, UnnamedBootstrapFailsClosedUntilOneRailExpires) {
   now_ms.store(130001, std::memory_order_relaxed);  // rail 0: 30001; rail 1: 10001
   ASSERT_TRUE(OpenUnnamedControlPeer(node, rails[0]))
       << "the empty device frame must now really bootstrap on recovered rail 0";
-  EXPECT_EQ(node.rsrv->V2Conns(), accepted_before + 1);
+  // Readiness/RTS may complete before the server's registration increment.
+  // Wait on that exact cumulative event, not a fixed delay or mere EOF: this
+  // test has no other admission source, so rail-one or sibling noise cannot
+  // account for the single new connection.
+  for (int i = 0;
+       i < 600 && node.rsrv->V2Conns() != accepted_before + 1; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_EQ(node.rsrv->V2Conns(), accepted_before + 1)
+      << "the recovered unnamed bootstrap never registered on the server";
   EXPECT_EQ(DeviceCounterVal(node.rsrv->MetricsText(),
                              "dfkv_rdma_rail_suspect", rails[0]),
             0);
