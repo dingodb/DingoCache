@@ -304,6 +304,9 @@ if(DFKV_BUILD_TESTS)
               -p test_client_metrics.py)
     set_tests_properties(python_client_metrics PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_storage_activation_controls
+      COMMAND ${PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_storage_activation_harness.py
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME python_block_size_preflight
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/integration/common/tests
