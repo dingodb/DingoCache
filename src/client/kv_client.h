@@ -17,6 +17,7 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -52,8 +53,21 @@ inline size_t AutoBatchWorkers(size_t bc, size_t groups) {
                   kMaxAutoBatchWorkers);
 }
 
-struct KvPutItem { std::string key; const void* value; size_t n; };
-struct KvGetItem { std::string key; void* out; size_t n; };
+// route_key is an optional non-owning placement identity. Empty means key.
+// It never changes the object identity sent to storage or rendezvous dedup.
+using KvRouteKeys = std::vector<std::string_view>;
+struct KvPutItem {
+  std::string key;
+  const void* value;
+  size_t n;
+  std::string_view route_key;
+};
+struct KvGetItem {
+  std::string key;
+  void* out;
+  size_t n;
+  std::string_view route_key;
+};
 
 // Scatter-gather batch items: one dfkv key gathers N non-contiguous source
 // buffers on put / scatters into N destination buffers on get. The stored value
@@ -65,11 +79,13 @@ struct KvPutItemSg {
   std::string key;
   std::vector<const void*> ptrs;
   std::vector<size_t> sizes;
+  std::string_view route_key;
 };
 struct KvGetItemSg {
   std::string key;
   std::vector<void*> dsts;
   std::vector<size_t> caps;
+  std::string_view route_key;
 };
 
 class KVClient {
@@ -114,7 +130,9 @@ class KVClient {
   std::vector<bool> BatchGetAuto(const std::vector<KvGetItem>& items,
                                  std::vector<size_t>* out_lens,
                                  std::vector<ItemStatus>* status = nullptr);
-  std::vector<bool> BatchExist(const std::vector<std::string>& keys);
+  std::vector<bool> BatchExist(
+      const std::vector<std::string>& keys,
+      const KvRouteKeys* route_keys = nullptr);
 
   // ---- Retention (kRetain) ----
   // Per-key result codes (mirrors dfkv_c_api.h DFKV_RET_*).
@@ -173,7 +191,8 @@ class KVClient {
       const std::string& prev,
       const std::vector<std::pair<std::string, MemoryAnswer>>& heard);
   void BatchRetain(const std::vector<std::string>& keys,
-                   const RetainRequest& req, uint8_t* out);
+                   const RetainRequest& req, uint8_t* out,
+                   const KvRouteKeys* route_keys = nullptr);
   // Ring-wide limits: *supported 1 = every member answered kRetain, 0 = some
   // member lacks it, -1 = unknown. *max_ttl_s = smallest cap seen (0 if not
   // supported). Unknown members are probed once, synchronously.
@@ -181,10 +200,13 @@ class KVClient {
   // Local, RPC-free: true iff every owner of `keys` supports retention and its
   // last reported headroom is >= min_headroom_pct (never-heard nodes pass).
   bool RetainPrecheck(const std::vector<std::string>& keys,
-                      uint8_t min_headroom_pct);
+                      uint8_t min_headroom_pct,
+                      const KvRouteKeys* route_keys = nullptr);
   // Batched remove, fanned out across owning nodes (grouped per node). Per-item
   // result like BatchExist: true iff the owning node confirmed the op.
-  std::vector<bool> BatchRemove(const std::vector<std::string>& keys);
+  std::vector<bool> BatchRemove(
+      const std::vector<std::string>& keys,
+      const KvRouteKeys* route_keys = nullptr);
 
   // Scatter-gather batch put: each key gathers its N source segments into one
   // stored blob (sum of sizes). Mirrors BatchPut (consistent-hash routing per
@@ -297,25 +319,28 @@ class KVClient {
   void StopProbe();
 
  private:
-  std::string Route(const std::string& key) const;
+  std::string Route(const std::string& key,
+                    std::string_view route_key = {}) const;
   // Route for an operation: Route, except that with cooldown reroute on and
   // the gate open a key whose owner cools in this client goes to its
   // substitute (§3.2 of docs/design/ring-unavailable-owner.md). "" for a
   // write refused because DFKV_RING_REROUTE_KEYS keys are tracked.
   enum class RouteOp { kGet, kExist, kPut, kRetainSet, kRetainRefresh };
-  std::string RouteFor(const std::string& key, RouteOp op);
+  std::string RouteFor(const std::string& key, RouteOp op,
+                       std::string_view route_key = {});
   // RouteFor for every key of a batch read (kGet or kExist), key_of(j) for
   // j < n, with the substitute-read checks of revision 11 asked together.
   std::vector<std::string> RouteReads(
       size_t n, const std::function<const std::string&(size_t)>& key_of,
-      RouteOp op);
+      const std::function<std::string_view(size_t)>& route_key_of, RouteOp op);
   // RouteFor without revision 11's check; a substitute read that needs it
   // is reported in *check_owner (when not null). A RETAIN SET on another
   // episode's copy is then not tracked: *set_episode (when not null) gets
   // its episode, for RouteFor to track it once the check passed.
   std::string RouteForUnchecked(const std::string& key, RouteOp op,
                                 std::string* check_owner,
-                                uint64_t* set_episode);
+                                uint64_t* set_episode,
+                                std::string_view route_key = {});
   uint64_t NowMs() const;
   void ProbeLoop();
   // Swap in a freshly-built ring under ring_mu_ and log the membership delta
@@ -372,25 +397,34 @@ class KVClient {
   // TCP batch fan-out calls these bodies so it cannot double-count each key.
   // `status`, when given, receives the item's outcome.
   bool PutDirect(const std::string& key, const void* value, size_t n,
-                 ItemStatus* status = nullptr);
+                 ItemStatus* status = nullptr,
+                 std::string_view route_key = {});
   // The read, exist and remove bodies below ask a key's draining owner too
   // (see full_ring_); each *Routed form asks the one node Route() names.
   bool GetDirect(const std::string& key, void* out, size_t n,
-                 ItemStatus* status = nullptr);
+                 ItemStatus* status = nullptr,
+                 std::string_view route_key = {});
   bool GetDirectRouted(const std::string& key, void* out, size_t n,
-                       ItemStatus* status);
+                       ItemStatus* status, std::string_view route_key = {});
   bool GetAutoDirect(const std::string& key, std::string* out,
-                     size_t max_bytes);
+                     size_t max_bytes, std::string_view route_key = {});
   bool GetAutoDirectRouted(const std::string& key, std::string* out,
-                           size_t max_bytes, ItemStatus* status);
+                           size_t max_bytes, ItemStatus* status,
+                           std::string_view route_key = {});
   bool GetAutoDirect(const std::string& key, void* out, size_t cap,
-                     size_t* out_len, ItemStatus* status = nullptr);
+                     size_t* out_len, ItemStatus* status = nullptr,
+                     std::string_view route_key = {});
   bool GetAutoDirectRouted(const std::string& key, void* out, size_t cap,
-                           size_t* out_len, ItemStatus* status);
-  bool ExistDirect(const std::string& key, Status* status);
-  bool ExistDirectRouted(const std::string& key, Status* status);
-  bool RemoveDirect(const std::string& key);
-  bool RemoveDirectRouted(const std::string& key);
+                           size_t* out_len, ItemStatus* status,
+                           std::string_view route_key = {});
+  bool ExistDirect(const std::string& key, Status* status,
+                   std::string_view route_key = {});
+  bool ExistDirectRouted(const std::string& key, Status* status,
+                         std::string_view route_key = {});
+  bool RemoveDirect(const std::string& key,
+                    std::string_view route_key = {});
+  bool RemoveDirectRouted(const std::string& key,
+                          std::string_view route_key = {});
   void CountDrainRead(bool hit);
   void InvalidateRendezvous(const BlockKey& key);
   DestinationMemoryKind ClassifyDestination(const void* destination,
@@ -422,19 +456,25 @@ class KVClient {
   std::vector<bool> BatchGetAutoSgDirectRouted(
       const std::vector<KvGetItemSg>& items, std::vector<size_t>* out_lens,
       ItemStatus* status);
-  std::vector<bool> BatchExistDirect(const std::vector<std::string>& keys,
-                                     std::vector<Status>* statuses);
-  std::vector<bool> BatchExistDirectRouted(const std::vector<std::string>& keys,
-                                           std::vector<Status>* statuses);
+  std::vector<bool> BatchExistDirect(
+      const std::vector<std::string>& keys, std::vector<Status>* statuses,
+      const KvRouteKeys* route_keys = nullptr);
+  std::vector<bool> BatchExistDirectRouted(
+      const std::vector<std::string>& keys, std::vector<Status>* statuses,
+      const KvRouteKeys* route_keys = nullptr);
   // The RDMA (pipelined) BatchRemove body for the nodes Route() names.
-  std::vector<char> BatchRemoveRouted(const std::vector<std::string>& keys);
+  std::vector<char> BatchRemoveRouted(
+      const std::vector<std::string>& keys,
+      const KvRouteKeys* route_keys = nullptr);
   void BatchRetainRouted(const std::vector<std::string>& keys,
-                         const RetainRequest& req, uint8_t* out);
+                         const RetainRequest& req, uint8_t* out,
+                         const KvRouteKeys* route_keys = nullptr);
   // Indices of the keys owned by a draining member (none unless one drains,
   // and none inside a drain pass).
-  template <typename KeyOf>
+  template <typename KeyOf, typename RouteKeyOf>
   std::vector<size_t> DrainerOwned(size_t n, const std::vector<bool>* done,
-                                   KeyOf key_of) const;
+                                   KeyOf key_of,
+                                   RouteKeyOf route_key_of) const;
   GpuNodeDedup* GpuDedup(const void* device_dst_hint);
   // Record one public batch operation (hits are the true flags) and return the
   // item results. Centralizing this at each public return point prevents direct
@@ -539,23 +579,28 @@ class KVClient {
       absent_removes_retried_{0}, absent_removes_dropped_{0};
   // The drainer of a key: its full-ring owner's address if that member
   // drains, else "".
-  std::string DrainRoute(const std::string& key) const;
+  std::string DrainRoute(const std::string& key,
+                         std::string_view route_key = {}) const;
   // absent owner of a key: its owner on absent_ring_ if that member is
   // absent (its address; `id` receives its id), else "". REMOVE and RETAIN
   // go there directly; an ordinary read does not. Its copy may be one a
   // REMOVE from a client that never saw the member did not reach, so only
   // PlanReadBack may read it, after the shared M/W and safety checks.
   std::string AbsentRoute(const std::string& key, std::string* id,
-                          uint64_t* since_ms = nullptr) const;
+                          uint64_t* since_ms = nullptr,
+                          std::string_view route_key = {}) const;
   struct AbsentPart {
     std::string id, addr;
     std::vector<size_t> index;  // into the keys
   };
   // The keys with an absent owner, by member.
-  std::vector<AbsentPart> AbsentOwned(const std::vector<std::string>& keys) const;
+  std::vector<AbsentPart> AbsentOwned(
+      const std::vector<std::string>& keys,
+      const KvRouteKeys* route_keys = nullptr) const;
   // REMOVE `keys`' absent-owned ones at their absent owner; the ones it
   // does not confirm are queued for its return.
-  void RemoveAtAbsent(const std::vector<std::string>& keys);
+  void RemoveAtAbsent(const std::vector<std::string>& keys,
+                      const KvRouteKeys* route_keys = nullptr);
 
   // ---- Previous-owner read-back (CLI-02 stage B, §3.4) ----
   bool readback_on_ = false;
@@ -578,7 +623,8 @@ class KVClient {
   // there, each asked about with M first. `keys` are reads just answered
   // not found by their owner.
   std::map<std::string, std::vector<size_t>> PlanReadBack(
-      const std::vector<std::string>& keys);
+      const std::vector<std::string>& keys,
+      const KvRouteKeys* route_keys = nullptr);
   // A read-back candidate: keys[i], its owner O, its previous owner (or the
   // substitute a read would go to), the nodes asked, and why it is refused
   // (-1: not refused; kRbRefusals: dropped without counting).
@@ -595,14 +641,16 @@ class KVClient {
   // Asks M at each unrefused candidate's ask set (plus drainer and absent
   // owner, without O) and refuses on any 1 or 2; counts the refusals.
   void AskRemoved(const std::vector<std::string>& keys, uint64_t now,
-                  std::vector<RbCand>* cands);
+                  std::vector<RbCand>* cands,
+                  const KvRouteKeys* route_keys = nullptr);
 
   // Revision 11: a substitute read of a key outside this client's current
   // episode is a read-back: asks M (ask set without the owner) and blanks
   // subs[k] (a miss) unless every answer is 0.
   void CheckSubstituteReads(const std::vector<std::string>& keys,
                             const std::vector<std::string>& owners,
-                            std::vector<std::string>* subs);
+                            std::vector<std::string>* subs,
+                            const KvRouteKeys* route_keys = nullptr);
   // Every registered client advertises B (readback=1): only then do ended
   // episodes' cleanups wait for the window (revision 11).
   std::atomic<bool> registry_readback_all_{false};
@@ -740,7 +788,9 @@ class KVClient {
   // owners that no longer cool (all of them with `all`), until `deadline_ms`
   // (0: no bound). Returns the number of keys left unsent.
   size_t RunCleanup(bool all, uint64_t deadline_ms);
-  std::vector<char> RemoveFanout(const std::vector<std::string>& keys);
+  std::vector<char> RemoveFanout(
+      const std::vector<std::string>& keys,
+      const KvRouteKeys* route_keys = nullptr);
   void CloseReroute();
   enum RerouteOpIndex { kRrGet, kRrExist, kRrPut, kRrRetain, kRrNone,
                         kRrOps };

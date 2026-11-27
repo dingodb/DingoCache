@@ -599,6 +599,50 @@ def _parse_lookup_cache_ttl_ms(value: Any) -> int:
 def _parse_lookup_timeout_ms(value: Any) -> int:
     return _parse_bounded_int("lookup_timeout_ms", value, 0, MAX_LOOKUP_TIMEOUT_MS)
 
+def _parse_segment_affinity_pages(value: Any) -> int:
+    # Keep the upper range non-restrictive: zero is the legacy off switch;
+    # a positive value is the number of absolute per-group pages per segment.
+    parsed = _parse_bounded_int(
+        "segment_affinity_pages", value, 0, (1 << 63) - 1
+    )
+    return parsed
+
+
+def _segment_anchor_key(
+    db: ChunkedTokenDatabase,
+    start: int,
+    key: PoolKey,
+    block_hashes: list[BlockHash],
+    pages: int,
+) -> PoolKey:
+    """Route to the actual object at this group's absolute segment start.
+
+    A boundary/partial object at the segment's first page is itself the
+    anchor; using its full-block hash would name a different, possibly absent
+    object. Later pages use the full object key of their segment's first page,
+    independent of batch filtering, ownership, submission order and rotation.
+    """
+    if pages == 0:
+        return key
+    if start < 0 or start % db.block_size:
+        raise ValueError(
+            f"segment affinity requires a page-aligned start, got {start} "
+            f"for block_size={db.block_size}"
+        )
+    page = start // db.block_size
+    first_page = page // pages * pages
+    if first_page == page:
+        return key
+    try:
+        first_hash = db.chunk_hash(first_page, block_hashes)
+    except IndexError as exc:
+        raise ValueError(
+            "segment affinity lacks the absolute segment-first hash for "
+            f"page={first_page} (object page={page})"
+        ) from exc
+    return PoolKey(key.key_metadata, first_hash.hex())
+
+
 def _load_windows(
     length: int,
     window_keys: int,
@@ -622,12 +666,17 @@ def _batch_get_auto_sg_windowed(
     seg_caps: list[list[int]],
     window_keys: int,
     min_keys: int,
+    route_keys: list[bytes] | None = None,
 ) -> tuple[list[bool], list[int]]:
     windows = _load_windows(len(keys), window_keys, min_keys)
     if not windows:
         return [], []
     if len(windows) == 1:
-        return client.batch_get_auto_sg(keys, seg_ptrs, seg_caps)
+        if route_keys is None:
+            return client.batch_get_auto_sg(keys, seg_ptrs, seg_caps)
+        return client.batch_get_auto_sg(
+            keys, seg_ptrs, seg_caps, route_keys=route_keys
+        )
 
     # A flat descriptor batch is windowed in place (no per-segment
     # re-marshalling of each window); plain nested lists are sliced.
@@ -640,9 +689,18 @@ def _batch_get_auto_sg_windowed(
             window_ptrs, window_caps = window.ptrs, window.caps
         else:
             window_ptrs, window_caps = seg_ptrs[start:stop], seg_caps[start:stop]
-        window_hits, window_lengths = client.batch_get_auto_sg(
-            keys[start:stop], window_ptrs, window_caps,
+        window_routes = (
+            None if route_keys is None else route_keys[start:stop]
         )
+        if window_routes is None:
+            window_hits, window_lengths = client.batch_get_auto_sg(
+                keys[start:stop], window_ptrs, window_caps,
+            )
+        else:
+            window_hits, window_lengths = client.batch_get_auto_sg(
+                keys[start:stop], window_ptrs, window_caps,
+                route_keys=window_routes,
+            )
         hits.extend(window_hits)
         lengths.extend(window_lengths)
     return hits, lengths
@@ -880,6 +938,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         record_operation: Callable[..., None] | None = None,
         queue_capacity: int = DEFAULT_TRANSFER_QUEUE_CAPACITY,
         tp_sharded_groups: frozenset[int] = frozenset(),
+        segment_affinity_pages: int = 0,
     ):
         super().__init__(
             client,
@@ -898,6 +957,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.stripe_step = stripe_step
         self.tp_sharded_groups = tp_sharded_groups
         self.coord = coord
+        self.segment_affinity_pages = _parse_segment_affinity_pages(
+            segment_affinity_pages
+        )
         self.kv_role = kv_role
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
         self._save_generations: dict[str, int] = {}
@@ -1152,6 +1214,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             starts: list[int] = []
             ends: list[int] = []
             keys: list[bytes] = []
+            route_keys: list[bytes] | None = (
+                [] if self.segment_affinity_pages else None
+            )
             block_hashes: list[BlockHash] = []
             parent_hashes: list[BlockHash | None] = []
             group_indices: list[int] = []
@@ -1260,6 +1325,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     starts.append(start)
                     ends.append(end)
                     keys.append(key.to_bytes())
+                    if route_keys is not None:
+                        route_keys.append(_segment_anchor_key(
+                            db, start, key, req_meta.block_hashes,
+                            self.segment_affinity_pages,
+                        ).to_bytes())
                     block_hashes.append(chunk_hash)
                     parent_hashes.append(chunk_parent)
                     group_indices.append(g_idx)
@@ -1288,6 +1358,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 starts.append(start)
                 ends.append(end)
                 keys.append(key.to_bytes())
+                if route_keys is not None:
+                    route_keys.append(_segment_anchor_key(
+                        db, start, key, req_meta.block_hashes,
+                        self.segment_affinity_pages,
+                    ).to_bytes())
                 block_hashes.append(BlockHash(bytes.fromhex(key.chunk_hash)))
                 parent_hashes.append(None)
                 group_indices.append(g_idx)
@@ -1310,13 +1385,17 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # directly and a missing object is rewritten as a whole.
             save_exists_start = time.perf_counter()
             retain_ttl_s = req_meta.retain_ttl_s
+            route_kwargs = (
+                {} if route_keys is None else {"route_keys": route_keys}
+            )
             try:
                 if retain_ttl_s > 0:
                     # SET doubles as the dedup probe: present keys are
                     # protected in the same round trip (prefix closure keeps
                     # every saved chunk of this request protected).
                     codes = self.client.batch_retain(
-                        keys, retain_ttl_s, dfkv_cabi.DFKV_RETAIN_SET)
+                        keys, retain_ttl_s, dfkv_cabi.DFKV_RETAIN_SET,
+                        **route_kwargs)
                     exists_states = [
                         1 if c in dfkv_cabi.RETAIN_HIT_CODES else 0
                         for c in codes
@@ -1324,7 +1403,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     self._note_retain_codes(
                         "save_retain_set", codes, save_exists_start)
                 else:
-                    exists_states = self.client.batch_exist(keys)
+                    exists_states = self.client.batch_exist(
+                        keys, **route_kwargs)
                 if len(exists_states) != len(keys):
                     raise RuntimeError(
                         "batch_exist returned incomplete per-key results: "
@@ -1358,6 +1438,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             starts = [starts[i] for i in missing_indices]
             ends = [ends[i] for i in missing_indices]
             keys = [keys[i] for i in missing_indices]
+            if route_keys is not None:
+                route_keys = [route_keys[i] for i in missing_indices]
+                route_kwargs["route_keys"] = route_keys
             block_hashes = [block_hashes[i] for i in missing_indices]
             parent_hashes = [parent_hashes[i] for i in missing_indices]
             group_indices = [group_indices[i] for i in missing_indices]
@@ -1430,7 +1513,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             successful_events: list[BlockStored] = []
             try:
                 res = self.client.batch_put_sg(
-                    keys, descriptor_batch.ptrs, descriptor_batch.sizes
+                    keys, descriptor_batch.ptrs, descriptor_batch.sizes,
+                    **route_kwargs,
                 )
                 if len(res) != len(keys):
                     raise RuntimeError(
@@ -1481,11 +1565,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
                               if rc == 0]
                     if stored:
                         retain_start = time.perf_counter()
+                        stored_kwargs = {}
+                        if route_keys is not None:
+                            stored_kwargs["route_keys"] = [
+                                route for route, rc in zip(
+                                    route_keys, res, strict=True
+                                ) if rc == 0
+                            ]
                         self._note_retain_codes(
                             "save_retain_set",
                             self.client.batch_retain(
                                 stored, retain_ttl_s,
-                                dfkv_cabi.DFKV_RETAIN_SET),
+                                dfkv_cabi.DFKV_RETAIN_SET, **stored_kwargs),
                             retain_start)
             except Exception as e:
                 self._record_operation(
@@ -1544,6 +1635,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         load_window_min_keys: int = DEFAULT_LOAD_WINDOW_MIN_KEYS,
         record_pool_sample: Callable[[str, int], None] | None = None,
         request_level_loads: bool = False,
+        segment_affinity_pages: int = 0,
     ):
         super().__init__(
             client,
@@ -1568,6 +1660,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             load_window_min_keys
         )
         self.client_provider = client_provider
+        self.segment_affinity_pages = _parse_segment_affinity_pages(
+            segment_affinity_pages
+        )
         self.request_level_loads = request_level_loads
         self._failed_requests: set[str] = set()
         self._invalid_block_ids_lock = threading.Lock()
@@ -1980,6 +2075,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 tuple[object, int, int, Sequence[int]]
             ] = []
             key_list: list[bytes] = []
+            route_key_list: list[bytes] | None = (
+                [] if self.segment_affinity_pages else None
+            )
             block_id_list: list[int] = []
             for g_idx, db, start, end, key, chunk_idx, logical_block_ids in (
                 self._load_chunks(req_meta)
@@ -1991,6 +2089,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         f"chunk={chunk_idx} block_id={block_id}"
                     )
                 key_list.append(key.to_bytes())
+                if route_key_list is not None:
+                    route_key_list.append(_segment_anchor_key(
+                        db, start, key, req_meta.block_hashes,
+                        self.segment_affinity_pages,
+                    ).to_bytes())
                 descriptor_chunks.append((db, start, end, logical_block_ids))
                 block_id_list.append(block_id)
 
@@ -2009,6 +2112,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 req_id, req_meta.block_hashes, self.tp_rank, len(key_list)
             )
             rotated_keys = _rotate_list(key_list, rotation)
+            rotated_route_keys = (
+                None if route_key_list is None
+                else _rotate_list(route_key_list, rotation)
+            )
             rotated_chunks = _rotate_list(descriptor_chunks, rotation)
             rotated_block_ids = _rotate_list(block_id_list, rotation)
             descriptor_batch = SgDescriptorBatch.from_chunks(rotated_chunks)
@@ -2046,6 +2153,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         descriptor_batch.caps,
                         self.load_window_keys,
                         self.load_window_min_keys,
+                        rotated_route_keys,
                     )
                 if len(hits) != len(rotated_keys) or len(lens) != len(rotated_keys):
                     raise RuntimeError(
@@ -2136,7 +2244,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     if hits[i] == 1 and lens[i] < chunk_totals[i]
                 ]
                 if stale:
-                    self._schedule_stale_removal(client, stale)
+                    stale_routes = None
+                    if rotated_route_keys is not None:
+                        stale_routes = [
+                            rotated_route_keys[i]
+                            for i in failed_indices
+                            if hits[i] == 1 and lens[i] < chunk_totals[i]
+                        ]
+                    self._schedule_stale_removal(
+                        client, stale, stale_routes
+                    )
 
         except Exception as e:
             # Any unexpected failure in the load path -> recompute this
@@ -2150,8 +2267,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             (req_meta.req_id,), wait=False, fail_closed=True
         )
 
-    def _schedule_stale_removal(self, client: Any, keys: list[bytes]) -> None:
-        """Hand ``keys`` to the background remover; never blocks the load."""
+    def _schedule_stale_removal(
+        self, client: Any, keys: list[bytes],
+        route_keys: list[bytes] | None = None,
+    ) -> None:
+        """Hand aligned keys/anchors to the remover without blocking the load."""
         with self._stale_remover_lock:
             if self._pool_stop_started:
                 return
@@ -2159,7 +2279,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 self._stale_remover = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="dfkv-stale-remove"
                 )
-            self._stale_remover.submit(self._remove_stale, client, keys)
+            self._stale_remover.submit(
+                self._remove_stale, client, keys, route_keys
+            )
 
     def _shutdown_stale_remover(self) -> None:
         # Queued removes are dropped; one already in the native client is
@@ -2169,7 +2291,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         if remover is not None:
             remover.shutdown(wait=True, cancel_futures=True)
 
-    def _remove_stale(self, client: Any, keys: list[bytes]) -> None:
+    def _remove_stale(
+        self, client: Any, keys: list[bytes],
+        route_keys: list[bytes] | None = None,
+    ) -> None:
         """Remove objects found under their key shorter than this layout's.
 
         The namespace binds the cache geometry, so a shorter object under a
@@ -2190,7 +2315,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     status="unsupported", num_failed_keys=len(keys),
                 )
                 return
-            removed = client.batch_remove(keys)
+            if route_keys is None:
+                removed = client.batch_remove(keys)
+            else:
+                removed = client.batch_remove(keys, route_keys=route_keys)
             not_removed = sum(1 for rc in removed if rc != 1)
         except Exception as e:
             # Best effort: the object is only left in place.
@@ -2302,6 +2430,9 @@ class DfkvStoreWorker:
                 "load_window_min_keys",
                 DEFAULT_LOAD_WINDOW_MIN_KEYS,
             )
+        )
+        self.segment_affinity_pages = _parse_segment_affinity_pages(
+            extra.get("segment_affinity_pages", 0)
         )
         logger.info(
             "dfkv transfer queues: capacity=%d per direction, recv_workers=%d, "
@@ -2551,6 +2682,7 @@ class DfkvStoreWorker:
             cache_role=str(self.kv_role),
             require_rdma=_tcfg.truthy(extra.get("require_rdma", True)),
             tp_rank=self.tp_rank,
+            segment_affinity=self.segment_affinity_pages > 0,
         )
         # Converged replicated layouts enable native same-host GPU rendezvous:
         # one TP rank performs each remote GET and CUDA IPC publishes identical
@@ -2870,6 +3002,9 @@ class DfkvStoreWorker:
                     self, "transfer_queue_capacity", DEFAULT_TRANSFER_QUEUE_CAPACITY
                 ),
                 tp_sharded_groups=self._tp_sharded_groups,
+                segment_affinity_pages=getattr(
+                    self, "segment_affinity_pages", 0
+                ),
             )
             if self.client_ranks < self.tp_size:
                 # Converged mode: re-stripe stores over the participant set.
@@ -2904,6 +3039,9 @@ class DfkvStoreWorker:
                 DEFAULT_LOAD_WINDOW_MIN_KEYS,
             ),
             request_level_loads=self.request_level_loads,
+            segment_affinity_pages=getattr(
+                self, "segment_affinity_pages", 0
+            ),
         )
         self.kv_recv_thread.start()
         ready_event_recving.wait()
@@ -3144,13 +3282,23 @@ class DfkvStoreWorker:
         the whole-prefix precheck finds an owner node short of headroom.
         """
         first_candidate_keys: list[bytes] | None = None
+        first_candidate_routes: list[bytes] | None = None
+        affinity_pages = getattr(self, "segment_affinity_pages", 0)
 
-        def probe(candidate_keys: list[bytes], num_logical_keys: int) -> list[int] | None:
+        def probe(
+            candidate_keys: list[bytes], num_logical_keys: int,
+            route_keys: list[bytes] | None = None,
+        ) -> list[int] | None:
             """Per-key presence (1/0) under a retention REFRESH; None on error."""
             lookup_start = time.perf_counter()
             try:
-                codes = self.client.batch_retain(
-                    candidate_keys, 0, dfkv_cabi.DFKV_RETAIN_REFRESH)
+                if route_keys is None:
+                    codes = self.client.batch_retain(
+                        candidate_keys, 0, dfkv_cabi.DFKV_RETAIN_REFRESH)
+                else:
+                    codes = self.client.batch_retain(
+                        candidate_keys, 0, dfkv_cabi.DFKV_RETAIN_REFRESH,
+                        route_keys=route_keys)
                 res = [1 if c in dfkv_cabi.RETAIN_HIT_CODES else 0
                        for c in codes]
                 if len(res) != len(candidate_keys):
@@ -3183,10 +3331,15 @@ class DfkvStoreWorker:
         # what longer ones found instead of probing (and building the keys of)
         # the whole prefix again.
         presence: dict[tuple[int, int, int, int, int], int] = {}
+        object_anchors: dict[tuple[int, int, int, int, int], bytes] = {}
 
         def probe_into(objects: dict, num_logical_keys: int) -> bool:
             """Probe ``objects`` (object -> key) and record their presence."""
-            res = probe(list(objects.values()), num_logical_keys)
+            routes = (
+                [object_anchors[physical] for physical in objects]
+                if affinity_pages else None
+            )
+            res = probe(list(objects.values()), num_logical_keys, routes)
             if res is None:
                 return False
             presence.update(zip(objects, res, strict=True))
@@ -3227,6 +3380,19 @@ class DfkvStoreWorker:
                 ))
             return parts[0] + pool_key_hash_field(h.hex()) + parts[1]
 
+        def object_anchor_key(
+            g_idx: int, chunk_id: int, current_key: bytes,
+            tp: int, pcp: int, dcp: int,
+        ) -> bytes:
+            first = chunk_id // affinity_pages * affinity_pages
+            if first == chunk_id:
+                # This also preserves a boundary/partial object's actual key.
+                return current_key
+            first_hash = self.token_dbs[g_idx].chunk_hash(
+                first, block_hashes
+            )
+            return object_key(g_idx, first_hash, tp, pcp, dcp)
+
         def prefetch_moving_groups(candidate: int, hit: int) -> bool:
             """After a failed candidate: probe, in one call, every chunk below
             ``hit`` of the groups whose load mask moves with the candidate
@@ -3252,11 +3418,16 @@ class DfkvStoreWorker:
                     for tp, pcp, dcp in namespaces:
                         physical = (g_idx, chunk_id, tp, pcp, dcp)
                         if physical not in presence and physical not in pending:
-                            pending[physical] = object_key(g_idx, h, tp, pcp, dcp)
+                            key = object_key(g_idx, h, tp, pcp, dcp)
+                            pending[physical] = key
+                            if affinity_pages:
+                                object_anchors[physical] = object_anchor_key(
+                                    g_idx, chunk_id, key, tp, pcp, dcp
+                                )
             return not pending or probe_into(pending, len(pending))
 
         def lookup_candidate(token_len: int) -> int:
-            nonlocal first_candidate_keys
+            nonlocal first_candidate_keys, first_candidate_routes
             """Check how many prefix tokens exist in the store.
 
             Checks across all TP ranks at this worker's own PP rank.
@@ -3309,7 +3480,12 @@ class DfkvStoreWorker:
                         candidate_objects.append(physical)
                         candidate_meta.append(object_meta)
                         if physical not in presence and physical not in unknown:
-                            unknown[physical] = object_key(g_idx, h, tp, pcp, dcp)
+                            key = object_key(g_idx, h, tp, pcp, dcp)
+                            unknown[physical] = key
+                            if affinity_pages:
+                                object_anchors[physical] = object_anchor_key(
+                                    g_idx, chunk_id, key, tp, pcp, dcp
+                                )
                 # A truncated hash vector is malformed metadata. Mark only its
                 # ungenerated required suffix chunks incomplete; the normal path
                 # has no second full mask scan.
@@ -3327,6 +3503,10 @@ class DfkvStoreWorker:
                 return 0
             if first_candidate_keys is None:
                 first_candidate_keys = list(unknown.values())
+                if affinity_pages:
+                    first_candidate_routes = [
+                        object_anchors[physical] for physical in unknown
+                    ]
             if unknown and not probe_into(unknown, len(expected_per_object)):
                 return 0
             res = [presence[physical] for physical in candidate_objects]
@@ -3408,15 +3588,18 @@ class DfkvStoreWorker:
                 for g in attention_groups
             }
             exists: set[tuple[int, bytes]] = set()
-            probed: set[tuple[int, BlockHash]] = set()
+            probed: set[tuple[int, int, BlockHash]] = set()
 
-            def probe_objects(objects: list[tuple[int, BlockHash]]) -> bool:
-                nonlocal first_candidate_keys
+            def probe_objects(
+                objects: list[tuple[int, int, BlockHash]],
+            ) -> bool:
+                nonlocal first_candidate_keys, first_candidate_routes
                 objects = [o for o in dict.fromkeys(objects) if o not in probed]
                 probed.update(objects)
                 keys: list[bytes] = []
+                routes: list[bytes] | None = [] if affinity_pages else None
                 owners: list[tuple[int, BlockHash]] = []
-                for g_idx, h in objects:
+                for g_idx, chunk_id, h in objects:
                     db = self.token_dbs[g_idx]
                     for tp, pcp, dcp in _key_namespaces(
                         tp_size=self.tp_size,
@@ -3428,35 +3611,46 @@ class DfkvStoreWorker:
                         dcp_group_ranks=getattr(self, "_dcp_group_ranks", None),
                         dcp_global_rank_base=getattr(self, "_dcp_global_rank_base", 0),
                     ):
-                        keys.append(object_key(g_idx, h, tp, pcp, dcp))
+                        key = object_key(g_idx, h, tp, pcp, dcp)
+                        keys.append(key)
+                        if routes is not None:
+                            routes.append(object_anchor_key(
+                                g_idx, chunk_id, key, tp, pcp, dcp
+                            ))
                         owners.append((g_idx, h))
                 if not keys:
                     return True
                 if first_candidate_keys is None:
                     first_candidate_keys = keys
-                res = probe(keys, len(objects))
+                    first_candidate_routes = (
+                        None if routes is None else list(routes)
+                    )
+                res = probe(keys, len(objects), routes)
                 if res is None:
                     return False
                 missing = {o for o, present in zip(owners, res, strict=True)
                            if present != 1}
                 exists.update(
-                    (g_idx, bytes(h)) for g_idx, h in objects
+                    (g_idx, bytes(h)) for g_idx, _chunk_id, h in objects
                     if (g_idx, h) not in missing
                 )
                 return True
 
             def candidates(full_blocks: dict[int, int], *, with_full: bool):
-                objects: list[tuple[int, BlockHash]] = []
+                objects: list[tuple[int, int, BlockHash]] = []
                 boundaries: set[int] = set()
                 for g in attention_groups:
                     if with_full:
                         objects.extend(
-                            (g, views[g][i]) for i in range(full_blocks[g])
+                            (g, i, views[g][i]) for i in range(full_blocks[g])
                         )
                     start = full_blocks[g] * block_sizes[g]
                     end = min(start + block_sizes[g], token_len + 1)
                     for c in range(start + hbs, end, hbs):
-                        objects.append((g, block_hashes[c // hbs - 1]))
+                        objects.append((
+                            g, (c - 1) // block_sizes[g],
+                            block_hashes[c // hbs - 1],
+                        ))
                         boundaries.add(c)
                 if with_full:
                     whole = min(
@@ -3465,7 +3659,10 @@ class DfkvStoreWorker:
                     )
                     boundaries.update(range(lcm, whole // lcm * lcm + 1, lcm))
                 objects.extend(
-                    (g, block_hashes[c // hbs - 1])
+                    (
+                        g, (c - 1) // block_sizes[g],
+                        block_hashes[c // hbs - 1],
+                    )
                     for g in state_groups for c in sorted(boundaries)
                 )
                 return objects
@@ -3513,7 +3710,16 @@ class DfkvStoreWorker:
                     return 0
                 # Decision 9: one owner short of headroom downgrades the whole
                 # request to best-effort rather than protecting a holed prefix.
-                if not self.client.retain_precheck(first_candidate_keys):
+                if first_candidate_routes is None:
+                    precheck_ok = self.client.retain_precheck(
+                        first_candidate_keys
+                    )
+                else:
+                    precheck_ok = self.client.retain_precheck(
+                        first_candidate_keys,
+                        route_keys=first_candidate_routes,
+                    )
+                if not precheck_ok:
                     return 0
                 return min(retain_ttl_s, max_ttl)
             except Exception as e:  # never fail a lookup over retention

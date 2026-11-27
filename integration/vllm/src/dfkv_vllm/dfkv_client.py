@@ -13,7 +13,7 @@ from dfkv_common import cabi as dfkv_cabi
 
 from dfkv_common.block_size import get_max_block_bytes, validate_object_sizes
 
-from ._cabi import load_lib, native_version
+from ._cabi import bind_anchored, load_lib, native_version
 from .client_stats import ClientStatsPoller, read_snapshot
 from . import access_log as _alog
 from .access_log import access_log
@@ -338,6 +338,7 @@ class DfkvDeviceClient:
         cache_role: str = "",
         require_rdma: bool = True,
         tp_rank: Optional[int] = None,
+        segment_affinity: bool = False,
     ):
         if not key_namespace:
             raise ValueError("DfkvDeviceClient requires a non-empty key namespace")
@@ -354,6 +355,14 @@ class DfkvDeviceClient:
         self._telemetry_acquired = False
         self._hot_config_acquired = False
         self._lib = load_lib(lib_path)
+        self._segment_affinity = bool(segment_affinity)
+        missing_anchored = bind_anchored(self._lib)
+        missing_anchored += dfkv_cabi.bind_anchored_retain(self._lib)
+        if self._segment_affinity and missing_anchored:
+            raise RuntimeError(
+                "segment_affinity_pages requires the complete anchored dfkv "
+                "C ABI; missing symbols: " + ", ".join(missing_anchored)
+            )
         self._has_retain = dfkv_cabi.bind_retain(self._lib)
         # ABI v2 constructs one fully configured handle: static membership or
         # MDS discovery, batch fan-out, and optional client registration become
@@ -480,8 +489,22 @@ class DfkvDeviceClient:
                     f"dfkv_register_memory(base={base:#x}, size={size}) rc={rc}"
                 )
 
+    def _route_key_array(self, keys, route_keys):
+        """Marshall optional anchors without allocating on the legacy path."""
+        if route_keys is None:
+            if getattr(self, "_segment_affinity", False):
+                raise RuntimeError(
+                    "segment affinity requires an absolute-segment route key "
+                    "for every object key"
+                )
+            return None
+        if len(route_keys) != len(keys):
+            raise ValueError("route_keys must have one entry per key")
+        return dfkv_cabi.make_route_key_array(route_keys)
+
     def batch_put(
-        self, keys: Sequence[bytes], ptrs: Sequence[int], sizes: Sequence[int]
+        self, keys: Sequence[bytes], ptrs: Sequence[int], sizes: Sequence[int],
+        *, route_keys: Sequence[bytes] | None = None,
     ) -> list:
         """Store ``keys[i]`` from buffer ``ptrs[i]`` (device or host) of
         ``sizes[i]`` bytes. Returns per-key status (``0`` = ok, ``1`` = failed).
@@ -502,8 +525,15 @@ class DfkvDeviceClient:
             parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
             sarr = (c_uint64 * n)(*sizes)
             out = (c_int * n)()
-            rc = self._lib.dfkv_batch_put(
-                self._h, karr, klens, parr, sarr, n, out)
+            routed = self._route_key_array(keys, route_keys)
+            if routed is None:
+                rc = self._lib.dfkv_batch_put(
+                    self._h, karr, klens, parr, sarr, n, out)
+            else:
+                rarr, rlens, rowners = routed
+                rc = self._lib.dfkv_batch_put_anchored(
+                    self._h, karr, klens, rarr, rlens, parr, sarr, n, out)
+                del rowners
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_put rc={rc}")
             res = [0 if ok == 1 else 1 for ok in out]
@@ -515,7 +545,8 @@ class DfkvDeviceClient:
             return res
 
     def batch_get(
-        self, keys: Sequence[bytes], ptrs: Sequence[int], caps: Sequence[int]
+        self, keys: Sequence[bytes], ptrs: Sequence[int], caps: Sequence[int],
+        *, route_keys: Sequence[bytes] | None = None,
     ):
         """Load ``keys[i]`` into buffer ``ptrs[i]`` (device or host, capacity
         ``caps[i]``). Returns ``(hits, lengths)``: ``hits[i]`` is 1 on hit, 0 on
@@ -529,9 +560,18 @@ class DfkvDeviceClient:
             carr = (c_uint64 * n)(*caps)
             out_hit = (c_int * n)()
             out_len = (c_uint64 * n)()
-            rc = self._lib.dfkv_batch_get_auto(
-                self._h, karr, klens, parr, carr, n, out_hit, out_len
-            )
+            routed = self._route_key_array(keys, route_keys)
+            if routed is None:
+                rc = self._lib.dfkv_batch_get_auto(
+                    self._h, karr, klens, parr, carr, n, out_hit, out_len
+                )
+            else:
+                rarr, rlens, rowners = routed
+                rc = self._lib.dfkv_batch_get_auto_anchored(
+                    self._h, karr, klens, rarr, rlens, parr, carr, n,
+                    out_hit, out_len,
+                )
+                del rowners
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_get_auto rc={rc}")
             hits, lens = list(out_hit), list(out_len)
@@ -549,6 +589,8 @@ class DfkvDeviceClient:
         keys: Sequence[bytes],
         seg_ptrs: Sequence[Sequence[int]],
         seg_sizes: Sequence[Sequence[int]],
+        *,
+        route_keys: Sequence[bytes] | None = None,
     ) -> list:
         """Store each key as the in-order concatenation of its GPU segments.
 
@@ -601,8 +643,17 @@ class DfkvDeviceClient:
                 sarr = prebuilt._size_vectors
                 narr = prebuilt._count_array
             out = (c_int * n)()
-            rc = self._lib.dfkv_batch_put_sg(
-                self._h, karr, klens, parr, sarr, narr, n, out)
+            routed = self._route_key_array(keys, route_keys)
+            if routed is None:
+                rc = self._lib.dfkv_batch_put_sg(
+                    self._h, karr, klens, parr, sarr, narr, n, out)
+            else:
+                rarr, rlens, rowners = routed
+                rc = self._lib.dfkv_batch_put_sg_anchored(
+                    self._h, karr, klens, rarr, rlens, parr, sarr, narr,
+                    n, out,
+                )
+                del rowners
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_put_sg rc={rc}")
             res = [0 if ok == 1 else 1 for ok in out]
@@ -618,6 +669,8 @@ class DfkvDeviceClient:
         keys: Sequence[bytes],
         seg_ptrs: Sequence[Sequence[int]],
         seg_caps: Sequence[Sequence[int]],
+        *,
+        route_keys: Sequence[bytes] | None = None,
     ):
         """Scatter each stored object in order across its destination segments.
 
@@ -666,9 +719,19 @@ class DfkvDeviceClient:
                 narr = prebuilt._count_array
             out_hit = (c_int * n)()
             out_len = (c_uint64 * n)()
-            rc = self._lib.dfkv_batch_get_auto_sg(
-                self._h, karr, klens, parr, carr, narr, n, out_hit, out_len
-            )
+            routed = self._route_key_array(keys, route_keys)
+            if routed is None:
+                rc = self._lib.dfkv_batch_get_auto_sg(
+                    self._h, karr, klens, parr, carr, narr, n,
+                    out_hit, out_len,
+                )
+            else:
+                rarr, rlens, rowners = routed
+                rc = self._lib.dfkv_batch_get_auto_sg_anchored(
+                    self._h, karr, klens, rarr, rlens, parr, carr, narr,
+                    n, out_hit, out_len,
+                )
+                del rowners
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_get_auto_sg rc={rc}")
             hits, lens = list(out_hit), list(out_len)
@@ -681,7 +744,8 @@ class DfkvDeviceClient:
             del key_owners
             return hits, lens
 
-    def batch_exist(self, keys: Sequence[bytes]) -> list:
+    def batch_exist(self, keys: Sequence[bytes], *,
+                    route_keys: Sequence[bytes] | None = None) -> list:
         """Return ``[1|0]`` per key (1 = present in the cache)."""
         n = len(keys)
         with _push_metrics.op("exist", num_keys=n), \
@@ -689,8 +753,15 @@ class DfkvDeviceClient:
                 access_log("batch_exist", lambda: f"{n} keys") as r:
             karr, klens, key_owners = make_key_array(keys)
             out = (c_int * n)()
-            rc = self._lib.dfkv_batch_exist(
-                self._h, karr, klens, n, out)
+            routed = self._route_key_array(keys, route_keys)
+            if routed is None:
+                rc = self._lib.dfkv_batch_exist(
+                    self._h, karr, klens, n, out)
+            else:
+                rarr, rlens, rowners = routed
+                rc = self._lib.dfkv_batch_exist_anchored(
+                    self._h, karr, klens, rarr, rlens, n, out)
+                del rowners
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_exist rc={rc}")
             res = list(out)
@@ -705,13 +776,22 @@ class DfkvDeviceClient:
         """True iff the loaded libdfkv.so has the remove RPC."""
         return hasattr(self._lib, "dfkv_batch_remove")
 
-    def batch_remove(self, keys: Sequence[bytes]) -> list:
+    def batch_remove(self, keys: Sequence[bytes], *,
+                     route_keys: Sequence[bytes] | None = None) -> list:
         """Remove ``keys``; ``[1|0]`` per key (1 = removed)."""
         n = len(keys)
         with access_log("batch_remove", lambda: f"{n} keys") as r:
             karr, klens, key_owners = make_key_array(keys)
             out = (c_int * n)()
-            rc = self._lib.dfkv_batch_remove(self._h, karr, klens, n, out)
+            routed = self._route_key_array(keys, route_keys)
+            if routed is None:
+                rc = self._lib.dfkv_batch_remove(
+                    self._h, karr, klens, n, out)
+            else:
+                rarr, rlens, rowners = routed
+                rc = self._lib.dfkv_batch_remove_anchored(
+                    self._h, karr, klens, rarr, rlens, n, out)
+                del rowners
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_remove rc={rc}")
             res = list(out)
@@ -725,20 +805,30 @@ class DfkvDeviceClient:
         return self._has_retain
 
     def batch_retain(self, keys: Sequence[bytes], ttl_s: int, mode: int,
-                     *, flags: int = 0, min_refresh_ms: int = 0) -> list:
+                     *, flags: int = 0, min_refresh_ms: int = 0,
+                     route_keys: Sequence[bytes] | None = None) -> list:
         """Return one DFKV_RET_* code per key.
 
         REFRESH doubles as an existence check (hit iff the code is in
         ``RETAIN_HIT_CODES``). With an older libdfkv, REFRESH degrades to
-        ``batch_exist`` and SET reports unsupported.
+        ``batch_exist`` and SET reports unsupported. Affinity retains the same
+        route keys across that existence fallback.
         """
         n = len(keys)
         if n == 0:
             return []
+        if route_keys is not None and len(route_keys) != n:
+            raise ValueError("route_keys must have one entry per key")
+        if getattr(self, "_segment_affinity", False) and route_keys is None:
+            raise RuntimeError("segment affinity requires route_keys")
         if not self._has_retain:
             if mode == dfkv_cabi.DFKV_RETAIN_REFRESH:
+                if route_keys is None:
+                    exists = self.batch_exist(keys)
+                else:
+                    exists = self.batch_exist(keys, route_keys=route_keys)
                 return [dfkv_cabi.DFKV_RET_HIT_UNPROTECTED if e else
-                        dfkv_cabi.DFKV_RET_MISS for e in self.batch_exist(keys)]
+                        dfkv_cabi.DFKV_RET_MISS for e in exists]
             return [dfkv_cabi.DFKV_RET_UNSUPPORTED] * n
         op = "retain_refresh" if mode == dfkv_cabi.DFKV_RETAIN_REFRESH \
             else "retain_set"
@@ -748,7 +838,7 @@ class DfkvDeviceClient:
                 access_log(op, lambda: f"{n} keys ttl={ttl_s}") as r:
             res = dfkv_cabi.call_batch_retain(
                 self._lib, self._h, keys, ttl_s, mode, flags=flags,
-                min_refresh_ms=min_refresh_ms)
+                min_refresh_ms=min_refresh_ms, route_keys=route_keys)
             hits = sum(1 for c in res if c in dfkv_cabi.RETAIN_HIT_CODES)
             r.result = f"hits={hits}/{n}"
             if _sp:
@@ -762,11 +852,15 @@ class DfkvDeviceClient:
         return dfkv_cabi.call_retain_limits(self._lib, self._h)
 
     def retain_precheck(self, keys: Sequence[bytes],
-                        min_headroom_pct: int = 0) -> bool:
+                        min_headroom_pct: int = 0, *,
+                        route_keys: Sequence[bytes] | None = None) -> bool:
+        if getattr(self, "_segment_affinity", False) and route_keys is None:
+            raise RuntimeError("segment affinity requires route_keys")
         if not self._has_retain:
             return False
         return dfkv_cabi.call_retain_precheck(
-            self._lib, self._h, keys, min_headroom_pct)
+            self._lib, self._h, keys, min_headroom_pct,
+            route_keys=route_keys)
 
     def close(self) -> None:
         try:

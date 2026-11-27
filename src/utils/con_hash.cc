@@ -50,7 +50,16 @@ std::map<std::string, size_t> ConHash::NodePointCounts() const {
   return counts;
 }
 
-uint32_t ConHash::KeyHash(const std::string& key) { return Md5_32(key); }
+uint32_t ConHash::KeyHash(std::string_view key) {
+  uint8_t digest[16];
+  Md5(key.data(), key.size(), digest);
+  return uint32_t(digest[0]) | (uint32_t(digest[1]) << 8) |
+         (uint32_t(digest[2]) << 16) | (uint32_t(digest[3]) << 24);
+}
+
+uint32_t ConHash::KeyHash(const std::string& key) {
+  return KeyHash(std::string_view(key));
+}
 
 bool ConHash::Lookup(const std::string& key, std::string* node) const {
   return LookupHash(KeyHash(key), node);

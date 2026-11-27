@@ -204,6 +204,92 @@ int dfkv_batch_get_auto_sg(dfkv_client_t c, const void* const* keys,
                            const uint64_t** caps, const int* num_dsts, int n,
                            int* out_hit, uint64_t* out_len);
 
+// ---- Segment-affine placement (additive, opt-in) ----
+// Anchored forms take (route_keys[i], route_key_lens[i]) immediately after the
+// actual key vectors. A NULL route_keys selects the legacy actual-key routing
+// and ignores route_key_lens; a zero per-item route length falls back to that
+// item's actual key. A non-NULL route_keys requires route_key_lens; malformed
+// pointers/lengths fail only their item (DFKV_ST_BAD_ARGUMENT in *_st forms).
+// Anchor bytes affect placement only. Actual keys remain the wire identity,
+// dedup identity, read-back/remove-memory identity, reroute cleanup identity,
+// and the object removed from every selected node. Distinct actual keys are
+// never collapsed merely because their anchors match. The anchored calls have
+// the same outputs and return conventions as their unanchored counterparts.
+int dfkv_batch_put_anchored(dfkv_client_t c, const void* const* keys,
+                            const uint64_t* key_lens,
+                            const void* const* route_keys,
+                            const uint64_t* route_key_lens, const void** ptrs,
+                            const uint64_t* sizes, int n, int* out_ok);
+int dfkv_batch_put_st_anchored(dfkv_client_t c, const void* const* keys,
+                               const uint64_t* key_lens,
+                               const void* const* route_keys,
+                               const uint64_t* route_key_lens, const void** ptrs,
+                               const uint64_t* sizes, int n, int* out_ok,
+                               uint8_t* out_status);
+int dfkv_batch_get_anchored(dfkv_client_t c, const void* const* keys,
+                            const uint64_t* key_lens,
+                            const void* const* route_keys,
+                            const uint64_t* route_key_lens, void** ptrs,
+                            const uint64_t* sizes, int n, int* out_hit);
+int dfkv_batch_get_st_anchored(dfkv_client_t c, const void* const* keys,
+                               const uint64_t* key_lens,
+                               const void* const* route_keys,
+                               const uint64_t* route_key_lens, void** ptrs,
+                               const uint64_t* sizes, int n, int* out_hit,
+                               uint8_t* out_status);
+int dfkv_batch_get_auto_anchored(dfkv_client_t c, const void* const* keys,
+                                 const uint64_t* key_lens,
+                                 const void* const* route_keys,
+                                 const uint64_t* route_key_lens, void** ptrs,
+                                 const uint64_t* caps, int n, int* out_hit,
+                                 uint64_t* out_len);
+int dfkv_batch_get_auto_st_anchored(
+    dfkv_client_t c, const void* const* keys, const uint64_t* key_lens,
+    const void* const* route_keys, const uint64_t* route_key_lens, void** ptrs,
+    const uint64_t* caps, int n, int* out_hit, uint64_t* out_len,
+    uint8_t* out_status);
+int dfkv_batch_exist_anchored(dfkv_client_t c, const void* const* keys,
+                              const uint64_t* key_lens,
+                              const void* const* route_keys,
+                              const uint64_t* route_key_lens, int n,
+                              int* out_exist);
+int dfkv_batch_remove_anchored(dfkv_client_t c, const void* const* keys,
+                               const uint64_t* key_lens,
+                               const void* const* route_keys,
+                               const uint64_t* route_key_lens, int n,
+                               int* out_ok);
+int dfkv_batch_put_sg_anchored(dfkv_client_t c, const void* const* keys,
+                               const uint64_t* key_lens,
+                               const void* const* route_keys,
+                               const uint64_t* route_key_lens,
+                               const void*** ptrs, const uint64_t** sizes,
+                               const int* num_bufs, int n, int* out_ok);
+int dfkv_batch_put_sg_st_anchored(
+    dfkv_client_t c, const void* const* keys, const uint64_t* key_lens,
+    const void* const* route_keys, const uint64_t* route_key_lens,
+    const void*** ptrs, const uint64_t** sizes, const int* num_bufs, int n,
+    int* out_ok, uint8_t* out_status);
+int dfkv_batch_get_auto_sg_anchored(
+    dfkv_client_t c, const void* const* keys, const uint64_t* key_lens,
+    const void* const* route_keys, const uint64_t* route_key_lens, void*** dsts,
+    const uint64_t** caps, const int* num_dsts, int n, int* out_hit,
+    uint64_t* out_len);
+int dfkv_batch_get_auto_sg_st_anchored(
+    dfkv_client_t c, const void* const* keys, const uint64_t* key_lens,
+    const void* const* route_keys, const uint64_t* route_key_lens, void*** dsts,
+    const uint64_t** caps, const int* num_dsts, int n, int* out_hit,
+    uint64_t* out_len, uint8_t* out_status);
+int dfkv_batch_retain_anchored(dfkv_client_t c, const void* const* keys,
+                               const uint64_t* key_lens,
+                               const void* const* route_keys,
+                               const uint64_t* route_key_lens, int n,
+                               const dfkv_retain_options* opt,
+                               uint8_t* out_result);
+int dfkv_retain_precheck_anchored(
+    dfkv_client_t c, const void* const* keys, const uint64_t* key_lens,
+    const void* const* route_keys, const uint64_t* route_key_lens, int n,
+    uint8_t min_headroom_pct, int* ok);
+
 // Client-side Prometheus metrics snapshot. Every public scalar/batch call is
 // counted exactly once with its submitted key count, including early failures
 // and rendezvous-served hits. Writes up to `cap` bytes (NUL-terminated when it

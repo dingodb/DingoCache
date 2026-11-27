@@ -66,6 +66,33 @@ def make_key_array(
     return key_array, length_array, [buffer]
 
 
+def make_route_key_array(
+    keys: Sequence[bytes],
+) -> tuple[Any, Any, list[Any]]:
+    """Build route vectors, allowing an individual empty native fallback.
+
+    Unlike object keys, a zero-length route key is valid and tells libdfkv to
+    route by the corresponding object key. Give such entries a null pointer;
+    non-empty routes retain exact bytes in one shared backing allocation.
+    """
+    for key in keys:
+        if not isinstance(key, bytes):
+            raise TypeError("dfkv route key must be bytes")
+    lengths = [len(key) for key in keys]
+    blob = b"".join(keys)
+    buffer = ctypes.create_string_buffer(blob, len(blob) + 1)
+    base = ctypes.addressof(buffer)
+    offsets = itertools.accumulate(lengths, initial=0)
+    key_array = (ctypes.c_void_p * len(lengths))(
+        *[
+            base + offset if length else 0
+            for length, offset in zip(lengths, offsets)
+        ]
+    )
+    length_array = (ctypes.c_uint64 * len(lengths))(*lengths)
+    return key_array, length_array, [buffer]
+
+
 def make_client_options_v2(
     key_namespace: bytes,
     *,
@@ -210,10 +237,48 @@ def bind_retain(lib: Any) -> bool:
     return True
 
 
+ANCHORED_RETAIN_SYMBOLS = (
+    "dfkv_batch_retain_anchored",
+    "dfkv_retain_precheck_anchored",
+)
+
+
+def bind_anchored_retain(lib: Any) -> list[str]:
+    """Bind optional anchored retention calls; never require them for legacy use."""
+    missing = []
+    key_args = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint64),
+    ]
+    try:
+        batch_retain = lib.dfkv_batch_retain_anchored
+    except AttributeError:
+        missing.append("dfkv_batch_retain_anchored")
+    else:
+        batch_retain.restype = ctypes.c_int
+        batch_retain.argtypes = [
+            *key_args, ctypes.c_int, ctypes.POINTER(DfkvRetainOptions),
+            ctypes.POINTER(ctypes.c_uint8),
+        ]
+    try:
+        precheck = lib.dfkv_retain_precheck_anchored
+    except AttributeError:
+        missing.append("dfkv_retain_precheck_anchored")
+    else:
+        precheck.restype = ctypes.c_int
+        precheck.argtypes = [
+            *key_args, ctypes.c_int, ctypes.c_uint8,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+    return missing
+
+
 def call_batch_retain(lib: Any, handle: Any, keys: Sequence[bytes],
                       ttl_s: int, mode: int, *, flags: int = 0,
-                      min_refresh_ms: int = 0) -> list[int]:
-    """Run ``dfkv_batch_retain`` and return one result code per key."""
+                      min_refresh_ms: int = 0,
+                      route_keys: Sequence[bytes] | None = None) -> list[int]:
+    """Run batch RETAIN, optionally with independent per-object route keys."""
     n = len(keys)
     if n == 0:
         return []
@@ -221,8 +286,17 @@ def call_batch_retain(lib: Any, handle: Any, keys: Sequence[bytes],
     out = (ctypes.c_uint8 * n)()
     options = make_retain_options(
         ttl_s, mode, flags=flags, min_refresh_ms=min_refresh_ms)
-    rc = lib.dfkv_batch_retain(
-        handle, key_array, length_array, n, ctypes.byref(options), out)
+    if route_keys is None:
+        rc = lib.dfkv_batch_retain(
+            handle, key_array, length_array, n, ctypes.byref(options), out)
+    else:
+        if len(route_keys) != n:
+            raise ValueError("route_keys must have one entry per key")
+        route_array, route_lens, route_owners = make_route_key_array(route_keys)
+        rc = lib.dfkv_batch_retain_anchored(
+            handle, key_array, length_array, route_array, route_lens, n,
+            ctypes.byref(options), out)
+        del route_owners
     del owners
     if rc != 0:
         raise RuntimeError(f"dfkv_batch_retain rc={rc}")
@@ -240,14 +314,24 @@ def call_retain_limits(lib: Any, handle: Any) -> tuple[int, int]:
 
 
 def call_retain_precheck(lib: Any, handle: Any, keys: Sequence[bytes],
-                         min_headroom_pct: int = 0) -> bool:
+                         min_headroom_pct: int = 0, *,
+                         route_keys: Sequence[bytes] | None = None) -> bool:
     n = len(keys)
     if n == 0:
         return True
     key_array, length_array, owners = make_key_array(keys)
     ok = ctypes.c_int(0)
-    rc = lib.dfkv_retain_precheck(
-        handle, key_array, length_array, n, int(min_headroom_pct),
-        ctypes.byref(ok))
+    if route_keys is None:
+        rc = lib.dfkv_retain_precheck(
+            handle, key_array, length_array, n, int(min_headroom_pct),
+            ctypes.byref(ok))
+    else:
+        if len(route_keys) != n:
+            raise ValueError("route_keys must have one entry per key")
+        route_array, route_lens, route_owners = make_route_key_array(route_keys)
+        rc = lib.dfkv_retain_precheck_anchored(
+            handle, key_array, length_array, route_array, route_lens, n,
+            int(min_headroom_pct), ctypes.byref(ok))
+        del route_owners
     del owners
     return rc == 0 and ok.value == 1
