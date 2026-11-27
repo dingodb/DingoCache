@@ -294,6 +294,10 @@ if(DFKV_BUILD_TESTS)
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_plugin PROPERTIES
       ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so;DFKV_STORE_ENGINE=file;DFKV_SLAB_WRITE=buffered;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_replay_trace_validation
+      COMMAND ${PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test/python/run_sto18_replay_trace_validation.py
+              ${CMAKE_BINARY_DIR}/replay_trace_test
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME python_client_metrics
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/integration/common/tests

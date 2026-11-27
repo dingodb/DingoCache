@@ -226,7 +226,7 @@ TEST(ReplayTrace, PublicBatchesEmitAlignedStructuredEvidence) {
   EXPECT_FALSE(auto_get[2]);
   EXPECT_EQ(lengths[0], 3u);
   EXPECT_EQ(lengths[1], 0u);
-  EXPECT_EQ(statuses[1], ItemStatus::kLengthMismatch);
+  EXPECT_EQ(statuses[1], ItemStatus::kInvalid);
 
   // Enabled observation must allocate its own aligned result arrays when the
   // caller asks for none, without changing the public return values.
@@ -329,7 +329,7 @@ TEST(ReplayTrace, PublicBatchesEmitAlignedStructuredEvidence) {
   EXPECT_EQ(auto_items[0].get_str("stored_length_semantics"),
             "actual_stored_length");
   EXPECT_EQ(auto_items[1].find("stored_length")->type, JsonValue::kNull);
-  EXPECT_EQ(auto_items[1].get_str("status"), "DFKV_ST_LENGTH_MISMATCH");
+  EXPECT_EQ(auto_items[1].get_str("status"), "DFKV_ST_INVALID");
   EXPECT_EQ(auto_items[2].find("stored_length")->type, JsonValue::kNull);
 
   const JsonValue* exist_record = At(records, 0, "batch_io", "exist");
