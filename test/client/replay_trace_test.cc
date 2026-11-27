@@ -302,9 +302,9 @@ TEST(ReplayTrace, PublicBatchesEmitAlignedStructuredEvidence) {
       EXPECT_EQ(identity.find_first_not_of("0123456789abcdef"), std::string::npos);
     }
   }
-  EXPECT_EQ(operations["put"], 3);  // contiguous, null-status contiguous, and SG
+  EXPECT_EQ(operations["put"], 4);  // contiguous/SG, with and without status
   EXPECT_EQ(operations["get"], 2);
-  EXPECT_EQ(operations["get_auto"], 3);
+  EXPECT_EQ(operations["get_auto"], 4);
   EXPECT_EQ(operations["exist"], 1);
   EXPECT_EQ(operations["retain"], 1);
   EXPECT_EQ(operations["remove"], 1);
@@ -342,14 +342,14 @@ TEST(ReplayTrace, PublicBatchesEmitAlignedStructuredEvidence) {
   EXPECT_EQ(retain_record->find("items")->arr[0].get_str("retain_result"),
             "DFKV_RET_REFRESHED");
 
-  const JsonValue* sg_put_record = At(records, 1, "batch_io", "put");
+  const JsonValue* sg_put_record = At(records, 2, "batch_io", "put");
   EXPECT_EQ(sg_put_record->get_str("payload_form"), "scatter_gather");
   const auto& sg_put_items = sg_put_record->find("items")->arr;
   EXPECT_EQ(sg_put_items[0].find("payload")->get_str("kind"),
             "scatter_gather_put");
   EXPECT_EQ(Number(sg_put_items[0], "requested_length"), 3u);
   EXPECT_EQ(sg_put_items[1].get_str("status"), "DFKV_ST_BAD_ARGUMENT");
-  const JsonValue* sg_get_record = At(records, 1, "batch_io", "get_auto");
+  const JsonValue* sg_get_record = At(records, 2, "batch_io", "get_auto");
   const auto& sg_get_items = sg_get_record->find("items")->arr;
   EXPECT_EQ(sg_get_items[0].find("payload")->get_str("kind"),
             "scatter_gather_get");
@@ -359,8 +359,8 @@ TEST(ReplayTrace, PublicBatchesEmitAlignedStructuredEvidence) {
   EXPECT_GT(Number(records.back(), "capture_end_epoch_ns"), 0u);
   EXPECT_GE(Number(records.back(), "capture_end_monotonic_ns"),
             Number(records.back(), "capture_start_monotonic_ns"));
-  const JsonValue* null_put = At(records, 2, "batch_io", "put");
-  const JsonValue* null_auto = At(records, 2, "batch_io", "get_auto");
+  const JsonValue* null_put = At(records, 1, "batch_io", "put");
+  const JsonValue* null_auto = At(records, 1, "batch_io", "get_auto");
   ASSERT_NE(null_put, nullptr);
   ASSERT_NE(null_auto, nullptr);
   EXPECT_EQ(null_put->find("items")->arr[0].get_str("status"), "DFKV_ST_OK");
@@ -439,6 +439,8 @@ TEST(ReplayTrace, WriteFailureProducesDropAndErrorEndMarkers) {
   const auto records = Read(paths);
   const JsonValue* drop = At(records, 0, "drop");
   ASSERT_NE(drop, nullptr);
+  EXPECT_EQ(Number(*drop, "dropped_sequence_begin"), 1u);
+  EXPECT_EQ(Number(*drop, "dropped_sequence_end"), 1u);
   EXPECT_EQ(Number(*drop, "dropped_count"), 1u);
   EXPECT_EQ(Number(*drop, "expected_dropped_count"), 1u);
   EXPECT_EQ(Number(records.back(), "dropped_record_count"), 1u);

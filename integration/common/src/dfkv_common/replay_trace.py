@@ -539,13 +539,13 @@ def _validate_batch(record, errors):
                 errors.append("missing_sg_payload_form")
             _validate_segment_payload(
                 operation, payload, requested if operation == "put" else capacity, errors)
-        elif "payload_form" in record and record["payload_form"] == "scatter_gather":
+        elif "payload_form" in record:
             errors.append("unexpected_sg_payload_form")
         if any(key in item for key in ("pointer", "payload_bytes", "route_key", "value")):
             errors.append("unsafe_item_field")
     if saw_sg and record.get("payload_form") != "scatter_gather":
         errors.append("missing_sg_payload_form")
-    if not saw_sg and record.get("payload_form") == "scatter_gather":
+    if not saw_sg and "payload_form" in record:
         errors.append("unexpected_sg_payload_form")
     if indices != list(range(expected)):
         errors.append("original_item_order_broken")
@@ -655,6 +655,13 @@ def _validate_prefix(record, errors):
             errors.append("original_native_order_broken")
     if indices != list(range(expected)):
         errors.append("original_page_order_broken")
+    if (record.get("probe_operation") == "retain_refresh" and
+            isinstance(refresh, dict) and _is_bool(refresh.get("attempted"))):
+        has_native_items = any(
+            isinstance(page, dict) and isinstance(page.get("native_items"), list) and
+            bool(page["native_items"]) for page in pages)
+        if refresh["attempted"] is not has_native_items:
+            errors.append("retain_attempt_native_items_mismatch")
 
 
 def validate_replay_trace(paths):

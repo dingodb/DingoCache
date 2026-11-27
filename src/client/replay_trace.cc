@@ -239,15 +239,23 @@ class ReplayTrace::Impl {
 
   void ObservationFailed() noexcept {
     try {
-      std::lock_guard<std::mutex> lock(mu_);
-      ++dropped_records_;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++dropped_records_;
+      }
+      // Argument conversion is inside this boundary too. If it throws, the
+      // unrepresented increment makes end/drop accounting fail closed.
+      Append("drop", ",\"dropped_sequence_begin\":null,"
+                     "\"dropped_sequence_end\":null,\"dropped_count\":1,"
+                     "\"expected_dropped_count\":1,"
+                     "\"reason\":\"record_serialization_failed\"");
     } catch (...) {
-      return;
+      try {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++write_errors_;
+      } catch (...) {
+      }
     }
-    Append("drop", ",\"dropped_sequence_begin\":null,"
-                   "\"dropped_sequence_end\":null,\"dropped_count\":1,"
-                   "\"expected_dropped_count\":1,"
-                   "\"reason\":\"record_serialization_failed\"");
   }
 
   void AppendBatch(const Mark& start, const Mark& end, const char* operation,
@@ -346,13 +354,17 @@ class ReplayTrace::Impl {
     const uint64_t first = first_dropped_sequence_;
     const uint64_t last = last_dropped_sequence_;
     const uint64_t count = pending_dropped_records_;
+    const std::string body =
+        ",\"dropped_sequence_begin\":" + std::to_string(first) +
+        ",\"dropped_sequence_end\":" + std::to_string(last) +
+        ",\"dropped_count\":" + std::to_string(count) +
+        ",\"expected_dropped_count\":" + std::to_string(count);
+    // Keep the pending range intact until every allocating conversion above
+    // has succeeded. WriteRecordLocked attributes any subsequent loss to its
+    // own newly reserved sequence, never to this range a second time.
     dropped_records_ += count;
     pending_dropped_records_ = 0;
-    WriteRecordLocked(
-        "drop", ",\"dropped_sequence_begin\":" + std::to_string(first) +
-                    ",\"dropped_sequence_end\":" + std::to_string(last) +
-                    ",\"dropped_count\":" + std::to_string(count) +
-                    ",\"expected_dropped_count\":" + std::to_string(count));
+    WriteRecordLocked("drop", body);
   }
   void RotateLocked() {
     const uint64_t next_generation = generation_ + 1;

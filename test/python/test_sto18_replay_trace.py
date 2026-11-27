@@ -124,7 +124,7 @@ class ReplayTraceWriterTest(unittest.TestCase):
             writer.mark(), operation="batch_exists", probe_operation="retain_refresh",
             pages={"logical_keys": logical_keys, "native_pages": native_pages,
                    "native_results": native_results},
-            refresh={"mode": "refresh", "ttl_s": 0},
+            refresh={"mode": "refresh", "ttl_s": 0, "attempted": True},
             result={"contiguous_prefix": 1})
         # Real additional calls force more than one actual size rotation.
         for index in range(6, 12):
@@ -150,6 +150,7 @@ class ReplayTraceWriterTest(unittest.TestCase):
         self.assertEqual(native_items[1]["sg_group"], 1)
         self.assertEqual(native_items[1]["sg_width"], 29)
         self.assertEqual(first["parent"], {"state": "unknown", "reason": "not_supplied"})
+        self.assertIs(first["refresh"]["attempted"], True)
         self.assertEqual(first["coordinates"], {"tp_size": 2, "tp_rank": 1})
         for page, descriptors in zip(first["pages"], native_pages):
             for actual, descriptor in zip(page["native_items"], descriptors):
@@ -375,6 +376,10 @@ class ReplayTraceWriterTest(unittest.TestCase):
         broken.pop("payload_form")
         self.assert_capture([start, broken, end], complete=False,
                             needed_error="missing_sg_payload_form")
+        contiguous = _valid_batch("put")
+        contiguous["payload_form"] = "contiguous"
+        self.assert_capture([start, contiguous, end], complete=False,
+                            needed_error="unexpected_sg_payload_form")
 
     def test_prefix_requires_boolean_result_and_coherent_layout(self):
         writer = self.writer()
@@ -406,6 +411,43 @@ class ReplayTraceWriterTest(unittest.TestCase):
             mutate(event)
             self.assert_capture(broken, complete=False, needed_error=expected,
                                 path=self.base + ".prefix-layout")
+
+    def test_retain_attempt_requires_exact_nonempty_probe_match(self):
+        writer = self.writer()
+        page = _page("05" * 32)
+        writer.record_prefix(
+            writer.mark(), operation="batch_exists", probe_operation="retain_refresh",
+            pages={"logical_keys": [page[0]], "native_pages": [page[1]],
+                   "native_results": [page[2]]},
+            refresh={"mode": "refresh", "ttl_s": 0, "attempted": True})
+        paths = writer.paths
+        writer.close()
+        records = _records(paths)
+        self.assert_capture(records, complete=True,
+                            path=self.base + ".retain-positive")
+
+        nonempty_false = copy.deepcopy(records)
+        event = next(r for r in nonempty_false if r["record_type"] == "prefix_exists")
+        event["refresh"]["attempted"] = False
+        report = self.assert_capture(nonempty_false, complete=False,
+                                     needed_error="retain_attempt_native_items_mismatch",
+                                     path=self.base + ".retain-nonempty-false")
+        self.assertEqual(report["errors"], ["retain_attempt_native_items_mismatch"])
+
+        empty_false = copy.deepcopy(records)
+        event = next(r for r in empty_false if r["record_type"] == "prefix_exists")
+        event.update(pages=[], expected_page_count=0, page_count=0)
+        event["refresh"]["attempted"] = False
+        self.assert_capture(empty_false, complete=True,
+                            path=self.base + ".retain-empty-false")
+
+        empty_true = copy.deepcopy(empty_false)
+        event = next(r for r in empty_true if r["record_type"] == "prefix_exists")
+        event["refresh"]["attempted"] = True
+        report = self.assert_capture(empty_true, complete=False,
+                                     needed_error="retain_attempt_native_items_mismatch",
+                                     path=self.base + ".retain-empty-true")
+        self.assertEqual(report["errors"], ["retain_attempt_native_items_mismatch"])
 
     def test_malformed_json_and_envelope_mutations_are_structured_failures(self):
         start, end = self.start_end(0)
