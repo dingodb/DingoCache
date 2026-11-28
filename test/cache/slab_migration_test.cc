@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -25,6 +26,7 @@
 #include "cache/log_store.h"
 #include "cache/lse_format.h"
 #include "utils/crc32.h"
+#include "utils/crc32c.h"
 #include "utils/net_util.h"
 #include "utils/sha256.h"
 
@@ -120,22 +122,68 @@ void PrintInterposerEvidence(const std::string& scenario, const fs::path& log) {
             << evidence << "MIGRATION_IO_EVIDENCE_END " << scenario << std::endl;
 }
 
+bool ReexecuteWithInterposer(const char* exact_filter) {
+  const char* active = ::getenv("DFKV_MIGRATION_IO_INTERPOSE_ACTIVE");
+  if (active != nullptr && std::string(active) == "1") return false;
+  char executable[4096];
+  const ssize_t length =
+      ::readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+  if (length <= 0) {
+    EXPECT_NE(length, 0) << "cannot resolve the test executable for scoped preload";
+    return true;
+  }
+  executable[length] = '\0';
+  const pid_t child = ::fork();
+  if (child < 0) {
+    EXPECT_EQ(child, 0) << "cannot create scoped-preload test child";
+    return true;
+  }
+  if (child == 0) {
+    ::setenv("LD_PRELOAD", DFKV_MIGRATION_IO_INTERPOSER_PATH, 1);
+    ::execl(executable, executable, "--gtest_color=no",
+            (std::string("--gtest_filter=") + exact_filter).c_str(),
+            static_cast<char*>(nullptr));
+    std::perror("execl scoped migration interposer");
+    ::_exit(126);
+  }
+  int status = 0;
+  pid_t waited = 0;
+  do {
+    waited = ::waitpid(child, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  EXPECT_EQ(waited, child);
+  EXPECT_TRUE(WIFEXITED(status)) << "scoped-preload child status=" << status;
+  if (WIFEXITED(status)) EXPECT_EQ(WEXITSTATUS(status), 0);
+  return true;
+}
+
 void ExpectMigratedRecords(const dfkv::slab_migration::MigrationResult& result,
-                           const Values& values) {
+                           const Values& values, const SlabSnapshot& source) {
   ASSERT_EQ(result.records.size(), values.size());
+  ASSERT_EQ(source.entries().size(), values.size());
   std::map<std::string, const std::pair<BlockKey, std::string>*> expected;
+  std::map<std::string, const SourceEntry*> source_entries;
   for (const auto& value : values)
     ASSERT_TRUE(expected.emplace(value.first.Filename(), &value).second);
+  for (const auto& entry : source.entries())
+    ASSERT_TRUE(source_entries.emplace(entry.key.Filename(), &entry).second);
   for (const auto& record : result.records) {
     const auto found = expected.find(record.key.Filename());
-    ASSERT_NE(found, expected.end()) << record.key.Filename();
+    ASSERT_NE(found, expected.end()) << "duplicate/foreign migration record "
+                                     << record.key.Filename();
+    const auto source_found = source_entries.find(record.key.Filename());
+    ASSERT_NE(source_found, source_entries.end()) << record.key.Filename();
     EXPECT_EQ(record.key.tenant_hash, found->second->first.tenant_hash);
     EXPECT_EQ(record.key.digest_hi, found->second->first.digest_hi);
     EXPECT_EQ(record.key.digest_lo, found->second->first.digest_lo);
     EXPECT_EQ(record.value_len, found->second->second.size());
     EXPECT_EQ(record.value_sha256, Digest(found->second->second));
     EXPECT_TRUE(record.source_has_payload_crc);
-    EXPECT_GT(record.source_slot_charge, 0u);
+    EXPECT_EQ(record.source_has_payload_crc, source_found->second->has_payload_crc);
+    EXPECT_EQ(record.source_payload_crc, source_found->second->payload_crc);
+    EXPECT_EQ(record.source_slot_charge, source_found->second->slot_size);
+    EXPECT_EQ(record.payload_crc,
+              dfkv::Crc32c(found->second->second.data(), found->second->second.size()));
     EXPECT_GT(record.generation, 0u);
     EXPECT_GE(record.write_lsn, record.generation);
     const bool inline_record =
@@ -147,7 +195,11 @@ void ExpectMigratedRecords(const dfkv::slab_migration::MigrationResult& result,
     EXPECT_EQ((record.flags & dfkv::lse::kRecordFlagInline) != 0,
               inline_record);
     EXPECT_EQ(record.header_len, dfkv::lse::kRecordHeaderBytes);
+    expected.erase(found);
+    source_entries.erase(source_found);
   }
+  EXPECT_TRUE(expected.empty()) << "at least one source key has no unique record";
+  EXPECT_TRUE(source_entries.empty());
 }
 
 void ExpectEveryValue(LogStore* store, const Values& values) {
@@ -689,6 +741,7 @@ TEST_F(SlabMigrationTest, CandidateVerificationFailureStillMarksIncompleteUnderE
   EXPECT_TRUE(source->VerifyUnchanged(&error)) << error;
 }
 
+#ifdef DFKV_WITH_URING
 TEST_F(SlabMigrationTest, DirectBatchProducerMigratesOfflineWithExactValues) {
   Values values;
   for (uint64_t i = 0; i < 12; ++i) {
@@ -752,7 +805,7 @@ TEST_F(SlabMigrationTest, DirectBatchProducerMigratesOfflineWithExactValues) {
   ASSERT_TRUE(result.published);
   ASSERT_TRUE(result.source_unchanged);
   ExpectRootUnchanged(source_, before);
-  ExpectMigratedRecords(result, values);
+  ExpectMigratedRecords(result, values, *source);
   EXPECT_TRUE(fs::exists(destination_));
   EXPECT_FALSE(fs::exists(result.staging_dir));
   std::cout << "DIRECT_PRODUCER_MIGRATION_RESULT "
@@ -772,8 +825,12 @@ TEST_F(SlabMigrationTest, DirectBatchProducerMigratesOfflineWithExactValues) {
   ExpectRootUnchanged(source_, before);
   ASSERT_TRUE(source->VerifyUnchanged(&error)) << error;
 }
+#endif  // DFKV_WITH_URING
 
 TEST_F(SlabMigrationTest, RealSyscallShortIoRetriesAndTerminalFaultsFailClosed) {
+  if (ReexecuteWithInterposer(
+          "SlabMigrationTest.RealSyscallShortIoRetriesAndTerminalFaultsFailClosed"))
+    return;
   ASSERT_EQ(std::string(::getenv("DFKV_MIGRATION_IO_INTERPOSE_ACTIVE") == nullptr
                             ? ""
                             : ::getenv("DFKV_MIGRATION_IO_INTERPOSE_ACTIVE")),
@@ -825,7 +882,7 @@ TEST_F(SlabMigrationTest, RealSyscallShortIoRetriesAndTerminalFaultsFailClosed) 
   ASSERT_TRUE(result.ok) << result.error;
   EXPECT_TRUE(result.published);
   EXPECT_TRUE(result.source_unchanged);
-  ExpectMigratedRecords(result, values);
+  ExpectMigratedRecords(result, values, *source);
   ExpectRootUnchanged(source_, before);
   std::cout << "RETRY_MIGRATION_RESULT "
             << dfkv::slab_migration::ResultJson(result) << std::endl;
@@ -894,6 +951,9 @@ TEST_F(SlabMigrationTest, RealSyscallShortIoRetriesAndTerminalFaultsFailClosed) 
 }
 
 TEST_F(SlabMigrationTest, MixedLayoutMultiSegmentDirectReopenVerifiesAllRanges) {
+  if (ReexecuteWithInterposer(
+          "SlabMigrationTest.MixedLayoutMultiSegmentDirectReopenVerifiesAllRanges"))
+    return;
   Values values;
   for (uint64_t i = 0; i < 128; ++i) {
     const size_t size = i % 3 == 0 ? 1 : (17 + (i * 37) % 3900);
@@ -935,7 +995,7 @@ TEST_F(SlabMigrationTest, MixedLayoutMultiSegmentDirectReopenVerifiesAllRanges) 
   ASSERT_TRUE(result.published);
   EXPECT_TRUE(result.source_unchanged);
   ExpectRootUnchanged(source_, before);
-  ExpectMigratedRecords(result, values);
+  ExpectMigratedRecords(result, values, *source);
   EXPECT_EQ(result.segment_bytes, 4ull << 20);
   std::map<uint32_t, size_t> records_per_segment;
   size_t inline_records = 0;
@@ -978,6 +1038,10 @@ TEST_F(SlabMigrationTest, MixedLayoutMultiSegmentDirectReopenVerifiesAllRanges) 
   bool ok = false;
   auto direct = std::make_unique<LogStore>(direct_options, &ok);
   ASSERT_TRUE(ok) << direct->StartupError();
+  // Constructor startup reads are not valid range-path proof. The scenario
+  // change resets only the read-observation phase while retaining the exact
+  // O_DIRECT descriptor inventory established above.
+  ASSERT_EQ(::setenv("DFKV_MIGRATION_IO_SCENARIO", "observe_ranges", 1), 0);
   ExpectEveryValue(direct.get(), values);
   for (const auto& value : values) {
     SCOPED_TRACE(value.first.Filename());
@@ -1002,8 +1066,12 @@ TEST_F(SlabMigrationTest, MixedLayoutMultiSegmentDirectReopenVerifiesAllRanges) 
   EXPECT_EQ(CountSubstring(direct_evidence, "event=odirect_open "),
             result.segment_count)
       << "every destination segment must really admit an O_DIRECT descriptor";
-  EXPECT_GT(CountSubstring(direct_evidence, "event=odirect_pread "), 0u)
-      << "the reopen comparisons must actually read through an O_DIRECT fd";
+  EXPECT_GE(CountSubstring(direct_evidence, "event=odirect_range_pread "),
+            records_per_segment.size())
+      << "every populated segment must be read through an O_DIRECT fd in the range phase";
+  EXPECT_EQ(CountSubstring(direct_evidence,
+                           "event=buffered_destination_range_pread "), 0u)
+      << "no destination range comparison may fall back to a buffered segment fd";
   ExpectRootUnchanged(source_, before);
   ASSERT_TRUE(source->VerifyUnchanged(&error)) << error;
   std::cout << "MIXED_LAYOUT_MIGRATION_RESULT "

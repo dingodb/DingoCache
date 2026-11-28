@@ -242,6 +242,8 @@ if(DFKV_BUILD_TESTS)
                           dfkv_unit_test_defaults)
     if(name STREQUAL "slab_migration_test")
       add_dependencies(${name} dfkv_migration_io_interposer)
+      target_compile_definitions(${name} PRIVATE
+        DFKV_MIGRATION_IO_INTERPOSER_PATH="$<TARGET_FILE:dfkv_migration_io_interposer>")
     endif()
     if(name STREQUAL "node_dedup_gpu_sim_test")
       # Re-executes itself with the simulated driver first on the library path.
