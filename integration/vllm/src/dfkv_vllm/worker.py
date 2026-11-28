@@ -77,6 +77,7 @@ from .client_ranks import (
 from .cache_api import (
     cache_group_view,
     group_block_size,
+    is_full_attention,
     is_mamba_group,
     logical_bytes_per_block,
     manager_api,
@@ -3433,7 +3434,7 @@ class DfkvStoreWorker:
             return not pending or probe_into(pending, len(pending))
 
         def lookup_candidate(token_len: int) -> int:
-            nonlocal first_candidate_keys, first_candidate_routes
+            nonlocal first_candidate_keys, first_candidate_routes, eagle_admission_pending
             """Check how many prefix tokens exist in the store.
 
             Checks across all TP ranks at this worker's own PP rank.
@@ -3543,7 +3544,30 @@ class DfkvStoreWorker:
                     break
                 prefix_chunks += 1
             complete_prefix_tokens = prefix_chunks * self.coord.lcm_block_size
-    
+            if (
+                eagle_admission_pending
+                and self.coord._manager_api
+                and self.coord.eagle_block_drop
+                and complete_prefix_tokens > 0
+                and len(self.coord.attention_groups) == 1
+                and is_full_attention(self.coord.attention_groups[0].view)
+            ):
+                # Admission must re-evaluate the tail under the real manager
+                # contract. Do not change the subsequent load/prefetch mask:
+                # once h1 is excluded here, h0 remains the stable prefix.
+                admission_exists = {
+                    (object_meta[1], object_meta[3])
+                    for object_meta, expected in expected_per_object.items()
+                    if present_per_object.get(object_meta, 0) == expected
+                }
+                admission_pool = ExternalCachedBlockPool(
+                    self.coord.hash_block_size, admission_exists
+                )
+                complete_prefix_tokens = self.coord.find_longest_cache_hit(
+                    block_hashes, complete_prefix_tokens, admission_pool
+                )
+                eagle_admission_pending = False
+
             # This is only a candidate boundary. The outer loop checks the
             # mask at that exact length before admitting it for LOAD.
             hit_length = complete_prefix_tokens
@@ -3736,6 +3760,7 @@ class DfkvStoreWorker:
             return lookup_partial(token_len), applied_ttl()
         lcm = self.coord.lcm_block_size
         candidate = token_len // lcm * lcm
+        eagle_admission_pending = True
         prefetched = False
         while candidate > 0:
             hit = lookup_candidate(candidate)

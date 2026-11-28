@@ -812,6 +812,62 @@ def test_worker_preserves_global_unmarked_eagle_drop(
     )
 
 
+@pytest.mark.skipif(not manager_api(), reason="manager-owned cache API required")
+@pytest.mark.parametrize(
+    ("drop_enabled", "marked", "expected_tokens"),
+    [(True, True, BLOCK), (True, False, BLOCK), (False, True, 2 * BLOCK)],
+)
+def test_exact_n_full_attention_drop_applies_once_on_ordinary_lookup(
+    hybrid_workers, drop_enabled, marked, expected_tokens
+):
+    create, _ = hybrid_workers
+    worker, _ = create(0, states=False, eagle_block_drop=drop_enabled)
+    group = worker.coord.kv_cache_groups[0]
+    if hasattr(group, "is_eagle_group"):
+        # Same assignment as vLLM's draft-layer planning on exact N.
+        group.is_eagle_group = marked
+    assert worker.coord.enable_partial_hash_hits is False
+    assert worker.coord.eagle_block_drop is drop_enabled
+
+    hashes = _hashes()
+    request = ReqMeta(
+        req_id=f"ordinary-eagle-{drop_enabled}-{marked}",
+        token_len_chunk=2 * BLOCK,
+        block_ids=([1, 2],),
+        block_hashes=hashes,
+    )
+    worker.kv_send_thread.add_stored_request(request)
+    worker.kv_send_thread._handle_request(request)
+
+    parameters = inspect.signature(
+        worker.coord._views[0].manager_cls.find_longest_cache_hit
+    ).parameters
+    expected = expected_tokens if "drop_eagle_block" in parameters else 2 * BLOCK
+    # Drop only for admission; later load/prefetch keeps stable h0 rather than
+    # dropping it again and turning a saved prefix into zero objects.
+    assert worker.lookup(2 * BLOCK, hashes) == (expected, 0)
+
+
+def test_exact_n_full_attention_single_block_is_not_admitted(hybrid_workers):
+    create, _ = hybrid_workers
+    worker, _ = create(0, states=False, eagle_block_drop=True)
+    parameters = inspect.signature(
+        worker.coord._views[0].manager_cls.find_longest_cache_hit
+    ).parameters
+    if "drop_eagle_block" not in parameters:
+        pytest.skip("exact-N drop-enabled manager API required")
+    hashes = _hashes()[:1]
+    request = ReqMeta(
+        req_id="ordinary-eagle-single-block",
+        token_len_chunk=BLOCK,
+        block_ids=([1],),
+        block_hashes=hashes,
+    )
+    worker.kv_send_thread.add_stored_request(request)
+    worker.kv_send_thread._handle_request(request)
+    assert worker.lookup(BLOCK, hashes) == (0, 0)
+
+
 @pytest.mark.parametrize("dcp", [1, 2])
 def test_hybrid_state_round_trip_preserves_every_tp_payload(hybrid_workers, dcp):
     create, objects = hybrid_workers
