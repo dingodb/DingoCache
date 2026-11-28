@@ -9,6 +9,7 @@
 #ifndef DFKV_SLAB_MIGRATION_H_
 #define DFKV_SLAB_MIGRATION_H_
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -115,6 +116,17 @@ struct MigrationResult {
   std::vector<FileManifest> source_after;
   std::vector<FileManifest> destination_files;
 };
+
+// sorted_actual is ListNames' lexical directory inventory. Compare by
+// membership rather than treating the expected generation order as lexical.
+// Duplicate expected entries cannot come from the validated E%05u range.
+inline bool ExtentInventoryMatches(const std::vector<std::string>& expected,
+                                   const std::vector<std::string>& sorted_actual) {
+  return expected.size() == sorted_actual.size() &&
+         std::all_of(expected.begin(), expected.end(), [&](const std::string& name) {
+           return std::binary_search(sorted_actual.begin(), sorted_actual.end(), name);
+         });
+}
 
 // destination must be absolute and absent, as must destination +
 // ".sto14-staging". No destination or staging path is ever reused or removed.

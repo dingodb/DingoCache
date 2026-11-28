@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -83,6 +84,35 @@ void WriteBytes(const fs::path& path, const std::vector<uint8_t>& bytes) {
   out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   ASSERT_TRUE(out.good());
 }
+
+size_t OpenFdCount() {
+  size_t count = 0;
+  for (const auto& ignored : fs::directory_iterator("/proc/self/fd")) {
+    (void)ignored;
+    ++count;
+  }
+  return count;
+}
+
+class ScopedFileLimit {
+ public:
+  explicit ScopedFileLimit(rlim_t limit) {
+    if (::getrlimit(RLIMIT_NOFILE, &previous_) != 0) return;
+    rlimit limited = previous_;
+    limited.rlim_cur = limit;
+    valid_ = ::setrlimit(RLIMIT_NOFILE, &limited) == 0;
+  }
+
+  ~ScopedFileLimit() {
+    if (valid_) ::setrlimit(RLIMIT_NOFILE, &previous_);
+  }
+
+  bool valid() const { return valid_; }
+
+ private:
+  rlimit previous_{};
+  bool valid_ = false;
+};
 
 class SlabMigrationTest : public ::testing::Test {
  protected:
@@ -367,18 +397,14 @@ TEST_F(SlabMigrationTest, StagingWriteFailureIsMarkedAndNeverPublished) {
   auto source = OpenSource(values);
   ASSERT_NE(source, nullptr);
   const auto before = RootHashes(source_);
-  size_t open_fds = 0;
-  for (const auto& ignored : fs::directory_iterator("/proc/self/fd")) {
-    (void)ignored;
-    ++open_fds;
+  const size_t open_fds = OpenFdCount();
+  dfkv::slab_migration::MigrationResult result;
+  {
+    ScopedFileLimit limit(open_fds + 2);
+    // Both reserved descriptors fit, so the LSE startup fails instead of the marker.
+    ASSERT_TRUE(limit.valid());
+    result = MigrateToLse(*source, destination_.string());
   }
-  struct rlimit old_limit {};
-  ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &old_limit), 0);
-  struct rlimit limited = old_limit;
-  limited.rlim_cur = open_fds + 2;  // source descriptors stay valid; new LSE cannot open all files.
-  ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &limited), 0);
-  auto result = MigrateToLse(*source, destination_.string());
-  ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &old_limit), 0);
   EXPECT_FALSE(result.ok) << result.error;
   EXPECT_FALSE(result.published);
   EXPECT_FALSE(fs::exists(destination_));
@@ -437,6 +463,134 @@ TEST_F(SlabMigrationTest, EmptyLiveWritesRemainInvalidAtTheNativeBoundary) {
   auto source = SlabSnapshot::Open(source_.string(), &error);
   ASSERT_TRUE(source != nullptr) << error;
   EXPECT_EQ(source->entries().size(), 1);
+}
+
+TEST_F(SlabMigrationTest, RejectsCrcValidNoncanonicalSlotClass) {
+  auto options = SourceOptions();
+  options.extent_bytes = 4ull << 20;
+  bool ok = false;
+  auto writer = std::make_unique<DiskSlabStore>(options, &ok);
+  ASSERT_TRUE(ok) << writer->StartupError();
+  const BlockKey key{4, 5, 6};
+  const std::string value = "one";
+  ASSERT_EQ(writer->Cache(key, value.data(), value.size()), Status::kOk);
+  ASSERT_TRUE(writer->Close());
+  writer.reset();
+
+  auto table = ReadBytes(source_ / "slots.tbl");
+  size_t row = table.size();
+  for (size_t offset = 0; offset + 64 <= table.size(); offset += 64) {
+    if (dfkv::net::GetU32(reinterpret_cast<char*>(table.data()) + offset) == 0x334C5453u &&
+        table[offset + 8] == 1) {
+      row = offset;
+      break;
+    }
+  }
+  ASSERT_NE(row, table.size());
+  // A 3 MiB row is in-range and correctly checksummed, but is not in the
+  // allocator's [1,2,4] MiB class lattice for a 4 MiB extent.
+  dfkv::net::PutU32(reinterpret_cast<char*>(table.data()) + row + 12,
+                    static_cast<uint32_t>(3ull << 20));
+  dfkv::net::PutU32(reinterpret_cast<char*>(table.data()) + row + 4,
+                    dfkv::Crc32(table.data() + row + 8, 64 - 8));
+  WriteBytes(source_ / "slots.tbl", table);
+  const auto before = RootHashes(source_);
+  std::string error;
+  EXPECT_EQ(SlabSnapshot::Open(source_.string(), &error), nullptr);
+  EXPECT_NE(error.find("noncanonical"), std::string::npos) << error;
+  EXPECT_FALSE(fs::exists(destination_));
+  ExpectRootUnchanged(source_, before);
+}
+
+TEST_F(SlabMigrationTest, ReservesTheMandatorySummaryBlockWhenChoosingSegments) {
+  auto options = SourceOptions();
+  options.extent_bytes = 8ull << 20;
+  bool ok = false;
+  auto writer = std::make_unique<DiskSlabStore>(options, &ok);
+  ASSERT_TRUE(ok) << writer->StartupError();
+  const BlockKey key{40, 41, 42};
+  // Fits MaxRecordValue(4 MiB) = S - 3 blocks, but not the ordinary
+  // LogStore::MaxValueBytes(4 MiB) = S - 4 blocks admission rule.
+  const std::string value((4ull << 20) - 3ull * dfkv::lse::kBlockBytes, 'v');
+  ASSERT_EQ(writer->Cache(key, value.data(), value.size()), Status::kOk);
+  ASSERT_TRUE(writer->Close());
+  writer.reset();
+
+  std::string error;
+  auto source = SlabSnapshot::Open(source_.string(), &error);
+  ASSERT_NE(source, nullptr) << error;
+  ASSERT_EQ(source->entries().size(), 1);
+  const auto before = RootHashes(source_);
+  auto result = MigrateToLse(*source, destination_.string());
+  ASSERT_TRUE(result.ok) << result.error;
+  ASSERT_TRUE(result.published);
+  ASSERT_TRUE(result.source_unchanged);
+  EXPECT_EQ(result.segment_bytes, 8ull << 20);
+  EXPECT_EQ(result.segment_count, 8);
+  ASSERT_EQ(result.records.size(), 1);
+  EXPECT_EQ(result.records[0].value_len, value.size());
+  EXPECT_EQ(result.records[0].value_sha256, Digest(value));
+  ExpectRootUnchanged(source_, before);
+}
+
+TEST(SlabMigrationInventoryTest, AcceptsLexicalDirectoryOrderAcrossSixDigitExtents) {
+  const std::vector<std::string> generation_order{
+      "E00000", "E00001", "E00002", "E00010", "E99999", "E100000"};
+  std::vector<std::string> lexical_order{
+      "E00000", "E00001", "E00002", "E00010", "E100000", "E99999"};
+  ASSERT_TRUE(std::is_sorted(lexical_order.begin(), lexical_order.end()));
+  ASSERT_NE(lexical_order, generation_order);
+  EXPECT_TRUE(dfkv::slab_migration::ExtentInventoryMatches(generation_order, lexical_order));
+  lexical_order.pop_back();
+  EXPECT_FALSE(dfkv::slab_migration::ExtentInventoryMatches(generation_order, lexical_order));
+}
+
+TEST_F(SlabMigrationTest, CandidateVerificationFailureStillMarksIncompleteUnderEmfile) {
+  auto options = SourceOptions();
+  options.capacity_bytes = options.extent_bytes;
+  bool ok = false;
+  auto writer = std::make_unique<DiskSlabStore>(options, &ok);
+  ASSERT_TRUE(ok) << writer->StartupError();
+  const BlockKey key{11, 12, 13};
+  const std::string value = "small-value";
+  ASSERT_EQ(writer->Cache(key, value.data(), value.size()), Status::kOk);
+  ASSERT_TRUE(writer->Close());
+  writer.reset();
+  std::string error;
+  auto source = SlabSnapshot::Open(source_.string(), &error);
+  ASSERT_NE(source, nullptr) << error;
+  const auto before = RootHashes(source_);
+  const size_t open_fds = OpenFdCount();
+  bool found_candidate_verification_failure = false;
+  // Each bound is a distinct deterministic resource-limit scenario, not a
+  // retry used to obtain a green result. Require a real read-only candidate
+  // verification failure after the writer has completed. The bounded runs also
+  // cover creator-startup errors, but do not pretend those are constructor
+  // failures in the later verifier, or count a successful migration as proof.
+  for (size_t extra = 2; extra <= 24 && !found_candidate_verification_failure; ++extra) {
+    const fs::path candidate = root_ / ("fd-limited-" + std::to_string(extra));
+    dfkv::slab_migration::MigrationResult result;
+    {
+      ScopedFileLimit limit(open_fds + extra);
+      ASSERT_TRUE(limit.valid());
+      result = MigrateToLse(*source, candidate.string());
+    }
+    std::fprintf(stderr, "extra_fd=%zu result_ok=%d published=%d error=%s\n", extra,
+                 static_cast<int>(result.ok), static_cast<int>(result.published),
+                 result.error.c_str());
+    if (result.error.rfind("open candidate ", 0) != 0 ||
+        result.error.find("Too many open files (errno 24)") == std::string::npos)
+      continue;
+    found_candidate_verification_failure = true;
+    EXPECT_FALSE(result.ok) << result.error;
+    EXPECT_FALSE(result.published) << result.error;
+    EXPECT_TRUE(fs::exists(candidate.string() + ".sto14-staging/STO14-MIGRATION-INCOMPLETE"))
+        << "extra_fd=" << extra << ": " << result.error;
+  }
+  ASSERT_TRUE(found_candidate_verification_failure)
+      << "bounded FD scenarios did not reach read-only candidate verification with EMFILE";
+  ExpectRootUnchanged(source_, before);
+  EXPECT_TRUE(source->VerifyUnchanged(&error)) << error;
 }
 
 }  // namespace

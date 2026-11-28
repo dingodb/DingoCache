@@ -166,7 +166,7 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
         static_cast<uint32_t>(opt_.extent_bytes / slot_size);
     classes_.push_back(std::move(cls));
     if (slot_size == max_aligned) break;
-    const uint64_t next = CanonicalSlotSize(slot_size + opt_.align);
+    const uint64_t next = CanonicalSlotSizeForGeometry(slot_size + opt_.align, opt_);
     if (next <= slot_size) break;
     slot_size = next;
   }
@@ -237,25 +237,26 @@ void SlabAllocator::DropExtentFreeLocked(Class& cls, uint32_t extent) {
   DropFromRotationLocked(cls, extent);
 }
 
-uint32_t SlabAllocator::CanonicalSlotSize(size_t aligned_len) const {
+uint32_t SlabAllocator::CanonicalSlotSizeForGeometry(size_t aligned_len,
+                                                      const Options& opt) {
   // Build a fixed geometric lattice from alignment and extent geometry. The
   // next bucket is the largest aligned slot for which the smallest request not
   // served by the preceding bucket still satisfies max_waste. Consequently a
   // request's class never depends on which other request arrived first.
   const uint64_t uint32_aligned =
-      (static_cast<uint64_t>(UINT32_MAX) / opt_.align) * opt_.align;
+      (static_cast<uint64_t>(UINT32_MAX) / opt.align) * opt.align;
   const uint64_t max_aligned = std::min(
-      (opt_.extent_bytes / opt_.align) * static_cast<uint64_t>(opt_.align),
+      (opt.extent_bytes / opt.align) * static_cast<uint64_t>(opt.align),
       uint32_aligned);
-  uint64_t current = opt_.align;
-  const double waste = std::min(opt_.max_waste, 0.999999);
+  uint64_t current = opt.align;
+  const double waste = std::min(opt.max_waste, 0.999999);
   while (current < aligned_len) {
-    const uint64_t minimum = current + opt_.align;
+    const uint64_t minimum = current + opt.align;
     uint64_t candidate = minimum;
     if (waste > 0) {
       const double raw = static_cast<double>(minimum) / (1.0 - waste);
       const uint64_t bounded = static_cast<uint64_t>(raw);
-      candidate = (bounded / opt_.align) * static_cast<uint64_t>(opt_.align);
+      candidate = (bounded / opt.align) * static_cast<uint64_t>(opt.align);
       if (candidate < minimum) candidate = minimum;
     }
     if (candidate > max_aligned) candidate = max_aligned;
@@ -266,7 +267,7 @@ uint32_t SlabAllocator::CanonicalSlotSize(size_t aligned_len) const {
 }
 
 size_t SlabAllocator::ClassForLen(size_t aligned_len) {
-  return ClassForExactSize(CanonicalSlotSize(aligned_len));
+  return ClassForExactSize(CanonicalSlotSizeForGeometry(aligned_len, opt_));
 }
 
 size_t SlabAllocator::ClassForExactSize(uint32_t slot_size) {
@@ -534,7 +535,7 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
     if (entry.slot_size == 0 || entry.extent >= extents_.size() ||
         entry.slot_size > opt_.extent_bytes ||
         entry.value_bytes > entry.slot_size ||
-        CanonicalSlotSize(entry.slot_size) != entry.slot_size ||
+        CanonicalSlotSizeForGeometry(entry.slot_size, opt_) != entry.slot_size ||
         ClassForExactSize(entry.slot_size) == classes_.size() ||
         entry.slot >= opt_.extent_bytes / entry.slot_size ||
         index_.Find(entry.key) != nullptr)
