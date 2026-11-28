@@ -166,4 +166,26 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
   return result;
 }
 
+size_t RdmaTransport::ConnectionBound(size_t required) const {
+  const size_t logical_max = OpBound();
+  size_t wanted = std::max(required, connection_min_block_bytes_);
+  if (wanted >= logical_max) return logical_max;
+  size_t size_class = 1;
+  while (size_class < wanted && size_class <= logical_max / 2)
+    size_class <<= 1;
+  return size_class < wanted ? logical_max
+                             : std::min(size_class, logical_max);
+}
+
+size_t RdmaTransport::ConnectionDepth(const std::string& node, Lane lane,
+                                      size_t requested_credits) {
+  const size_t learned = std::max<size_t>(1, LearnedDepth(node, lane));
+  const size_t wanted =
+      std::min(learned, std::max<size_t>(1, requested_credits));
+  size_t depth_class = 1;
+  while (depth_class < wanted && depth_class <= learned / 2)
+    depth_class <<= 1;
+  return depth_class < wanted ? learned : std::min(depth_class, learned);
+}
+
 }  // namespace dfkv
