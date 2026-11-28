@@ -472,7 +472,7 @@ TEST_F(SlabMigrationTest, RejectsCrcValidNoncanonicalSlotClass) {
   auto writer = std::make_unique<DiskSlabStore>(options, &ok);
   ASSERT_TRUE(ok) << writer->StartupError();
   const BlockKey key{4, 5, 6};
-  const std::string value = "one";
+  const std::string value(3ull << 20, 'x');
   ASSERT_EQ(writer->Cache(key, value.data(), value.size()), Status::kOk);
   ASSERT_TRUE(writer->Close());
   writer.reset();
@@ -487,8 +487,16 @@ TEST_F(SlabMigrationTest, RejectsCrcValidNoncanonicalSlotClass) {
     }
   }
   ASSERT_NE(row, table.size());
-  // A 3 MiB row is in-range and correctly checksummed, but is not in the
-  // allocator's [1,2,4] MiB class lattice for a 4 MiB extent.
+  const size_t records_per_extent = options.extent_bytes / options.slot_granularity;
+  ASSERT_EQ((row / 64) % records_per_extent, 0);
+  ASSERT_EQ(dfkv::net::GetU32(reinterpret_cast<char*>(table.data()) + row + 12),
+            options.extent_bytes);
+  ASSERT_EQ(dfkv::net::GetU32(reinterpret_cast<char*>(table.data()) + row + 32),
+            value.size());
+  // Its original canonical bucket is 4 MiB at physical slot zero. Altering
+  // only slot_size to 3 MiB keeps slot bounds, granularity and payload bounds,
+  // so rejection must reach the canonical-class check rather than any earlier
+  // physical-slot guard. The 3 MiB row has valid row and payload CRCs.
   dfkv::net::PutU32(reinterpret_cast<char*>(table.data()) + row + 12,
                     static_cast<uint32_t>(3ull << 20));
   dfkv::net::PutU32(reinterpret_cast<char*>(table.data()) + row + 4,
