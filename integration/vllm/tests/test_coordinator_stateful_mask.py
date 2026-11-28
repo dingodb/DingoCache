@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import BlockHash
 from _cache_api import cache_group, full_attention_spec, sliding_window_spec
@@ -69,11 +70,11 @@ def _lookup(coordinator, tokens, hashes, exists):
     if manager_api() and coordinator.num_hash_lookahead_tokens:
         # Match the scheduler's consumer-facing bound before calling the
         # worker directly: a hit may use only hashes emitted by the engine.
-        from vllm.v1.kv_cache_interface import get_reusable_prefix_length
+        from dfkv_vllm.cache_api import reusable_prefix_length
 
         alignment = coordinator.hit_alignment
         tokens = min(
-            get_reusable_prefix_length(
+            reusable_prefix_length(
                 tokens,
                 num_hash_lookahead_tokens=coordinator.num_hash_lookahead_tokens,
                 alignment_tokens=alignment,
@@ -179,3 +180,44 @@ def test_window_only_model_can_reuse_its_required_tail():
     coordinator = _coordinator(eagle=False, dense=False)
     hashes, exists = _stored_prefix(coordinator)
     assert _lookup(coordinator, 256, hashes, exists) == 256
+
+
+@pytest.mark.skipif(not manager_api(), reason="manager-owned cache API required")
+@pytest.mark.parametrize("global_drop", [False, True])
+def test_multi_group_eagle_drop_preserves_the_common_candidate(global_drop):
+    dense = cache_group(
+        ["main"],
+        full_attention_spec(
+            block_size=64, num_kv_heads=1, head_size=8, dtype=torch.float16
+        ),
+    )
+    window = cache_group(
+        ["window"],
+        sliding_window_spec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float16,
+            sliding_window=128,
+        ),
+    )
+    coordinator = DfkvStoreCoordinator(
+        [dense, window], 64, 64, use_eagle=global_drop
+    )
+    hashes = [BlockHash(bytes([index + 1]) * 32) for index in range(2)]
+    exists = {
+        (group, bytes(block_hash))
+        for group in range(2)
+        for block_hash in hashes
+    }
+    from dfkv_vllm.coordinator import ExternalCachedBlockPool
+
+    pool = ExternalCachedBlockPool(64, exists)
+    import inspect
+
+    drop_capable = "drop_eagle_block" in inspect.signature(
+        coordinator._views[0].manager_cls.find_longest_cache_hit
+    ).parameters
+    assert coordinator.find_longest_cache_hit(hashes, 128, pool) == (
+        64 if global_drop and drop_capable else 128
+    )

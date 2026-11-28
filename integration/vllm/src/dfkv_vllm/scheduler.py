@@ -173,9 +173,9 @@ class DfkvStoreScheduler:
         # Partial hash hits land on hash blocks inside a scheduler block.
         align = self._hash_block_size if self._partial_hash_hits else self._block_size
         if getattr(self, "_manager_groups", False):
-            from vllm.v1.kv_cache_interface import get_reusable_prefix_length
+            from .cache_api import reusable_prefix_length
 
-            token_len = get_reusable_prefix_length(
+            token_len = reusable_prefix_length(
                 request.num_tokens,
                 num_hash_lookahead_tokens=getattr(self, "_num_hash_lookahead_tokens", 0),
                 alignment_tokens=align,

@@ -561,9 +561,9 @@ class ReqMeta:
             and 0 < num_prompt_tokens <= input_token_len
         )
         if hash_block_size is not None and num_prompt_tokens is not None:
-            from vllm.v1.kv_cache_interface import get_reusable_prefix_length
+            from .cache_api import reusable_prefix_length
 
-            boundary = get_reusable_prefix_length(
+            boundary = reusable_prefix_length(
                 num_prompt_tokens,
                 num_hash_lookahead_tokens=num_hash_lookahead_tokens,
                 alignment_tokens=hash_block_size,

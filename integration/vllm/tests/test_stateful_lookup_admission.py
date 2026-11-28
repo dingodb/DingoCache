@@ -6,7 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 
@@ -691,7 +691,7 @@ def hybrid_workers(monkeypatch):
     monkeypatch.setenv("DFKV_CLIENT_NODE_DEDUP_GPU", "0")
     monkeypatch.setenv("DFKV_CLIENT_LOG_SUFFIX", "state-test")
 
-    def create(tp_rank, *, dcp=1, states=True, attention_block_size=None, scratch=False, kernel_tiles=1, wrapped_attention=False, num_blocks=4, kv_events=False):
+    def create(tp_rank, *, dcp=1, states=True, attention_block_size=None, scratch=False, kernel_tiles=1, wrapped_attention=False, num_blocks=4, kv_events=False, eagle_block_drop=False, num_hash_lookahead_tokens=0):
         rank[0], dcp_size[0] = tp_rank, dcp
         physical_block_size = attention_block_size or BLOCK // dcp
         mla = mla_attention_spec(
@@ -726,6 +726,10 @@ def hybrid_workers(monkeypatch):
                 prefix_cacheable=False,
             ))
         config = SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                use_eagle_block_drop=lambda: eagle_block_drop,
+            ),
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
             model_config=SimpleNamespace(
                 model="test/hybrid-state", use_mla=True,
                 get_num_layers=lambda parallel: len(groups),
@@ -765,6 +769,47 @@ def hybrid_workers(monkeypatch):
     yield create, objects
     for worker in workers:
         worker.close()
+
+
+@pytest.mark.skipif(not manager_api(), reason="manager-owned cache API required")
+@pytest.mark.parametrize("global_drop", [False, True])
+def test_worker_preserves_global_unmarked_eagle_drop(
+    hybrid_workers, monkeypatch, global_drop
+):
+    create, _ = hybrid_workers
+    worker, _ = create(0, states=False, eagle_block_drop=global_drop)
+    coordinator = worker.coord
+    assert not any(
+        getattr(group, "is_eagle_group", False)
+        for group in coordinator.kv_cache_groups
+    )
+
+    from vllm.v1.core.kv_cache_coordinator import replay_boundaries
+
+    if "use_eagle" not in inspect.signature(replay_boundaries).parameters:
+        pytest.skip("exact-N EAGLE replay API required")
+    replay = create_autospec(replay_boundaries, return_value=(255,))
+    monkeypatch.setattr(
+        "vllm.v1.core.kv_cache_coordinator.replay_boundaries", replay
+    )
+    manager_cls = coordinator._views[0].manager_cls
+    reachable = create_autospec(
+        manager_cls.reachable_block_mask,
+        return_value=[True] * 4,
+    )
+    monkeypatch.setattr(manager_cls, "reachable_block_mask", reachable)
+
+    assert coordinator.store_mask(256, num_prompt_tokens=256) == ([True] * 4,)
+    assert replay.call_args.kwargs["use_eagle"] is global_drop
+    assert reachable.call_args.kwargs["use_eagle"] is global_drop
+
+    from dfkv_vllm.coordinator import ExternalCachedBlockPool
+
+    block_hash = BlockHash(b"\x01" * 32)
+    pool = ExternalCachedBlockPool(64, {(0, bytes(block_hash))})
+    assert coordinator.find_longest_cache_hit([block_hash], 64, pool) == (
+        0 if global_drop else 64
+    )
 
 
 @pytest.mark.parametrize("dcp", [1, 2])

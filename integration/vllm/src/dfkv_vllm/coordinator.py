@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 
 from .cache_api import (
     CacheGroupView,
+    accepts_keyword,
     cache_group_view,
     group_block_size,
     is_full_attention,
@@ -69,6 +70,10 @@ def _find_hit_blocks(
             block_size=view.block_size,
             manager_config=view.manager_config,
         )
+        if accepts_keyword(
+            view.manager_cls.find_longest_cache_hit, "drop_eagle_block"
+        ):
+            kwargs["drop_eagle_block"] = drop_eagle_block
     else:
         kwargs.update(
             kv_cache_spec=view.registry_spec,
@@ -197,6 +202,18 @@ class DfkvStoreCoordinator:
         self.num_hash_lookahead_tokens = (
             num_hash_lookahead_tokens if self._manager_api else 0
         )
+        # Keep the global drop decision separate from planning's optional group
+        # markers. Lookahead hashes suppress drops without clearing markers.
+        self.eagle_block_drop = use_eagle and not self.num_hash_lookahead_tokens
+        self.drop_eagle_group_ids: set[int] = set()
+        if self.eagle_block_drop:
+            self.drop_eagle_group_ids = {
+                index
+                for index, group in enumerate(self.kv_cache_groups)
+                if getattr(group, "is_eagle_group", False)
+            }
+            if not self.drop_eagle_group_ids:
+                self.drop_eagle_group_ids = set(range(len(self.kv_cache_groups)))
         self.retention_interval = retention_interval if self._manager_api else None
         self.enable_partial_hash_hits = enable_partial_hash_hits
         self.hit_alignment = (
@@ -271,14 +288,18 @@ class DfkvStoreCoordinator:
         from vllm.v1.core.kv_cache_coordinator import replay_boundaries
         from .cache_api import is_mamba_group
 
-        replay = (
-            ()
-            if num_prompt_tokens is None
-            else replay_boundaries(
-                num_prompt_tokens,
-                num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
-            )
-        )
+        replay = ()
+        if num_prompt_tokens is not None:
+            replay_kwargs = {
+                "num_hash_lookahead_tokens": self.num_hash_lookahead_tokens
+            }
+            if accepts_keyword(replay_boundaries, "use_eagle"):
+                replay_use_eagle = bool(self.drop_eagle_group_ids)
+                replay_kwargs.update(
+                    scheduler_block_size=self.lcm_block_size,
+                    use_eagle=replay_use_eagle,
+                )
+            replay = replay_boundaries(num_prompt_tokens, **replay_kwargs)
         masks: list[list[bool]] = [[] for _ in self.kv_cache_groups]
         for index, view in enumerate(self._views):
             if not view.prefix_cacheable:
@@ -289,7 +310,7 @@ class DfkvStoreCoordinator:
                 # boundary hand-offs, never by position in the live table.
                 masks[index] = [False] * end_block
                 continue
-            mask = view.manager_cls.reachable_block_mask(
+            mask_kwargs = dict(
                 start_block=0,
                 end_block=end_block,
                 alignment_tokens=self.lcm_block_size,
@@ -299,6 +320,11 @@ class DfkvStoreCoordinator:
                 reachable_boundaries=replay,
                 dcp_world_size=1,
             )
+            if accepts_keyword(
+                view.manager_cls.reachable_block_mask, "use_eagle"
+            ):
+                mask_kwargs["use_eagle"] = index in self.drop_eagle_group_ids
+            mask = view.manager_cls.reachable_block_mask(**mask_kwargs)
             masks[index] = (
                 [True] * end_block if mask is None else mask
             )
@@ -355,16 +381,20 @@ class DfkvStoreCoordinator:
     ) -> int:
         """Hash-block-granular hit length over ``block_pool``.
 
-        Converges managers as the core coordinator does. Modern lookahead
-        hashes already prove draft boundaries; no API-era EAGLE block drop
-        is applied here on either engine generation.
+        Converges managers and applies the same drop-enabled group decisions
+        as core. Newer managers omit the argument by signature; load masks
+        continue to use their separate non-dropping path.
         """
         groups = sorted(
             self.attention_groups,
             key=lambda group: not is_full_attention(group.view),
         )
+        from .cache_api import is_mamba_group
+
         is_simple_hybrid = len(groups) == 2 and is_full_attention(groups[0].view)
         full_attention_hits: dict[int, int] = {}
+        # Verify each drop-enabled group at most once per candidate length.
+        eagle_verified: set[int] = set()
         hit_length = max_length
         while True:
             curr_hit_length = hit_length
@@ -372,13 +402,47 @@ class DfkvStoreCoordinator:
                 if index in full_attention_hits:
                     curr_hit_length = min(curr_hit_length, full_attention_hits[index])
                     continue
-                _, curr_hit_length = _find_hit_blocks(
+                drop_eagle_block = (
+                    self._manager_api
+                    and index not in eagle_verified
+                    and accepts_keyword(
+                        group.view.manager_cls.find_longest_cache_hit,
+                        "drop_eagle_block",
+                    )
+                    and any(
+                        gid in self.drop_eagle_group_ids
+                        for gid in group.group_ids
+                    )
+                )
+                candidate_max_length = curr_hit_length
+                if drop_eagle_block and not is_mamba_group(group.view):
+                    from vllm.v1.core.kv_cache_utils import eagle_proof_margin
+
+                    margin = eagle_proof_margin(
+                        group.view.block_size,
+                        self.hash_block_size,
+                        self.enable_partial_hash_hits
+                        and group.view.manager_cls.supports_fine_grained_hash_lookup,
+                    )
+                    # Probe the block that proves the current candidate, then
+                    # let the manager drop back to it instead of shortening twice.
+                    candidate_max_length = min(
+                        curr_hit_length + margin,
+                        len(block_hashes) * self.hash_block_size,
+                    )
+                _, new_hit_length = _find_hit_blocks(
                     group,
                     block_hashes=block_hashes,
-                    max_length=curr_hit_length,
+                    max_length=candidate_max_length,
                     block_pool=cast(BlockPool, block_pool),
                     alignment_tokens=self.hash_block_size,
+                    drop_eagle_block=drop_eagle_block,
                 )
+                if drop_eagle_block:
+                    eagle_verified.add(index)
+                elif new_hit_length < curr_hit_length:
+                    eagle_verified.clear()
+                curr_hit_length = new_hit_length
                 if is_full_attention(group.view):
                     full_attention_hits[index] = curr_hit_length
             if curr_hit_length >= hit_length:
@@ -394,9 +458,9 @@ class DfkvStoreCoordinator:
             return None
         hbs = self.hash_block_size
         if self._manager_api:
-            from vllm.v1.kv_cache_interface import get_reusable_prefix_length
+            from .cache_api import reusable_prefix_length
 
-            boundary = get_reusable_prefix_length(
+            boundary = reusable_prefix_length(
                 num_prompt_tokens,
                 num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
                 alignment_tokens=hbs,
