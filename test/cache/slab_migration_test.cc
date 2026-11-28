@@ -1,6 +1,7 @@
 #include "cache/slab_migration.h"
 
 #include <gtest/gtest.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -140,13 +141,28 @@ bool ReexecuteWithInterposer(const char* exact_filter) {
     return true;
   }
   executable[length] = '\0';
+  std::string preload = DFKV_MIGRATION_IO_INTERPOSER_PATH;
+  Dl_info asan_info{};
+  void* asan_init = ::dlsym(RTLD_DEFAULT, "__asan_init");
+  if (asan_init != nullptr && ::dladdr(asan_init, &asan_info) != 0 &&
+      asan_info.dli_fname != nullptr) {
+    const fs::path asan_runtime(asan_info.dli_fname);
+    const std::string filename = asan_runtime.filename().string();
+    if (filename.rfind("libasan.so", 0) == 0 ||
+        filename.rfind("libclang_rt.asan", 0) == 0) {
+      // The runtime must precede the interposer in the initial library list.
+      // A statically linked runtime resolves to the executable and needs no
+      // preload; the basename check keeps that executable out of LD_PRELOAD.
+      preload = asan_runtime.string() + ":" + preload;
+    }
+  }
   const pid_t child = ::fork();
   if (child < 0) {
     EXPECT_EQ(child, 0) << "cannot create scoped-preload test child";
     return true;
   }
   if (child == 0) {
-    if (::setenv("LD_PRELOAD", DFKV_MIGRATION_IO_INTERPOSER_PATH, 1) != 0 ||
+    if (::setenv("LD_PRELOAD", preload.c_str(), 1) != 0 ||
         ::setenv("DFKV_MIGRATION_IO_REEXECUTED", "1", 1) != 0) {
       std::perror("setenv scoped migration interposer");
       ::_exit(125);
