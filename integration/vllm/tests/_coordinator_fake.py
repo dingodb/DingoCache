@@ -28,4 +28,27 @@ def fake_coordinator(lcm_block_size: int = 64, **overrides) -> SimpleNamespace:
         "eagle_attn_group_indices": set(),
     }
     attributes.update(overrides)
+    attributes.setdefault(
+        "eagle_block_drop",
+        bool(
+            attributes["use_eagle"]
+            and not attributes["num_hash_lookahead_tokens"]
+        ),
+    )
+    if "drop_eagle_group_ids" not in attributes:
+        if attributes["eagle_block_drop"]:
+            drop_eagle_group_ids = {
+                index
+                for index, group in enumerate(attributes["kv_cache_groups"])
+                if getattr(group, "is_eagle_group", False)
+            }
+            attributes["drop_eagle_group_ids"] = drop_eagle_group_ids or set(
+                range(len(attributes["kv_cache_groups"]))
+            )
+        else:
+            attributes["drop_eagle_group_ids"] = set()
+    else:
+        attributes["drop_eagle_group_ids"] = set(
+            attributes["drop_eagle_group_ids"]
+        )
     return SimpleNamespace(**attributes)
