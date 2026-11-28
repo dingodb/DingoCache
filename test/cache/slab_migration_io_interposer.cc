@@ -33,6 +33,9 @@ struct State {
   std::string scenario;
   unsigned pread_stage = 0;
   unsigned pwrite_stage = 0;
+  int read_fd = -1;
+  off_t read_offset = -1;
+  std::string read_path;
   uint64_t committed_writes = 0;
   std::set<int> direct_fds;
   std::set<int> direct_read_fds;
@@ -89,7 +92,11 @@ void RefreshScenarioUnlocked() {
     state.scenario = scenario;
     state.pread_stage = 0;
     state.pwrite_stage = 0;
+    state.read_fd = -1;
+    state.read_offset = -1;
+    state.read_path.clear();
     state.committed_writes = 0;
+    state.direct_read_fds.clear();
   }
 }
 
@@ -158,17 +165,31 @@ extern "C" ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
 
   if (!path.empty() && state.direct_fds.count(fd) != 0 &&
       state.direct_read_fds.insert(fd).second) {
-    EventUnlocked("odirect_pread", path, offset, count, fd);
+    const char* event = state.scenario == "observe_ranges"
+                            ? "odirect_range_pread"
+                            : "odirect_pread";
+    EventUnlocked(event, path, offset, count, fd);
+  }
+  if (state.scenario == "observe_ranges" && !path.empty() &&
+      Contains(path, Environment("DFKV_MIGRATION_IO_WATCH").c_str()) &&
+      Contains(path, "/segments/") && state.direct_fds.count(fd) == 0) {
+    EventUnlocked("buffered_destination_range_pread", path, offset, count, fd);
   }
 
   const std::string target_text = Environment("DFKV_MIGRATION_IO_TARGET_READ_BYTES");
   const size_t target = target_text.empty()
                             ? 0
                             : static_cast<size_t>(std::strtoull(target_text.c_str(), nullptr, 10));
-  if (target != 0 && (count == target || (state.pread_stage == 2 && count == 1)) &&
+  const bool bound_completion =
+      state.pread_stage == 2 && count == 1 && fd == state.read_fd &&
+      path == state.read_path && offset == state.read_offset + static_cast<off_t>(target) - 1;
+  if (target != 0 && (count == target || bound_completion) &&
       SourceExtent(path) && state.scenario == "retry") {
     if (state.pread_stage == 0) {
       state.pread_stage = 1;
+      state.read_fd = fd;
+      state.read_offset = offset;
+      state.read_path = path;
       EventUnlocked("source_pread_eintr", path, offset, count, -EINTR);
       errno = EINTR;
       return -1;
