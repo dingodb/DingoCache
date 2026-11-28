@@ -4205,33 +4205,6 @@ Status RdmaTransport::PullInto(
   return Status::kIOError;
 }
 
-std::vector<Status> RdmaTransport::RangeInto(
-    const std::string& node, const std::vector<BlockKey>& keys,
-    const std::vector<RangeDst>& destinations,
-    std::vector<uint64_t>* value_lens) {
-  const size_t count = keys.size();
-  if (value_lens) value_lens->assign(count, 0);
-  if (destinations.size() != count) return InvalidStatuses(count);
-  std::vector<Status> result(count, Status::kInvalid);
-  std::vector<RangeDstSegment> segments;
-  segments.reserve(count);
-  std::vector<PullItem> items;
-  items.reserve(count);
-  for (size_t item = 0; item < count; ++item) {
-    const RangeDst& destination = destinations[item];
-    if (!ValidBuffer(destination.payload, destination.n) ||
-        NoteBlock(destination.n))
-      continue;
-    segments.emplace_back(destination.payload, destination.n,
-                          destination.memory_kind);
-    items.push_back(
-        PullItem{item, nullptr, 1, destination.n, destination.exact});
-  }
-  for (size_t i = 0; i < items.size(); ++i) items[i].segments = &segments[i];
-  PullIntoMany(node, keys, items, Lane::kData, &result, value_lens, nullptr);
-  return result;
-}
-
 void RdmaTransport::PullIntoMany(const std::string& node,
                                  const std::vector<BlockKey>& keys,
                                  const std::vector<PullItem>& items, Lane lane,
@@ -4750,49 +4723,6 @@ bool RdmaTransport::NoteBlock(size_t n) const {
                   "upstream (not an error). Raise DFKV_RDMA_MAX_BLOCK_BYTES. rejects=" +
                   std::to_string(k + 1));
   return true;
-}
-
-std::vector<Status> RdmaTransport::RangeIntoMulti(
-    const std::string& node, const std::vector<BlockKey>& keys,
-    const std::vector<RangeDstMulti>& destinations,
-    std::vector<size_t>* out_lengths, std::string* out_dev) {
-  const size_t count = keys.size();
-  if (out_lengths) out_lengths->assign(count, 0);
-  if (out_dev) out_dev->clear();
-  if (destinations.size() != count) return InvalidStatuses(count);
-  std::vector<Status> result(count, Status::kInvalid);
-  std::vector<PullItem> items;
-  items.reserve(count);
-  for (size_t item = 0; item < count; ++item) {
-    const auto& segments = destinations[item].payloads;
-    size_t capacity = 0;
-    bool valid = true;
-    for (const auto& segment : segments) {
-      size_t next = 0;
-      if (!ValidBuffer(segment.first, segment.second) ||
-          !CheckedAddSize(capacity, segment.second, &next)) {
-        valid = false;
-        break;
-      }
-      capacity = next;
-    }
-    if (!valid || NoteBlock(capacity)) continue;
-    items.push_back(
-        PullItem{item, segments.data(), segments.size(), capacity});
-  }
-  std::vector<uint64_t> value_lens(count, 0);
-  PullIntoMany(node, keys, items, Lane::kSgData, &result, &value_lens,
-               out_dev);
-  if (out_lengths) {
-    for (const PullItem& item : items) {
-      const uint64_t value_len = value_lens[item.index];
-      if (result[item.index] == Status::kOk ||
-          (result[item.index] == Status::kInvalid &&
-           value_len > item.capacity))
-        (*out_lengths)[item.index] = static_cast<size_t>(value_len);
-    }
-  }
-  return result;
 }
 
 }  // namespace dfkv
