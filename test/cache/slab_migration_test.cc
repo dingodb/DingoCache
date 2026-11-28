@@ -839,8 +839,8 @@ TEST_F(SlabMigrationTest, RealSyscallShortIoRetriesAndTerminalFaultsFailClosed) 
   ASSERT_TRUE(reopened->Close());
   reopened.reset();
 
-  for (const std::string terminal : {std::string("source_eof"),
-                                     std::string("destination_fail")}) {
+  for (const std::string& terminal : {std::string("source_eof"),
+                                      std::string("destination_fail")}) {
     SCOPED_TRACE(terminal);
     TearDown();
     SetUp();
@@ -913,7 +913,18 @@ TEST_F(SlabMigrationTest, MixedLayoutMultiSegmentDirectReopenVerifiesAllRanges) 
                                  0xabd000 + i},
                         std::move(value));
   }
-  CreateSource(values);
+  auto source_options = SourceOptions();
+  source_options.slot_granularity = 4096;
+  bool source_ok = false;
+  auto source_writer = std::make_unique<DiskSlabStore>(source_options, &source_ok);
+  ASSERT_TRUE(source_ok) << source_writer->StartupError();
+  for (const auto& value : values)
+    ASSERT_EQ(source_writer->Cache(value.first, value.second.data(), value.second.size()),
+              Status::kOk);
+  ASSERT_EQ(source_writer->Count(), values.size())
+      << "the source fixture must not evict any mixed-layout input";
+  ASSERT_TRUE(source_writer->Close());
+  source_writer.reset();
   std::string error;
   auto source = SlabSnapshot::Open(source_.string(), &error);
   ASSERT_NE(source, nullptr) << error;
