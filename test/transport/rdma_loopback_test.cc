@@ -12680,6 +12680,9 @@ TEST(RdmaLoopback, AConnectionCannotWriteAnotherConnectionsSlots) {
 
 // RDS-13: receive slots leased to a new connection hold none of the bytes
 // a previous connection left in them.
+namespace {
+bool WaitFor(const std::function<bool()>& done, int timeout_ms = 3000);
+}  // namespace
 TEST(RdmaLoopback, ANewConnectionsSlotsAreZeroed) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv uring("DFKV_SERVER_URING", "0");
@@ -12689,6 +12692,7 @@ TEST(RdmaLoopback, ANewConnectionsSlotsAreZeroed) {
   {
     PinnedPullPeer first;
     ASSERT_TRUE(first.Open(node));
+    ASSERT_TRUE(WaitFor([&] { return node.rsrv->ActiveConns() != 0; }));
     first_base = first.resident.base_addr;
     first_size = first.resident.slot_size;
     std::string marker(4096, 'R');
@@ -12853,7 +12857,7 @@ struct ServerPorts {
     for (size_t i = 0; i < rails.size(); ++i) state[i] = 1;
   }
 };
-bool WaitFor(const std::function<bool()>& done, int timeout_ms = 3000) {
+bool WaitFor(const std::function<bool()>& done, int timeout_ms) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(timeout_ms);
   while (!done()) {
