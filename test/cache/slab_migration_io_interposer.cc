@@ -165,8 +165,8 @@ extern "C" ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
   const size_t target = target_text.empty()
                             ? 0
                             : static_cast<size_t>(std::strtoull(target_text.c_str(), nullptr, 10));
-  if (target != 0 && count == target && SourceExtent(path) &&
-      state.scenario == "retry") {
+  if (target != 0 && (count == target || (state.pread_stage == 2 && count == 1)) &&
+      SourceExtent(path) && state.scenario == "retry") {
     if (state.pread_stage == 0) {
       state.pread_stage = 1;
       EventUnlocked("source_pread_eintr", path, offset, count, -EINTR);
@@ -206,7 +206,10 @@ extern "C" ssize_t pwritev2(int fd, const struct iovec* iov, int iovcnt,
   const std::string path =
       path_len > 0 ? std::string(path_buf, static_cast<size_t>(path_len)) : std::string();
   const size_t total = IovBytes(iov, iovcnt);
-  const bool record_write = StagingSegment(path) && offset >= 4096 && total >= 4096;
+  // For the 4 MiB migration geometry, 4190208 is the sealed trailer block,
+  // not a committed Cache record. Count only data-record writes before it.
+  const bool record_write = StagingSegment(path) && offset >= 4096 &&
+                            offset < 4190208 && total >= 4096;
   if (!record_write) return RealPwritev2(fd, iov, iovcnt, offset, flags);
 
   if (state.scenario == "retry" && state.pwrite_stage == 2 &&
