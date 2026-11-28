@@ -1,13 +1,15 @@
 """Compatibility checks against the real vLLM API loaded by the test run."""
 import importlib
+import inspect
 from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import pytest
 import torch
 
 from _cache_api import cache_group, full_attention_spec
 from dfkv_vllm.cache_api import cache_group_view, group_block_size, manager_api
-from dfkv_vllm.coordinator import _AttentionGroup, _find_hit_blocks
+from dfkv_vllm.coordinator import DfkvStoreCoordinator, _AttentionGroup, _find_hit_blocks
 
 
 def test_production_modules_import_on_the_current_engine():
@@ -42,7 +44,7 @@ def test_cache_fixture_builds_the_current_engines_real_group():
 
 
 @pytest.mark.skipif(not manager_api(), reason="manager-owned cache API required")
-def test_main_manager_lookup_does_not_pass_legacy_eagle_arguments(monkeypatch):
+def test_main_manager_lookup_passes_required_eagle_argument(monkeypatch):
     group = cache_group(
         ["attention"],
         full_attention_spec(
@@ -50,13 +52,13 @@ def test_main_manager_lookup_does_not_pass_legacy_eagle_arguments(monkeypatch):
         ),
     )
     view = cache_group_view(group)
-    calls = []
     result = object()
-
-    def find_longest_cache_hit(**kwargs):
-        calls.append(kwargs)
-        return result
-
+    parameters = inspect.signature(
+        view.manager_cls.find_longest_cache_hit
+    ).parameters
+    find_longest_cache_hit = create_autospec(
+        view.manager_cls.find_longest_cache_hit, return_value=result
+    )
     monkeypatch.setattr(
         view.manager_cls, "find_longest_cache_hit", find_longest_cache_hit
     )
@@ -69,11 +71,98 @@ def test_main_manager_lookup_does_not_pass_legacy_eagle_arguments(monkeypatch):
         drop_eagle_block=True,
     ) is result
 
-    (call,) = calls
-    assert call["block_size"] == group_block_size(group) == 16
-    assert call["manager_config"] is group.manager_config
-    assert "drop_eagle_block" not in call
-    assert "kv_cache_spec" not in call
+    (call,) = find_longest_cache_hit.call_args_list
+    kwargs = call.kwargs
+    assert kwargs["block_size"] == group_block_size(group) == 16
+    assert kwargs["manager_config"] is group.manager_config
+    if "drop_eagle_block" in parameters:
+        assert kwargs["drop_eagle_block"] is True
+    else:
+        assert "drop_eagle_block" not in kwargs
+    assert "kv_cache_spec" not in kwargs
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "lookahead", "alignment", "expected"),
+    [
+        (0, 0, 1, 0),
+        (1, 0, 16, 0),
+        (16, 0, 16, 0),
+        (17, 0, 16, 16),
+        (65, 16, 16, 48),
+        (32, 64, 16, 0),
+        (129, 64, 64, 64),
+    ],
+)
+def test_reusable_prefix_length_contract(num_tokens, lookahead, alignment, expected):
+    from dfkv_vllm.cache_api import reusable_prefix_length
+
+    assert reusable_prefix_length(num_tokens, lookahead, alignment) == expected
+
+
+@pytest.mark.skipif(not manager_api(), reason="manager-owned cache API required")
+@pytest.mark.parametrize("eagle", [False, True])
+@pytest.mark.parametrize("num_hash_lookahead_tokens", [0, 16])
+def test_modern_store_mask_passes_eagle_replay_and_group(
+    monkeypatch, eagle, num_hash_lookahead_tokens
+):
+    group = cache_group(
+        ["attention"],
+        full_attention_spec(
+            block_size=64, num_kv_heads=1, head_size=8, dtype=torch.float16
+        ),
+        is_eagle_group=eagle,
+    )
+    if hasattr(group, "is_eagle_group"):
+        # Mirrors vLLM's post-planning assignment before coordinator creation.
+        group.is_eagle_group = eagle
+    coordinator = DfkvStoreCoordinator(
+        [group],
+        64,
+        64,
+        use_eagle=eagle,
+        num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+    )
+    drop_eagle = eagle and not num_hash_lookahead_tokens
+    from vllm.v1.core.kv_cache_coordinator import replay_boundaries
+
+    replay_parameters = inspect.signature(replay_boundaries).parameters
+    replay = create_autospec(replay_boundaries, return_value=(255,))
+    monkeypatch.setattr(
+        "vllm.v1.core.kv_cache_coordinator.replay_boundaries", replay
+    )
+    mask_parameters = inspect.signature(
+        coordinator._views[0].manager_cls.reachable_block_mask
+    ).parameters
+    reachable_block_mask = create_autospec(
+        coordinator._views[0].manager_cls.reachable_block_mask,
+        return_value=[True] * 4,
+    )
+    monkeypatch.setattr(
+        coordinator._views[0].manager_cls,
+        "reachable_block_mask",
+        reachable_block_mask,
+    )
+
+    assert coordinator.store_mask(256, num_prompt_tokens=256) == ([True] * 4,)
+    assert replay.call_args.args == (256,)
+    replay_kwargs = replay.call_args.kwargs
+    assert replay_kwargs["num_hash_lookahead_tokens"] == num_hash_lookahead_tokens
+    if "use_eagle" in replay_parameters:
+        assert replay_kwargs["scheduler_block_size"] == 64
+        assert replay_kwargs["use_eagle"] is drop_eagle
+    else:
+        assert "scheduler_block_size" not in replay_kwargs
+        assert "use_eagle" not in replay_kwargs
+
+    (call,) = reachable_block_mask.call_args_list
+    mask_kwargs = call.kwargs
+    assert mask_kwargs["manager_config"] is group.manager_config
+    assert mask_kwargs["reachable_boundaries"] == (255,)
+    if "use_eagle" in mask_parameters:
+        assert mask_kwargs["use_eagle"] is drop_eagle
+    else:
+        assert "use_eagle" not in mask_kwargs
 
 
 def test_dcp_membership_uses_global_stage_ranks():

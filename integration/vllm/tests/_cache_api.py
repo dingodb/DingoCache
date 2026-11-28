@@ -66,6 +66,14 @@ class _UniformRecipe:
 def _recipe(spec, manager_cls, **manager_params):
     if _LEGACY:
         return spec
+    fields = {field.name for field in dataclasses.fields(manager_cls.Params)}
+    if "mamba_cache_mode" in fields:
+        # This vLLM generation migrated the old mode string into the manager;
+        # newer engines instead accept enable_prefix_caching as a bool.
+        enable_prefix_caching = manager_params.pop("enable_prefix_caching", False)
+        manager_params["mamba_cache_mode"] = (
+            "align" if enable_prefix_caching else "none"
+        )
     return _LayerRecipe(spec, manager_cls.config(**manager_params))
 
 

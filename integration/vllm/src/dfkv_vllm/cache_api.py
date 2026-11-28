@@ -40,6 +40,29 @@ def manager_api(group_or_config: Any | None = None) -> bool:
     return _manager_api_available()
 
 
+@lru_cache(maxsize=None)
+def accepts_keyword(callable_obj: Any, name: str) -> bool:
+    """Whether the running engine's callable explicitly declares a keyword."""
+    import inspect
+
+    return name in inspect.signature(callable_obj).parameters
+
+
+def reusable_prefix_length(
+    num_tokens: int,
+    num_hash_lookahead_tokens: int,
+    alignment_tokens: int = 1,
+) -> int:
+    """Return the aligned prefix allowed by known tokens on either manager API.
+
+    vLLM #61452 does not export ``get_reusable_prefix_length``. Later vLLM
+    versions define it with this exact bound: exclude the logit target and
+    hash lookahead, then round down to the engine's hash granularity.
+    """
+    token_limit = max(0, num_tokens - max(1, num_hash_lookahead_tokens))
+    return token_limit // alignment_tokens * alignment_tokens
+
+
 def _spec_layers(group: Any) -> tuple[tuple[str, KVCacheSpec], ...]:
     if manager_api(group):
         return tuple(sorted(group.kv_cache_specs.items()))

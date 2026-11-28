@@ -2728,11 +2728,17 @@ class DfkvStoreWorker:
         self._kv_cache_config = kv_cache_config
         manager_groups = manager_api(kv_cache_config)
         spec_cfg = getattr(vllm_config, "speculative_config", None)
-        use_eagle = not manager_groups and bool(
-            spec_cfg.use_eagle()
-            if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
-            else False
-        ) and not getattr(spec_cfg, "disable_eagle_block_drop", False)
+        if spec_cfg is not None and callable(
+            getattr(spec_cfg, "use_eagle_block_drop", None)
+        ):
+            use_eagle = bool(spec_cfg.use_eagle_block_drop())
+        else:
+            use_eagle = not manager_groups and bool(
+                spec_cfg.use_eagle()
+                if spec_cfg is not None
+                and callable(getattr(spec_cfg, "use_eagle", None))
+                else False
+            ) and not getattr(spec_cfg, "disable_eagle_block_drop", False)
         self.coord = DfkvStoreCoordinator(
             self._kv_cache_groups,
             scheduler_block_size=self.block_size,
