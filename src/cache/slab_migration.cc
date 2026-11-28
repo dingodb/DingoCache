@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdio>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -25,6 +26,7 @@
 
 #include "cache/log_store.h"
 #include "cache/lse_format.h"
+#include "cache/slab_allocator.h"
 #include "common/block_key_hash.h"
 #include "utils/crc32.h"
 #include "utils/crc32c.h"
@@ -308,15 +310,14 @@ bool SyncDirectory(const fs::path& path, std::string* error) {
   return true;
 }
 
-bool MarkIncomplete(int marker_fd, const fs::path& stage, const std::string& reason,
+bool MarkIncomplete(int marker_fd, int stage_fd, const std::string& reason,
                     std::string* error) {
   if (marker_fd < 0) return Fail(error, "incomplete marker descriptor was not reserved");
-  ScopedFd stage_fd(::open(stage.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
-  if (stage_fd.get() < 0) return Fail(error, ErrnoText("open incomplete staging directory", errno));
+  if (stage_fd < 0) return Fail(error, "incomplete staging directory descriptor was not reserved");
   if (::ftruncate(marker_fd, 0) != 0 || ::lseek(marker_fd, 0, SEEK_SET) != 0)
     return Fail(error, ErrnoText("reset incomplete staging marker", errno));
   const std::string unnamed_fd = "/proc/self/fd/" + std::to_string(marker_fd);
-  if (::linkat(AT_FDCWD, unnamed_fd.c_str(), stage_fd.get(), "STO14-MIGRATION-INCOMPLETE",
+  if (::linkat(AT_FDCWD, unnamed_fd.c_str(), stage_fd, "STO14-MIGRATION-INCOMPLETE",
                AT_SYMLINK_FOLLOW) != 0)
     return Fail(error, ErrnoText("materialize incomplete staging marker", errno));
   size_t done = 0;
@@ -327,7 +328,7 @@ bool MarkIncomplete(int marker_fd, const fs::path& stage, const std::string& rea
     else return Fail(error, ErrnoText("write incomplete staging marker", n < 0 ? errno : EIO));
   }
   if (::fdatasync(marker_fd) != 0) return Fail(error, ErrnoText("sync incomplete staging marker", errno));
-  if (::fsync(stage_fd.get()) != 0) return Fail(error, ErrnoText("fsync incomplete staging directory", errno));
+  if (::fsync(stage_fd) != 0) return Fail(error, ErrnoText("fsync incomplete staging directory", errno));
   return true;
 }
 
@@ -555,7 +556,7 @@ struct SlabSnapshot::Impl {
     for (const auto& file : extents) expected_extents.push_back(file.path);
     std::vector<std::string> actual_extents;
     if (!ListNames(extents_fd.get(), &actual_extents, error)) return false;
-    if (actual_extents != expected_extents) {
+    if (!ExtentInventoryMatches(expected_extents, actual_extents)) {
       std::string found;
       for (const auto& name : actual_extents) found += (found.empty() ? "" : ",") + name;
       return Fail(error, "source extent inventory changed; found: " + found);
@@ -674,6 +675,9 @@ std::unique_ptr<SlabSnapshot> SlabSnapshot::Open(const std::string& dir, std::st
     Fail(error, "slab table geometry overflows its native representation");
     return nullptr;
   }
+  SlabAllocator::Options allocator_options;
+  allocator_options.align = impl->slot_granularity;
+  allocator_options.extent_bytes = impl->extent_bytes;
   const uint64_t table_bytes = impl->extent_count * slots_per_extent * kRecordBytes;
   if (!OpenReadonly(impl->root_fd.get(), "slots.tbl", table_bytes, &impl->table, error))
     return nullptr;
@@ -704,7 +708,7 @@ std::unique_ptr<SlabSnapshot> SlabSnapshot::Open(const std::string& dir, std::st
   std::vector<std::string> expected_extents;
   expected_extents.reserve(impl->extent_count);
   for (const auto& file : impl->extents) expected_extents.push_back(file.path);
-  if (extent_names != expected_extents) {
+  if (!ExtentInventoryMatches(expected_extents, extent_names)) {
     Fail(error, "source extents contain missing, foreign or history files");
     return nullptr;
   }
@@ -776,9 +780,11 @@ std::unique_ptr<SlabSnapshot> SlabSnapshot::Open(const std::string& dir, std::st
                             entry.slot_size % impl->slot_granularity == 0 &&
                             entry.slot_size <= impl->extent_bytes &&
                             entry.payload_len <= entry.slot_size &&
-                            slot < impl->extent_bytes / entry.slot_size;
+                            slot < impl->extent_bytes / entry.slot_size &&
+                            SlabAllocator::CanonicalSlotSizeForGeometry(
+                                entry.slot_size, allocator_options) == entry.slot_size;
       if (!geometry) {
-        Fail(error, "STL3 row has invalid/mixed slot geometry");
+        Fail(error, "STL3 row has invalid, mixed or noncanonical slot geometry");
         return nullptr;
       }
       const auto [extent_class, inserted_class] =
@@ -854,10 +860,11 @@ MigrationResult MigrateToLse(const SlabSnapshot& source, const std::string& dest
     return result;
   };
   ScopedFd marker_fd;
+  ScopedFd stage_fd;
   auto fail_stage = [&](const std::string& message) {
     result.error = message;
     std::string marker_error;
-    if (!MarkIncomplete(marker_fd.get(), result.staging_dir, message, &marker_error))
+    if (!MarkIncomplete(marker_fd.get(), stage_fd.get(), message, &marker_error))
       result.error += "; also failed to mark staging: " + marker_error;
     return finish();
   };
@@ -877,10 +884,17 @@ MigrationResult MigrateToLse(const SlabSnapshot& source, const std::string& dest
     result.source_slot_charge += entry.slot_size;
     max_value = std::max<uint64_t>(max_value, entry.payload_len);
   }
+  const auto fits_largest_value = [max_value](uint64_t segment) {
+    // MaxRecordValue accounts for segment header, record header and trailer.
+    // Ordinary LogStore admission also reserves the minimum sealed summary.
+    const uint64_t raw_capacity = lse::MaxRecordValue(segment);
+    return raw_capacity >= lse::kBlockBytes &&
+           raw_capacity - lse::kBlockBytes >= max_value;
+  };
   uint64_t segment_bytes = kMinSegmentBytes;
-  while (segment_bytes < kMaxSegmentBytes && lse::MaxRecordValue(segment_bytes) < max_value)
+  while (segment_bytes < kMaxSegmentBytes && !fits_largest_value(segment_bytes))
     segment_bytes *= 2;
-  if (lse::MaxRecordValue(segment_bytes) < max_value) {
+  if (!fits_largest_value(segment_bytes)) {
     result.error = "largest slab value exceeds ordinary LSE MaxValueBytes";
     return finish();
   }
@@ -967,6 +981,13 @@ MigrationResult MigrateToLse(const SlabSnapshot& source, const std::string& dest
                       : "staging appeared concurrently; refusing existing tree";
     return finish();
   }
+  // Keep the staging directory available for every failure-marking path,
+  // including a partially opened verifier under RLIMIT_NOFILE exhaustion.
+  stage_fd.Reset(::open(stage.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+  if (stage_fd.get() < 0) {
+    result.error = ErrnoText("open staging directory for failure ownership", errno);
+    return finish();
+  }
   // No O_EXCL: /proc/self/fd/N may materialize this unnamed inode on failure.
   // The directory inventory stays clear for the ordinary LSE constructor.
   marker_fd.Reset(::open(stage.c_str(), O_TMPFILE | O_WRONLY | O_CLOEXEC, 0600));
@@ -988,7 +1009,7 @@ MigrationResult MigrateToLse(const SlabSnapshot& source, const std::string& dest
     std::optional<LogStore> writer(std::in_place, options, &opened);
     if (!opened) {
       const auto startup_error = writer->StartupError();
-      writer.reset();  // release partial-open FDs before opening the marker directory.
+      writer.reset();  // release partial-open FDs before failure marking.
       return fail_stage("cannot create ordinary LSE writer: " + startup_error);
     }
     for (size_t i = 0; i < source.entries().size(); ++i) {
@@ -1016,12 +1037,16 @@ MigrationResult MigrateToLse(const SlabSnapshot& source, const std::string& dest
     options.preopen = false;
     options.open_segments = 1;
     bool reopened = false;
-    LogStore verifier(options, &reopened);
-    if (!reopened) return fail_stage("candidate cannot reopen through ordinary LSE: " + verifier.StartupError());
-    if (verifier.Count() != source.entries().size())
+    std::optional<LogStore> verifier(std::in_place, options, &reopened);
+    if (!reopened) {
+      const auto startup_error = verifier->StartupError();
+      verifier.reset();  // release partial-open FDs before failure marking.
+      return fail_stage("candidate cannot reopen through ordinary LSE: " + startup_error);
+    }
+    if (verifier->Count() != source.entries().size())
       return fail_stage("reopened LSE live count differs from source");
     KnownKeys reopened_keys;
-    verifier.ForEachKey([&](const BlockKey& key) { reopened_keys.emplace(key, 0); });
+    verifier->ForEachKey([&](const BlockKey& key) { reopened_keys.emplace(key, 0); });
     if (reopened_keys.size() != source_keys.size())
       return fail_stage("reopened LSE key set size differs from source");
     for (const auto& entry : source.entries()) {
@@ -1029,11 +1054,11 @@ MigrationResult MigrateToLse(const SlabSnapshot& source, const std::string& dest
         return fail_stage("reopened LSE is missing exact source key " + entry.key.Filename());
       std::string actual;
       size_t actual_len = 0;
-      if (verifier.Range(entry.key, 0, 0, &actual, &actual_len) != Status::kOk ||
+      if (verifier->Range(entry.key, 0, 0, &actual, &actual_len) != Status::kOk ||
           actual_len != entry.payload_len || Sha256(actual.data(), actual.size()) != expected[entry.key].sha256)
         return fail_stage("reopened LSE payload/length differs for " + entry.key.Filename());
       ValueMetadata metadata{};
-      if (verifier.Lookup(entry.key, &metadata) != Status::kOk || metadata.generation == 0 ||
+      if (verifier->Lookup(entry.key, &metadata) != Status::kOk || metadata.generation == 0 ||
           metadata.value_len != entry.payload_len)
         return fail_stage("reopened LSE Lookup differs for " + entry.key.Filename());
       expected[entry.key].generation = metadata.generation;
@@ -1050,7 +1075,7 @@ MigrationResult MigrateToLse(const SlabSnapshot& source, const std::string& dest
       record.source_payload_crc = original.payload_crc;
     }
     result.records = std::move(audited);
-    if (!verifier.Close()) return fail_stage("candidate LSE verifier did not close cleanly");
+    if (!verifier->Close()) return fail_stage("candidate LSE verifier did not close cleanly");
   }  // verifier is destroyed, its lock and descriptors released before publish.
   if (!source.VerifyUnchanged(&result.error)) return fail_stage(result.error);
   result.source_after = result.source_before;

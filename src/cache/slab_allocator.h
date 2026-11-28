@@ -90,6 +90,12 @@ class SlabAllocator {
     std::function<bool(const SlotRef&)> on_slot_evict;
   };
 
+  // Compute the allocator's canonical class using its established align,
+  // extent geometry and max-waste policy. The Options must be normalized
+  // before this shared calculation; no allocator/store must be constructed.
+  static uint32_t CanonicalSlotSizeForGeometry(size_t aligned_len,
+                                               const Options& opt);
+
   // An extent moves to another size class only if its residents are, on
   // average, this many times longer unused than those of the extent the
   // other class would lose first of its own.
@@ -409,7 +415,6 @@ class SlabAllocator {
   };
 
   uint64_t TailAgeLocked(const Class& cls) const;
-  uint32_t CanonicalSlotSize(size_t aligned_len) const;
   size_t ClassForLen(size_t aligned_len);
   size_t ClassForExactSize(uint32_t slot_size);
   ExtentBindResult BindExtentLocked(size_t cls, uint32_t extent,

@@ -50,7 +50,7 @@ class SlabAllocatorTestPeer {
       if (entry.slot_size == 0 || entry.extent >= a->extents_.size() ||
           entry.slot_size > a->opt_.extent_bytes ||
           entry.value_bytes > entry.slot_size ||
-          a->CanonicalSlotSize(entry.slot_size) != entry.slot_size ||
+          SlabAllocator::CanonicalSlotSizeForGeometry(entry.slot_size, a->opt_) != entry.slot_size ||
           a->ClassForExactSize(entry.slot_size) == a->classes_.size() ||
           entry.slot >= a->opt_.extent_bytes / entry.slot_size ||
           a->index_.Find(entry.key) != nullptr)
