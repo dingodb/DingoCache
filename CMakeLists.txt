@@ -120,6 +120,8 @@ add_executable(dfkv_mds ${CMAKE_CURRENT_SOURCE_DIR}/src/mds/dfkv_mds_main.cc)
 target_link_libraries(dfkv_mds PRIVATE dfkv_core)
 add_executable(dfkv_smoke ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_smoke_main.cc)
 target_link_libraries(dfkv_smoke PRIVATE dfkv_core)
+add_executable(dfkv_slab_migrate ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_slab_migrate_main.cc)
+target_link_libraries(dfkv_slab_migrate PRIVATE dfkv_core)
 add_executable(dfkvctl ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkvctl_main.cc)
 target_link_libraries(dfkvctl PRIVATE dfkv_core)
 add_executable(dfkv_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_bench_main.cc)
@@ -181,6 +183,9 @@ install(FILES CMakeLists.txt Makefile Dockerfile .dockerignore
 # --- tests ---
 if(DFKV_BUILD_TESTS)
   enable_testing()
+  add_executable(dfkv_slab_fixture_repack
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/support/slab_fixture_repack_main.cc)
+  target_link_libraries(dfkv_slab_fixture_repack PRIVATE dfkv_core)
   include(FetchContent)
   FetchContent_Declare(googletest
     URL https://github.com/google/googletest/releases/download/v1.17.0/googletest-1.17.0.tar.gz

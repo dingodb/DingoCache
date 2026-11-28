@@ -5,6 +5,8 @@ numpy host buffers (CPU), and asserts MLA single-object keying, backup_skip,
 batch_exists longest-prefix, and header-mismatch => miss.
 """
 import ctypes
+import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -1391,6 +1393,159 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 self.assertEqual(restored["side"], [True, True, True, False])
                 for i in range(3):
                     self.assertEqual(side2.page_bytes_at(i), expected_side[i])
+
+    def test_sto14_migrates_real_slab_anchor_variants_to_lse(self):
+        """Native writers, ordinary migration, and genuine connector reopen.
+
+        No-layout is a connector contract only. The source values remain opaque
+        to migration: exact tenant/digest tuples and marker/side/reference bytes
+        are copied without marker classification or lineage reconstruction.
+        """
+        from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+
+        repack_bin = os.path.join(BUILD, "dfkv_slab_fixture_repack")
+        migrate_bin = os.path.join(BUILD, "dfkv_slab_migrate")
+
+        def hashes(root):
+            result = {}
+            for base, dirs, files in os.walk(root):
+                dirs.sort()
+                for name in sorted(files):
+                    path = os.path.join(base, name)
+                    with open(path, "rb") as source:
+                        result[os.path.relpath(path, root)] = hashlib.sha256(
+                            source.read()).hexdigest()
+            return result
+
+        for pool_type in (FakeLogicalAnchorPool, FakeTupleNoneAnchorPool):
+            with self.subTest(pool=pool_type.__name__):
+                tag = "sto14_" + pool_type.__name__
+                members, _, original = self._node(
+                    tag, engine_args=("--store-engine", "slab"),
+                    env={"DFKV_SLAB_WRITE": "buffered"})
+                st = self._plugin(self._cfg(members, model="glm-5.2"),
+                                  pool_type(self.PAGE_SIZE))
+                side = FakeMlaPool(4, self.PAGE_BYTES, self.PAGE_SIZE)
+                st.register_mem_host_pool_v2(side, "side")
+
+                def markers(keys):
+                    self.assertEqual(
+                        st.batch_set_v1(keys, list(range(len(keys) * self.PAGE_SIZE))),
+                        [True] * len(keys))
+
+                def side_put(keys, indices, salt):
+                    for index, value in zip(indices, salt):
+                        side.fill_page(index, value)
+                    transfer = PoolTransfer(
+                        name="side",
+                        host_indices=[i for i in range((max(indices) + 1) * self.PAGE_SIZE)],
+                        keys=keys)
+                    self.assertEqual(st.batch_set_v2([transfer])["side"],
+                                     [True] * len(keys))
+
+                full = ["full0", "full1", "full2", "full3"]
+                no_anchor = ["noanchor0", "noanchor1", "noanchor2", "noanchor3"]
+                no_side = ["noside0", "noside1", "noside2", "noside3"]
+                markers(full)
+                side_put(full, list(range(4)), [41, 42, 43, 44])
+                markers(no_anchor[:3])
+                side_put(no_anchor, list(range(4)), [51, 52, 53, 54])
+                markers(no_side)
+                side_put(no_side[:3], list(range(3)), [61, 62, 63])
+                # A genuine ordinary one-byte PUT stays 0x7f and is not promoted
+                # into an anchor by value length, byte value, or key proximity.
+                self.assertTrue(st.set("native_reference_7f", b"\x7f"))
+
+                st.__del__()
+                original_process = self.procs[-1]
+                original_process.terminate()
+                original_process.wait(timeout=10)
+
+                workspace = tempfile.mkdtemp(prefix="dfkv_sto14_migrate_")
+                self.dirs.append(workspace)
+                small = os.path.join(workspace, "small-slab")
+                candidate = os.path.join(workspace, "candidate")
+                report_path = os.path.join(workspace, "migration.json")
+                # Preserve connector output in actual 1 MiB native extents; this
+                # shrinks geometry only and does not construct or interpret keys.
+                repack = subprocess.run(
+                    [repack_bin, original, small], text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+                self.assertEqual(repack.returncode, 0,
+                                 msg=repack.stdout + repack.stderr)
+                self.assertIn("repacked_values=23", repack.stdout)
+                before = hashes(small)
+                migrated = subprocess.run(
+                    [migrate_bin, small, candidate, report_path], text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+                self.assertEqual(migrated.returncode, 0,
+                                 msg=migrated.stdout + migrated.stderr)
+                self.assertEqual(hashes(small), before)
+                with open(report_path, encoding="utf-8") as source:
+                    report = json.load(source)
+                self.assertTrue(report["ok"])
+                self.assertTrue(report["published"])
+                self.assertTrue(report["source_unchanged"])
+                self.assertEqual(report["record_count"], 23)
+                self.assertEqual(report["source_slot_charge"], 23 * (1 << 20))
+                self.assertFalse(os.path.exists(candidate + ".sto14-staging"))
+                self.assertIn(hashlib.sha256(b"\x7f").hexdigest(),
+                              [r["value_sha256"] for r in report["records"]])
+                for record in report["records"]:
+                    self.assertEqual(record["header_len"], 88)
+                    self.assertGreater(record["generation"], 0)
+                    self.assertGreaterEqual(record["write_lsn"], record["generation"])
+                    if record["value_len"] == 1:
+                        self.assertEqual(record["flags"] & 1, 1)
+                        self.assertEqual(record["footprint"], 4096)
+                    elif record["value_len"] == 4096:
+                        self.assertEqual(record["footprint"], 8192)
+
+                process = subprocess.Popen(
+                    [SERVER_BIN, "--dir", candidate, "--port", "0",
+                     "--cap", str(report["capacity_bytes"]),
+                     "--store-engine", "log"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.procs.append(process)
+                greeting = process.stdout.readline().strip()
+                self.assertTrue(greeting.startswith("PORT "), msg=greeting)
+                port = int(greeting.split()[1])
+                migrated_members = f"{tag}=127.0.0.1:{port}"
+                st2 = self._plugin(self._cfg(migrated_members, model="glm-5.2"),
+                                   pool_type(self.PAGE_SIZE))
+                side2 = FakeMlaPool(4, self.PAGE_BYTES, self.PAGE_SIZE)
+                st2.register_mem_host_pool_v2(side2, "side")
+
+                def usable(keys):
+                    transfer = PoolTransfer(
+                        name="side", host_indices=list(range(4 * self.PAGE_SIZE)),
+                        keys=keys)
+                    return st2.batch_exists_v2(keys, [transfer]).kv_hit_pages
+
+                self.assertEqual(st2.batch_exists(full), 4)
+                self.assertEqual(usable(full), 4)
+                # The orphan fourth side payload cannot create a fourth anchor.
+                self.assertEqual(st2.batch_exists(no_anchor), 3)
+                self.assertEqual(usable(no_anchor), 3)
+                # Complete primary markers remain primary=4 while the absent
+                # fourth side payload narrows the usable prefix to 3.
+                self.assertEqual(st2.batch_exists(no_side), 4)
+                self.assertEqual(usable(no_side), 3)
+
+                transfer = PoolTransfer(
+                    name="side", host_indices=list(range(4 * self.PAGE_SIZE)),
+                    keys=full)
+                readback = st2.batch_get_v2([transfer])
+                self.assertEqual(readback["side"], [True] * 4)
+                for index, value in enumerate([41, 42, 43, 44]):
+                    self.assertEqual(side2.page_bytes_at(index),
+                                     bytes([value]) * self.PAGE_BYTES)
+                reference = FlatBuf(1)
+                self.assertIs(st2.get("native_reference_7f", reference), reference)
+                self.assertEqual(reference.arr.tobytes(), b"\x7f")
+                st2.__del__()
+                process.terminate()
+                process.wait(timeout=10)
 
     def test_v2_exists_trailing_pool_sliding_window(self):
         # TRAILING_PAGES (SWA / Mamba state): only the last N pages of a prefix
