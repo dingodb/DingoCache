@@ -125,11 +125,18 @@ void PrintInterposerEvidence(const std::string& scenario, const fs::path& log) {
 bool ReexecuteWithInterposer(const char* exact_filter) {
   const char* active = ::getenv("DFKV_MIGRATION_IO_INTERPOSE_ACTIVE");
   if (active != nullptr && std::string(active) == "1") return false;
+  const char* reexecuted = ::getenv("DFKV_MIGRATION_IO_REEXECUTED");
+  if (reexecuted != nullptr && std::string(reexecuted) == "1") {
+    EXPECT_STREQ(active, "1") << "scoped preload did not activate; refusing recursive reexec";
+    return true;
+  }
   char executable[4096];
   const ssize_t length =
       ::readlink("/proc/self/exe", executable, sizeof(executable) - 1);
-  if (length <= 0) {
-    EXPECT_NE(length, 0) << "cannot resolve the test executable for scoped preload";
+  if (length <= 0 || length >= static_cast<ssize_t>(sizeof(executable) - 1)) {
+    EXPECT_GT(length, 0) << "cannot resolve the test executable for scoped preload";
+    EXPECT_LT(length, static_cast<ssize_t>(sizeof(executable) - 1))
+        << "test executable path was truncated";
     return true;
   }
   executable[length] = '\0';
@@ -139,7 +146,11 @@ bool ReexecuteWithInterposer(const char* exact_filter) {
     return true;
   }
   if (child == 0) {
-    ::setenv("LD_PRELOAD", DFKV_MIGRATION_IO_INTERPOSER_PATH, 1);
+    if (::setenv("LD_PRELOAD", DFKV_MIGRATION_IO_INTERPOSER_PATH, 1) != 0 ||
+        ::setenv("DFKV_MIGRATION_IO_REEXECUTED", "1", 1) != 0) {
+      std::perror("setenv scoped migration interposer");
+      ::_exit(125);
+    }
     ::execl(executable, executable, "--gtest_color=no",
             (std::string("--gtest_filter=") + exact_filter).c_str(),
             static_cast<char*>(nullptr));
