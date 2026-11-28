@@ -10,10 +10,13 @@
 #include <array>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -83,6 +86,91 @@ void WriteBytes(const fs::path& path, const std::vector<uint8_t>& bytes) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   ASSERT_TRUE(out.good());
+}
+
+std::string ReadText(const fs::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+}
+
+size_t CountSubstring(const std::string& text, const std::string& needle) {
+  size_t count = 0;
+  for (size_t at = 0; (at = text.find(needle, at)) != std::string::npos;
+       at += needle.size())
+    ++count;
+  return count;
+}
+
+fs::path ArmInterposer(const fs::path& root, const std::string& scenario,
+                       size_t target_read_bytes = 0) {
+  const fs::path log = root / "migration-io-events.log";
+  WriteBytes(log, {});
+  EXPECT_EQ(::setenv("DFKV_MIGRATION_IO_SCENARIO", scenario.c_str(), 1), 0);
+  const std::string target = std::to_string(target_read_bytes);
+  EXPECT_EQ(::setenv("DFKV_MIGRATION_IO_TARGET_READ_BYTES", target.c_str(), 1), 0);
+  EXPECT_EQ(::setenv("DFKV_MIGRATION_IO_INTERPOSE_LOG", log.c_str(), 1), 0);
+  EXPECT_EQ(::unsetenv("DFKV_MIGRATION_IO_WATCH"), 0);
+  return log;
+}
+
+void PrintInterposerEvidence(const std::string& scenario, const fs::path& log) {
+  const std::string evidence = ReadText(log);
+  std::cout << "MIGRATION_IO_EVIDENCE_BEGIN " << scenario << "\n"
+            << evidence << "MIGRATION_IO_EVIDENCE_END " << scenario << std::endl;
+}
+
+void ExpectMigratedRecords(const dfkv::slab_migration::MigrationResult& result,
+                           const Values& values) {
+  ASSERT_EQ(result.records.size(), values.size());
+  std::map<std::string, const std::pair<BlockKey, std::string>*> expected;
+  for (const auto& value : values)
+    ASSERT_TRUE(expected.emplace(value.first.Filename(), &value).second);
+  for (const auto& record : result.records) {
+    const auto found = expected.find(record.key.Filename());
+    ASSERT_NE(found, expected.end()) << record.key.Filename();
+    EXPECT_EQ(record.key.tenant_hash, found->second->first.tenant_hash);
+    EXPECT_EQ(record.key.digest_hi, found->second->first.digest_hi);
+    EXPECT_EQ(record.key.digest_lo, found->second->first.digest_lo);
+    EXPECT_EQ(record.value_len, found->second->second.size());
+    EXPECT_EQ(record.value_sha256, Digest(found->second->second));
+    EXPECT_TRUE(record.source_has_payload_crc);
+    EXPECT_GT(record.source_slot_charge, 0u);
+    EXPECT_GT(record.generation, 0u);
+    EXPECT_GE(record.write_lsn, record.generation);
+    const bool inline_record =
+        dfkv::lse::RecordFitsInline(found->second->second.size());
+    dfkv::lse::RecordHeader shape{};
+    shape.value_len = found->second->second.size();
+    shape.flags = inline_record ? dfkv::lse::kRecordFlagInline : 0;
+    EXPECT_EQ(record.footprint, dfkv::lse::RecordFootprint(shape));
+    EXPECT_EQ((record.flags & dfkv::lse::kRecordFlagInline) != 0,
+              inline_record);
+    EXPECT_EQ(record.header_len, dfkv::lse::kRecordHeaderBytes);
+  }
+}
+
+void ExpectEveryValue(LogStore* store, const Values& values) {
+  ASSERT_EQ(store->Count(), values.size());
+  std::set<std::string> keys;
+  store->ForEachKey([&](const BlockKey& key) { keys.insert(key.Filename()); });
+  ASSERT_EQ(keys.size(), values.size());
+  for (const auto& value : values) {
+    SCOPED_TRACE(value.first.Filename());
+    EXPECT_EQ(keys.count(value.first.Filename()), 1u);
+    std::string actual;
+    size_t actual_len = 0;
+    ASSERT_EQ(store->Range(value.first, 0, 0, &actual, &actual_len),
+              Status::kOk);
+    ASSERT_EQ(actual_len, value.second.size());
+    EXPECT_EQ(actual.size(), value.second.size());
+    EXPECT_EQ(actual, value.second);
+    EXPECT_EQ(Digest(actual), Digest(value.second));
+    dfkv::ValueMetadata metadata{};
+    ASSERT_EQ(store->Lookup(value.first, &metadata), Status::kOk);
+    EXPECT_EQ(metadata.value_len, value.second.size());
+    EXPECT_GT(metadata.generation, 0u);
+  }
 }
 
 size_t OpenFdCount() {
@@ -599,6 +687,316 @@ TEST_F(SlabMigrationTest, CandidateVerificationFailureStillMarksIncompleteUnderE
       << "bounded FD scenarios did not reach read-only candidate verification with EMFILE";
   ExpectRootUnchanged(source_, before);
   EXPECT_TRUE(source->VerifyUnchanged(&error)) << error;
+}
+
+TEST_F(SlabMigrationTest, DirectBatchProducerMigratesOfflineWithExactValues) {
+  Values values;
+  for (uint64_t i = 0; i < 12; ++i) {
+    std::string value(3000 + i * 701, static_cast<char>(31 + i));
+    for (size_t p = i; p < value.size(); p += 997)
+      value[p] = static_cast<char>((i * 29 + p) % 256);
+    values.emplace_back(BlockKey{0x4100 + i, 0x5100 + i * 3,
+                                 0xd1ec7000 + i},
+                        std::move(value));
+  }
+
+  auto options = SourceOptions();
+  options.slot_granularity = 4096;
+  options.direct_writes = true;
+  ASSERT_EQ(::setenv("DFKV_SLAB_URING_WRITE", "1", 1), 0);
+  bool ok = false;
+  auto writer = std::make_unique<DiskSlabStore>(options, &ok);
+  ASSERT_TRUE(ok) << writer->StartupError();
+  ASSERT_TRUE(writer->DirectWritesActive())
+      << "the runtime trial requires an O_DIRECT-capable source filesystem";
+
+  using Aligned = std::unique_ptr<char, void (*)(void*)>;
+  std::vector<Aligned> buffers;
+  std::vector<DiskSlabStore::CacheBatchItem> items;
+  for (const auto& value : values) {
+    const size_t cap = (value.second.size() + 4095) & ~size_t{4095};
+    void* memory = nullptr;
+    ASSERT_EQ(::posix_memalign(&memory, 4096, cap), 0);
+    Aligned buffer(static_cast<char*>(memory), &std::free);
+    std::memcpy(buffer.get(), value.second.data(), value.second.size());
+    items.push_back({value.first, buffer.get(), value.second.size(), cap});
+    buffers.push_back(std::move(buffer));
+  }
+  const auto statuses = writer->CacheDirectBatch(items);
+  ASSERT_EQ(statuses.size(), values.size());
+  for (size_t i = 0; i < statuses.size(); ++i)
+    ASSERT_EQ(statuses[i], Status::kOk) << i;
+  const auto direct_stats = writer->GetStats();
+  EXPECT_EQ(direct_stats.dio_write_fallbacks, 0u);
+  ASSERT_GE(direct_stats.uring_write_batches, 1u)
+      << "no actual io_uring batch was submitted";
+  EXPECT_GE(direct_stats.batched_writes, values.size())
+      << "not every eligible direct item completed on the CQE path";
+  std::cout << "DIRECT_PRODUCER_EVIDENCE odirect_active=1 eligible_items="
+            << values.size() << " uring_write_batches="
+            << direct_stats.uring_write_batches << " cqe_full_writes="
+            << direct_stats.batched_writes << " dio_fallbacks="
+            << direct_stats.dio_write_fallbacks << std::endl;
+  ASSERT_TRUE(writer->Close());
+  writer.reset();
+  buffers.clear();
+  MakeSourceReadonly();
+
+  std::string error;
+  auto source = SlabSnapshot::Open(source_.string(), &error);
+  ASSERT_NE(source, nullptr) << error;
+  ASSERT_EQ(source->entries().size(), values.size());
+  const auto before = RootHashes(source_);
+  auto result = MigrateToLse(*source, destination_.string());
+  ASSERT_TRUE(result.ok) << result.error;
+  ASSERT_TRUE(result.published);
+  ASSERT_TRUE(result.source_unchanged);
+  ExpectRootUnchanged(source_, before);
+  ExpectMigratedRecords(result, values);
+  EXPECT_TRUE(fs::exists(destination_));
+  EXPECT_FALSE(fs::exists(result.staging_dir));
+  std::cout << "DIRECT_PRODUCER_MIGRATION_RESULT "
+            << dfkv::slab_migration::ResultJson(result) << std::endl;
+
+  LogStore::Options reopen_options;
+  reopen_options.dir = destination_.string();
+  reopen_options.capacity_bytes = result.capacity_bytes;
+  reopen_options.cleaner = false;
+  reopen_options.preopen = false;
+  reopen_options.open_segments = 1;
+  auto reopened = std::make_unique<LogStore>(reopen_options, &ok);
+  ASSERT_TRUE(ok) << reopened->StartupError();
+  ExpectEveryValue(reopened.get(), values);
+  ASSERT_TRUE(reopened->Close());
+  reopened.reset();
+  ExpectRootUnchanged(source_, before);
+  ASSERT_TRUE(source->VerifyUnchanged(&error)) << error;
+}
+
+TEST_F(SlabMigrationTest, RealSyscallShortIoRetriesAndTerminalFaultsFailClosed) {
+  ASSERT_EQ(std::string(::getenv("DFKV_MIGRATION_IO_INTERPOSE_ACTIVE") == nullptr
+                            ? ""
+                            : ::getenv("DFKV_MIGRATION_IO_INTERPOSE_ACTIVE")),
+            "1")
+      << "run this case with the bounded slab_migration_io_interposer preloaded";
+
+  const auto make_values = [] {
+    return Values{
+        {BlockKey{0x6100, 0x7100, 0xf100}, std::string(5001, 'R')},
+        {BlockKey{0x6101, 0x7101, 0xf101}, std::string(5002, 'S')},
+        {BlockKey{0x6102, 0x7102, 0xf102}, std::string(37, 'T')},
+        {BlockKey{0x6103, 0x7103, 0xf103}, std::string(9003, 'U')}};
+  };
+  const Values values = make_values();
+  auto options = SourceOptions();
+  options.slot_granularity = 4096;
+  bool ok = false;
+  auto initial = std::make_unique<DiskSlabStore>(options, &ok);
+  ASSERT_TRUE(ok) << initial->StartupError();
+  for (const auto& value : values)
+    ASSERT_EQ(initial->Cache(value.first, value.second.data(), value.second.size()),
+              Status::kOk);
+  ASSERT_TRUE(initial->Close());
+  initial.reset();
+  std::string error;
+  auto source = SlabSnapshot::Open(source_.string(), &error);
+  ASSERT_NE(source, nullptr) << error;
+
+  const auto before = RootHashes(source_);
+  const fs::path retry_log = ArmInterposer(root_, "retry", values[1].second.size());
+  auto result = MigrateToLse(*source, destination_.string());
+  PrintInterposerEvidence("retry", retry_log);
+  const std::string retry_evidence = ReadText(retry_log);
+  EXPECT_EQ(CountSubstring(retry_evidence, "event=source_pread_eintr "), 1u);
+  EXPECT_EQ(CountSubstring(retry_evidence, "event=source_pread_short "), 1u);
+  EXPECT_EQ(CountSubstring(retry_evidence, "event=source_pread_retry_completed "), 1u);
+  EXPECT_NE(retry_evidence.find("event=source_pread_short "), std::string::npos);
+  EXPECT_NE(retry_evidence.find("bytes=5002 result=5001"), std::string::npos);
+  EXPECT_NE(retry_evidence.find("event=source_pread_retry_completed "), std::string::npos);
+  EXPECT_NE(retry_evidence.find("bytes=1 result=1"), std::string::npos);
+  EXPECT_EQ(CountSubstring(retry_evidence, "event=destination_pwritev2_eintr "), 1u);
+  EXPECT_EQ(CountSubstring(retry_evidence, "event=destination_pwritev2_short "), 1u);
+  EXPECT_NE(retry_evidence.find("event=destination_pwritev2_short "), std::string::npos);
+  EXPECT_NE(retry_evidence.find("bytes=9097 result=4097"), std::string::npos);
+  EXPECT_NE(retry_evidence.find("event=destination_pwritev2_retry_completed "),
+            std::string::npos);
+  EXPECT_NE(retry_evidence.find("offset=8193 bytes=5000 result=5000"),
+            std::string::npos);
+  ASSERT_TRUE(result.ok) << result.error;
+  EXPECT_TRUE(result.published);
+  EXPECT_TRUE(result.source_unchanged);
+  ExpectMigratedRecords(result, values);
+  ExpectRootUnchanged(source_, before);
+  std::cout << "RETRY_MIGRATION_RESULT "
+            << dfkv::slab_migration::ResultJson(result) << std::endl;
+  LogStore::Options reopened_options;
+  reopened_options.dir = destination_.string();
+  reopened_options.capacity_bytes = result.capacity_bytes;
+  reopened_options.cleaner = false;
+  auto reopened = std::make_unique<LogStore>(reopened_options, &ok);
+  ASSERT_TRUE(ok) << reopened->StartupError();
+  ExpectEveryValue(reopened.get(), values);
+  ASSERT_TRUE(reopened->Close());
+  reopened.reset();
+
+  for (const std::string terminal : {std::string("source_eof"),
+                                     std::string("destination_fail")}) {
+    SCOPED_TRACE(terminal);
+    TearDown();
+    SetUp();
+    const Values terminal_values = make_values();
+    auto fresh_options = SourceOptions();
+    fresh_options.slot_granularity = 4096;
+    auto fresh = std::make_unique<DiskSlabStore>(fresh_options, &ok);
+    ASSERT_TRUE(ok) << fresh->StartupError();
+    for (const auto& value : terminal_values)
+      ASSERT_EQ(fresh->Cache(value.first, value.second.data(), value.second.size()),
+                Status::kOk);
+    ASSERT_TRUE(fresh->Close());
+    fresh.reset();
+    source = SlabSnapshot::Open(source_.string(), &error);
+    ASSERT_NE(source, nullptr) << error;
+    const auto terminal_before = RootHashes(source_);
+    const fs::path fault_log =
+        ArmInterposer(root_, terminal, terminal_values[1].second.size());
+    auto failed = MigrateToLse(*source, destination_.string());
+    PrintInterposerEvidence(terminal, fault_log);
+    const std::string evidence = ReadText(fault_log);
+    EXPECT_GE(CountSubstring(evidence, "event=destination_committed_before_fault "), 1u)
+        << "the terminal fault must follow at least one complete migrated record";
+    if (terminal == "source_eof") {
+      EXPECT_EQ(CountSubstring(evidence, "event=source_eof_injected "), 1u);
+      EXPECT_EQ(CountSubstring(evidence, "event=destination_pwritev2_eio "), 0u)
+          << "source EOF is not a vectored-write/CQE fault";
+      EXPECT_NE(failed.error.find("cannot read source value"), std::string::npos)
+          << failed.error;
+    } else {
+      EXPECT_EQ(CountSubstring(evidence, "event=destination_pwritev2_eio "), 1u);
+      EXPECT_EQ(CountSubstring(evidence, "event=source_eof_injected "), 0u);
+      EXPECT_NE(failed.error.find("ordinary LSE Cache rejected source value"),
+                std::string::npos)
+          << failed.error;
+    }
+    EXPECT_FALSE(failed.ok) << failed.error;
+    EXPECT_FALSE(failed.published);
+    EXPECT_FALSE(failed.source_unchanged);
+    EXPECT_FALSE(fs::exists(destination_));
+    EXPECT_EQ(failed.staging_dir, destination_.string() + ".sto14-staging");
+    const fs::path marker = fs::path(failed.staging_dir) / "STO14-MIGRATION-INCOMPLETE";
+    ASSERT_TRUE(fs::exists(marker)) << failed.error;
+    EXPECT_EQ(ReadText(marker), failed.error);
+    EXPECT_TRUE(fs::exists(fs::path(failed.staging_dir) / "segments"));
+    ExpectRootUnchanged(source_, terminal_before);
+    ASSERT_TRUE(source->VerifyUnchanged(&error)) << error;
+    std::cout << "TERMINAL_MIGRATION_RESULT "
+              << dfkv::slab_migration::ResultJson(failed) << std::endl;
+  }
+}
+
+TEST_F(SlabMigrationTest, MixedLayoutMultiSegmentDirectReopenVerifiesAllRanges) {
+  Values values;
+  for (uint64_t i = 0; i < 128; ++i) {
+    const size_t size = i % 3 == 0 ? 1 : (17 + (i * 37) % 3900);
+    std::string value(size, static_cast<char>(i % 251));
+    for (size_t p = 0; p < value.size(); p += 113)
+      value[p] = static_cast<char>((i + p * 7) % 256);
+    values.emplace_back(BlockKey{0x8100 + i, 0x9100 + i * 11,
+                                 0xabc000 + i},
+                        std::move(value));
+  }
+  for (uint64_t i = 0; i < 96; ++i) {
+    const size_t size = 65539 + (i % 7) * 4093;
+    std::string value(size, static_cast<char>(33 + i % 90));
+    for (size_t p = i; p < value.size(); p += 4091)
+      value[p] = static_cast<char>((i * 13 + p) % 256);
+    values.emplace_back(BlockKey{0x8200 + i, 0x9200 + i * 13,
+                                 0xabd000 + i},
+                        std::move(value));
+  }
+  CreateSource(values);
+  std::string error;
+  auto source = SlabSnapshot::Open(source_.string(), &error);
+  ASSERT_NE(source, nullptr) << error;
+  ASSERT_EQ(source->entries().size(), values.size());
+  const auto before = RootHashes(source_);
+  auto result = MigrateToLse(*source, destination_.string());
+  ASSERT_TRUE(result.ok) << result.error;
+  ASSERT_TRUE(result.published);
+  EXPECT_TRUE(result.source_unchanged);
+  ExpectRootUnchanged(source_, before);
+  ExpectMigratedRecords(result, values);
+  EXPECT_EQ(result.segment_bytes, 4ull << 20);
+  std::map<uint32_t, size_t> records_per_segment;
+  size_t inline_records = 0;
+  size_t noninline_records = 0;
+  for (const auto& record : result.records) {
+    ++records_per_segment[record.segment];
+    if ((record.flags & dfkv::lse::kRecordFlagInline) != 0)
+      ++inline_records;
+    else
+      ++noninline_records;
+  }
+  EXPECT_GT(records_per_segment.size(), 1u);
+  EXPECT_GT(inline_records, 0u);
+  EXPECT_GT(noninline_records, 0u);
+  size_t maximum_segment_cardinality = 0;
+  for (const auto& segment : records_per_segment)
+    maximum_segment_cardinality =
+        std::max(maximum_segment_cardinality, segment.second);
+  EXPECT_GT(maximum_segment_cardinality, 64u)
+      << "at least one sealed summary must grow beyond one 4 KiB block";
+  std::cout << "MIXED_LAYOUT_EVIDENCE values=" << values.size()
+            << " destination_segments=" << records_per_segment.size()
+            << " max_segment_cardinality=" << maximum_segment_cardinality
+            << " inline=" << inline_records << " noninline=" << noninline_records
+            << " capacity=" << result.capacity_bytes << std::endl;
+
+  ASSERT_EQ(std::string(::getenv("DFKV_MIGRATION_IO_INTERPOSE_ACTIVE") == nullptr
+                            ? ""
+                            : ::getenv("DFKV_MIGRATION_IO_INTERPOSE_ACTIVE")),
+            "1");
+  const fs::path direct_log = ArmInterposer(root_, "observe");
+  ASSERT_EQ(::setenv("DFKV_MIGRATION_IO_WATCH", destination_.c_str(), 1), 0);
+  LogStore::Options direct_options;
+  direct_options.dir = destination_.string();
+  direct_options.capacity_bytes = result.capacity_bytes;
+  direct_options.direct_writes = true;
+  direct_options.cleaner = false;
+  direct_options.preopen = false;
+  direct_options.open_segments = 1;
+  bool ok = false;
+  auto direct = std::make_unique<LogStore>(direct_options, &ok);
+  ASSERT_TRUE(ok) << direct->StartupError();
+  ExpectEveryValue(direct.get(), values);
+  for (const auto& value : values) {
+    SCOPED_TRACE(value.first.Filename());
+    const std::string& expected = value.second;
+    const size_t head_len = std::min<size_t>(37, expected.size());
+    std::string actual;
+    ASSERT_EQ(direct->Range(value.first, 0, head_len, &actual), Status::kOk);
+    EXPECT_EQ(actual, expected.substr(0, head_len));
+    const size_t middle = expected.size() / 2;
+    const size_t middle_len = std::min<size_t>(53, expected.size() - middle);
+    ASSERT_EQ(direct->Range(value.first, middle, middle_len, &actual), Status::kOk);
+    EXPECT_EQ(actual, expected.substr(middle, middle_len));
+    const size_t tail = expected.size() > 29 ? expected.size() - 29 : 0;
+    const size_t tail_len = expected.size() - tail;
+    ASSERT_EQ(direct->Range(value.first, tail, tail_len, &actual), Status::kOk);
+    EXPECT_EQ(actual, expected.substr(tail));
+  }
+  ASSERT_TRUE(direct->Close());
+  direct.reset();
+  PrintInterposerEvidence("odirect_mixed_reopen", direct_log);
+  const std::string direct_evidence = ReadText(direct_log);
+  EXPECT_EQ(CountSubstring(direct_evidence, "event=odirect_open "),
+            result.segment_count)
+      << "every destination segment must really admit an O_DIRECT descriptor";
+  EXPECT_GT(CountSubstring(direct_evidence, "event=odirect_pread "), 0u)
+      << "the reopen comparisons must actually read through an O_DIRECT fd";
+  ExpectRootUnchanged(source_, before);
+  ASSERT_TRUE(source->VerifyUnchanged(&error)) << error;
+  std::cout << "MIXED_LAYOUT_MIGRATION_RESULT "
+            << dfkv::slab_migration::ResultJson(result) << std::endl;
 }
 
 }  // namespace

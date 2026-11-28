@@ -232,11 +232,17 @@ if(DFKV_BUILD_TESTS)
   # linked into each unit test binary; see the file for why not ENVIRONMENT.
   add_library(dfkv_unit_test_defaults OBJECT
     ${CMAKE_CURRENT_SOURCE_DIR}/test/support/unit_test_defaults.cc)
+  add_library(dfkv_migration_io_interposer SHARED
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/cache/slab_migration_io_interposer.cc)
+  target_link_libraries(dfkv_migration_io_interposer PRIVATE ${CMAKE_DL_LIBS})
   foreach(t ${DFKV_TESTS})
     get_filename_component(name ${t} NAME_WE)
     add_executable(${name} ${t})
     target_link_libraries(${name} PRIVATE dfkv_core GTest::gtest_main
                           dfkv_unit_test_defaults)
+    if(name STREQUAL "slab_migration_test")
+      add_dependencies(${name} dfkv_migration_io_interposer)
+    endif()
     if(name STREQUAL "node_dedup_gpu_sim_test")
       # Re-executes itself with the simulated driver first on the library path.
       add_dependencies(${name} dfkv_sim_cuda)
